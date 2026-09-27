@@ -1,114 +1,121 @@
-# Ministrant Manager — Raport Iteracji 1 (po trzech rundach przeglądu 1.1)
+# Ministrant Manager — Raport Iteracji 1 (ZAMKNIĘTA — 5/5 GitHub Actions GREEN)
 
-Ten raport zamyka Iterację 1 w zakresie, który mogłem faktycznie wykonać
-bez dostępu do Twojego repozytorium GitHub. Cztery deliverable'y:
+**Status: Iteracja 1 zamknięta.** Wszystkie pięć workflowów CI przechodzi
+na commitcie `407e5c3` (i późniejszych) w repo
+`github.com/doniniks2004-hue/MinistrantManager`:
 
-- `MinistrantManager-Backend.zip` — app.ministrant.eu
-- `MinistrantManager-MobileAPI.zip` — kontrakt + silnik sync/actions
-- `MinistrantManager-Android.zip` / `MinistrantManager-iOS.zip` — Flutter
-- `RUNNING-CI.md` — dokładna instrukcja uruchomienia CI (punkt 8 przeglądu)
+| Workflow | Status |
+|---|---|
+| Backend tests | ✅ GREEN |
+| MobileAPI tests | ✅ GREEN |
+| Flutter analyze + test | ✅ GREEN (9 plików testowych faktycznie wykonanych) |
+| Android build (`flutter build apk --debug`) | ✅ GREEN |
+| iOS build (`flutter build ios --simulator --no-codesign`) | ✅ GREEN |
+
+To pierwszy moment, w którym możemy powiedzieć: **kod faktycznie się
+kompiluje i przechodzi testy na prawdziwej infrastrukturze CI**, nie tylko
+lokalnie na sucho.
 
 ---
 
-## ZROBIONE — zmiany tej (trzeciej) rundy
+## ZROBIONE (skumulowane, wszystkie rundy przeglądu)
 
-1. **Konfiguracja SQLite3MultipleCiphers naprawiona** — usunięty błędny
-   `sqlite3mc: ^1.0.0` jako osobna zależność; poprawna konfiguracja to
-   `hooks.user_defines.sqlite3.source: sqlite3mc` w `pubspec.yaml`.
-   `drift`/`drift_dev` podniesione do `^2.32.0` (kompatybilne z `sqlite3`
-   3.x — Drift 2.21 tego nie obsługiwał). Usunięte wszystkie odniesienia
-   do `hooks/build.dart` i pakietu `sqlite3mc` z dokumentacji.
-2. **Wersja Flutter ujednolicona** — wszystkie trzy workflowy (`flutter-test`,
-   `android-build`, `ios-build`) przypięte na `3.27.0` (Dart 3.6.0),
-   zgodnie z `pubspec.yaml`'s `sdk: '>=3.6.0'`. Poprzednie `3.24.0`
-   (Dart 3.5.x) faktycznie zawaliłoby `flutter pub get`.
-3. **API routing w CI naprawiony** — nowy `ci/enable-api-routing.php`
-   wstrzykuje `api: __DIR__.'/../routes/api.php'` do `withRouting()` w
-   świeżo wygenerowanym `bootstrap/app.php` (Laravel 11 nie rejestruje
-   API routes domyślnie). Przetestowany end-to-end lokalnie na
-   realistycznym szkielecie — działa poprawnie i idempotentnie.
-4. **Błąd replay `error`→`already_applied` naprawiony** — dodana
-   `ActionResult::fromCached()`, która odtwarza ORYGINALNY status
-   (`error`/`conflict`/`applied`) zamiast zawsze zwracać
-   `already_applied`. **Zweryfikowałem realnie dokładnie ten scenariusz z
-   Twojego zgłoszenia** i potwierdzam, że przed poprawką occurred exactly
-   as reported; po poprawce naprawione i pokryte dwoma nowymi grupami
-   testów (terminal error replay + conflict replay).
-5. **Granice gwarancji exactly-once doprecyzowane w dokumentacji** —
-   `ActionLogRepositoryInterface` i `docs/INTEGRATION.md` teraz jawnie
-   mówią: `tryClaim()` chroni przed współbieżnym podwójnym wykonaniem,
-   ale NIE przed sekwencyjnym re-claimem po awarii między mutacją a
-   `finalize()`. Realny handler non-versioned w Iteracji 2 musi być albo
-   idempotentny względem `client_action_id`, albo claim+mutacja+finalize
-   muszą być w jednej transakcji DB.
+Backend, MobileAPI i Flutter/Android/iOS przeszły łącznie cztery rundy
+przeglądu kodu + jedną rundę realnego debugowania CI. Kluczowe punkty:
 
-Punkty 6 (crypto-erase) i 7 (PreflightGate/DeepLinkService) z poprzedniej
-rundy potwierdzone jako OK — nieprzebudowywane.
+**Backend (app.ministrant.eu)**: role SUPER_ADMIN/ADMIN, recovery codes
+(Argon2id, atomowe zużycie, kolumna `code_hash` poprawiona na 255 znaków),
+rate limiting TOTP, `totp_secret` szyfrowany, panel Audit Log, naprawiona
+aktywacja (transakcja + `lockForUpdate`), `DeviceStatusEvaluator`
+(platforma-specyficzna wersja minimalna), `AppConfig::$table` naprawione,
+`/device/status` przyjmuje i zapisuje `app_version`/`os_version` przed
+oceną statusu, audit log/rate limiter używają fingerprintu (SHA-256) —
+nigdy surowego kodu aktywacyjnego.
 
-## PRZETESTOWANE REALNIE
+**MobileAPI**: `ActionDispatcher` z atomowym `tryClaim`/`finalize`/
+`failClaim`, `ActionResult::fromCached()` wiernie odtwarzający oryginalny
+status (error/conflict/applied — nigdy fałszywie `already_applied`),
+`SyncService` z prawdziwym `hasMore` i tombstones, `VerifyDeviceTokenService`
+z izolacją tenantów (test §36 dosłownie).
 
-Wszystko z poprzednich rund ponownie uruchomione (61 plików backendu,
-46 MobileAPI — 0 błędów `php -l`). Nowe testy tej rundy:
+**Android/iOS (Flutter)**: `CipherEngine`/`MultiCiphersEngine` (SQLite3MultipleCiphers,
+poprawny import `package:sqlite3/common.dart`), crypto-erase przy revoke,
+`PreflightGate` (globalny client-config przed Activation/Home, z
+działającym przyciskiem AKTUALIZUJ przez wspólny `StoreLinkLauncher`),
+`DeepLinkService` z walidacją hosta, `checkDeviceStatus()` rozróżniający
+transport failure / 401 / 403 / 5xx (nowy `DeviceAuthState.authError`,
+fail-closed zamiast fail-open), kompletny natywny scaffold Android
+(Kotlin DSL, AGP 9.1.0, Gradle 9.3.1) i iOS (Xcode project, bundle
+identifier i deployment target 15.0 spójne wszędzie) — **wygenerowany
+raz przez Flutter 3.47.3 i faktycznie zweryfikowany w CI**, nie
+regenerowany przed każdym buildem.
 
-| Test | Co dowodzi | Wynik |
-|---|---|---|
-| `ActionDispatcherTest.php` — grupa 5 | **Dosłowny scenariusz z Twojego zgłoszenia**: unknown action → `error` → retry tego samego `client_action_id` → nadal `error`, NIE `already_applied`, ten sam `reason` co za pierwszym razem, stabilne przy trzeciej próbie | PASS |
-| `ActionDispatcherTest.php` — grupa 6 | Replayowany `conflict` pozostaje `conflict` (nie `already_applied`), z poprawnym `current_record` | PASS |
-| `ci/enable-api-routing.php` (test lokalny) | Wstrzykuje `api:` do realistycznego szkieletu `bootstrap/app.php`, idempotentnie (drugie uruchomienie = no-op) | PASS |
+## PRZETESTOWANE REALNIE (lokalnie, w tym środowisku)
 
-## PRZETESTOWANE W CI
+Bez zmian względem poprzednich rund: testy współbieżności na
+prawdziwych dwóch procesach OS (aktywacja, recovery code, MobileAPI
+action claim), pełen zestaw testów framework-free MobileAPI, `php -l`
+na 61 plikach backendu — 0 błędów.
 
-**Nadal nic.** Bez zmian względem poprzedniej rundy — nie mam dostępu do
-Twojego repozytorium GitHub. **Patrz `RUNNING-CI.md`** — dokładna,
-krok-po-kroku instrukcja przygotowana specjalnie w tej rundzie (punkt 8
-przeglądu), żebyś mógł to uruchomić samodzielnie. Dopóki nie zobaczymy
-wyniku, status całej sekcji "CI" pozostaje deklaratywny, nie
-zweryfikowany.
+## PRZETESTOWANE W CI — TERAZ RZECZYWIŚCIE ZIELONE
+
+To jest fundamentalna zmiana względem poprzednich rund tego raportu,
+gdzie ta sekcja mówiła "nic". Diagnozowanie i naprawa oparte były na
+**prawdziwych logach GitHub Actions** (odczytywanych przez API, gdzie się
+dało, lub dostarczanych bezpośrednio przez Ciebie, gdzie moja sieć nie
+sięgała do Azure Blob Storage przechowującego pełne logi):
+
+- Naprawione po drodze: kontekst `secrets` niedozwolony w `if:` (realne
+  ograniczenie GitHub, nie fałszywy alarm), blokada advisory Composera
+  (`policy.advisories.block` — projektowy, nie globalny config),
+  niekompatybilna wersja Fluttera z Dart SDK wymaganym przez Drift
+  ^2.32.0 (3.24.0→3.47.3), domyślny `ExampleTest.php` świeżego Laravela
+  kolidujący z naszym routingiem, `CommonDatabase` w złym pakiecie
+  (`sqlite3.dart`→`common.dart`), literówki Dart (brakujące nawiasy,
+  `Value()`, `skip: true` zamiast stringa), podwójny `primaryKey` w
+  Drift, przestarzała wersja AGP (8.3.2→9.1.0 przez pełną migrację na
+  Kotlin DSL), niespójny bundle identifier iOS, deployment target 13.0→15.0.
 
 ## IMPLEMENTED / NOT VERIFIED ON REAL DEVICE
 
-Bez zmian statusu: szyfrowanie lokalnej bazy (SQLite3MultipleCiphers).
-Konfiguracja w `pubspec.yaml` poprawiona na właściwy mechanizm
-(`hooks.user_defines`), ale nadal nie przeszła przez realny
-`flutter pub get`/build — to właśnie pierwsze uruchomienie CI (patrz
-wyżej) da na to odpowiedź.
-
-## NIEPRZETESTOWANE Z POWODU ŚRODOWISKA
-
-- Wszystkie testy na prawdziwym telefonie/emulatorze
-- Wszystkie 9 plików `mobile/test/*.dart`
-- Realny build APK/AAB/IPA
-- Wdrożenie `app.ministrant.eu` na produkcję
-- Wszystkie 5 workflow'ów CI — do czasu wykonania kroków z `RUNNING-CI.md`
+**Szyfrowanie lokalnej bazy — częściowy postęp.** Punkt 1 z
+czteropunktowej checklisty (`docs/ENCRYPTION.md`) jest teraz
+**potwierdzony**: `flutter pub get` i `flutter build apk`/`flutter build
+ios` przechodzą realnie w CI z konfiguracją `hooks.user_defines.sqlite3.source:
+sqlite3mc` — mechanizm faktycznie się rozwiązuje i aplikacja faktycznie
+się kompiluje z nim. **Punkty 2-4 (otwarcie z poprawnym kluczem, odrzucenie
+złego klucza, round-trip crypto-erase) nadal wymagają uruchomienia na
+prawdziwym urządzeniu/emulatorze** — CI buduje, ale nie uruchamia
+aplikacji ani nie wykonuje runtime asercji na cipherze.
 
 ## BLOCKERY
 
-- **Brak dostępu do GitHub tego projektu** — patrz `RUNNING-CI.md` dla instrukcji, jak Ty możesz to odblokować
-- **Packagist zablokowany w sieci tego środowiska**
-- **Brak toolchaina Flutter/Android/iOS oraz brak dostępu do pub.dev**
-- **Brak dostępu do istniejącego kodu/schematu Ministrant Manager**
-- Brak finalnego keystore Android / konta Apple Developer
+- Brak realnego keystore Android / konta Apple Developer → sekrety
+  (`ANDROID_KEYSTORE_*`, `APPLE_CERTIFICATE_*`, `APPLE_TEAM_ID`) nie są
+  ustawione w repo, więc release-signing kroki CI pozostają no-op
+  (debug/simulator build wystarcza na tę iterację)
+- Brak dostępu do istniejącego kodu/schematu Ministrant Manager →
+  Iteracja 2
 
-## PLACEHOLDERY
+## PLACEHOLDERY (bez zmian)
 
-Bez zmian: App Links/Universal Links, `ExportOptions.plist` teamID,
-`assets/branding/`, `ConfigController` (MobileAPI).
+`public/.well-known/*`, `ios/ExportOptions.plist` teamID,
+`assets/branding/`, `ConfigController` (MobileAPI) zwraca pusty config.
 
-## WYMAGA INTEGRACJI Z ISTNIEJĄCYM MM
+## WYMAGA INTEGRACJI Z ISTNIEJĄCYM MM / DO ITERACJI 2
 
-Bez zmian, plus nowy wymóg jawnie udokumentowany w `docs/INTEGRATION.md`:
-każdy realny handler non-versioned (attendance/points/substitutions) musi
-być albo idempotentny względem `client_action_id`, albo objęty jedną
-transakcją z action logiem — patrz punkt 5 wyżej.
-
-## DO ITERACJI 2
-
-Bez zmian.
+Bez zmian względem poprzednich rund: prawdziwe adaptery repozytoriów
+domenowych, realne dane biznesowe (grafik/obecności/punkty/ranking/
+ogłoszenia/zastępstwa), faktyczne `permissions`, integracja
+`VerifyDeviceToken` z prawdziwym źródłem prawdy o urządzeniach. Każdy
+handler non-versioned musi być idempotentny względem `client_action_id`
+LUB objęty jedną transakcją z action logiem (udokumentowane w
+`mobileapi/docs/INTEGRATION.md`).
 
 ---
 
-**Warunek zamknięcia Iteracji 1 pozostaje taki, jak ustaliliśmy**: dopiero
-zielone CI (`flutter pub get`, `flutter analyze`, `flutter test`, Android
-debug build, iOS simulator build, backend feature tests, MobileAPI tests)
-pozwala nazwać ją COMPLETE. Z mojej strony kod jest gotowy do tej próby —
-`RUNNING-CI.md` mówi dokładnie, jak ją wykonać.
+**Iteracja 1 jest zamknięta.** Repozytorium
+`github.com/doniniks2004-hue/MinistrantManager` zawiera pełną,
+zweryfikowaną w CI historię — jeśli potrzebna jest analiza konkretnej
+decyzji, jest ona opisana w odpowiadającym jej commicie. Gotowi do
+Iteracji 2 z prawdziwym backendem Ministrant Manager.

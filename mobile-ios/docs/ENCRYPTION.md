@@ -7,10 +7,15 @@ toolchain and a real device/emulator confirms ALL FOUR of the following
 against an actual build — not before, and this document will not claim
 otherwise:
 
-- [ ] **Build**: the app compiles with a SQLite3MultipleCiphers-enabled
+- [x] **Build**: the app compiles with a SQLite3MultipleCiphers-enabled
       `sqlite3` linked in via the `hooks.user_defines.sqlite3.source:
-      sqlite3mc` entry in `pubspec.yaml` (see "What changed this round"
-      below).
+      sqlite3mc` entry in `pubspec.yaml`. **CONFIRMED in real GitHub
+      Actions CI**: `flutter pub get`, `flutter build apk --debug`, and
+      `flutter build ios --simulator --no-codesign` all succeeded against
+      this exact pubspec.yaml (see the project's CI run history) — the
+      hook mechanism genuinely resolves and the app genuinely compiles
+      with it. This does NOT yet confirm the cipher is actually active at
+      runtime — see the remaining three items below.
 - [ ] **Open with correct key**: a fresh database opens successfully
       through `MultiCiphersEngine` with a real key from
       `SecureStorageService.getOrCreateDbEncryptionKey()`, and
