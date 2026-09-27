@@ -12,7 +12,7 @@ if (localPropertiesFile.exists()) {
 
 android {
     namespace = "eu.ministrant.manager"
-    compileSdk = 34
+    compileSdk = 36
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
@@ -26,8 +26,8 @@ android {
     defaultConfig {
         // Matches spec §3 app_icon/branding requirement — see assets/branding.
         applicationId = "eu.ministrant.manager"
-        minSdk = 23
-        targetSdk = 34
+        minSdk = 24
+        targetSdk = 36
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }

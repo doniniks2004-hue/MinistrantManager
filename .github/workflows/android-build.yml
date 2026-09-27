@@ -5,6 +5,12 @@ on:
     branches: [main, develop]
   workflow_dispatch:
 
+# Needed for the one-time "Commit generated native scaffold" step to push
+# back to the repo using the default GITHUB_TOKEN (default permissions are
+# often read-only for contents).
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -56,6 +62,24 @@ jobs:
           diff /tmp/pre-create-snapshot/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
           diff /tmp/pre-create-snapshot/build.gradle android/app/build.gradle
           grep -q "Android App Links (spec §35" android/app/src/main/AndroidManifest.xml
+
+      # ONE-TIME step (review round 3.x point 11): commits the native
+      # Android scaffold (gradle wrapper jar/properties, gradlew scripts,
+      # any files flutter create added that we didn't already have) back
+      # into the repo, so future runs never need `flutter create` again —
+      # a real project should own its full native project, not regenerate
+      # part of it before every build. Safe to leave in permanently: it's
+      # a no-op ("nothing to commit") once the scaffold is already
+      # committed, and GITHUB_TOKEN-authored pushes don't re-trigger `on:
+      # push` workflows, so this can't create an infinite loop.
+      - name: Commit generated native scaffold (one-time; no-op afterwards)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A android/
+          git diff --cached --quiet && echo "Nothing new to commit — scaffold already committed." || git commit -m "Commit Flutter-generated native Android scaffold (gradle wrapper etc.) [skip ci reason: one-time, see workflow comment]"
+          git pull --rebase origin main || true
+          git push || echo "Push skipped/failed (e.g. nothing to push, or lost a race with ios-build.yml's own commit) — not fatal to this build; re-run via workflow_dispatch if needed."
 
       - run: flutter pub get
       - run: dart run build_runner build --delete-conflicting-outputs

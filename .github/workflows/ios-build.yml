@@ -5,6 +5,9 @@ on:
     branches: [main, develop]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-14
@@ -43,6 +46,21 @@ jobs:
           diff /tmp/pre-create-snapshot/Runner.entitlements ios/Runner/Runner.entitlements
           diff /tmp/pre-create-snapshot/Podfile ios/Podfile
           grep -q "applinks:app.ministrant.eu" ios/Runner/Runner.entitlements
+
+      # ONE-TIME step (review round 3.x point 11) — see android-build.yml's
+      # identical step for the full rationale. `git pull --rebase` first
+      # because this job runs IN PARALLEL with android-build.yml's own
+      # commit-back step on the same push; if Android's commit lands
+      # first, this avoids a plain non-fast-forward push failure for the
+      # (unrelated, different-subdirectory) iOS scaffold commit.
+      - name: Commit generated native scaffold (one-time; no-op afterwards)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A ios/
+          git diff --cached --quiet && echo "Nothing new to commit — scaffold already committed." || git commit -m "Commit Flutter-generated native iOS scaffold (Xcode project etc.) [skip ci reason: one-time, see workflow comment]"
+          git pull --rebase origin main || true
+          git push || echo "Push skipped/failed (e.g. nothing to push, or lost a race with android-build.yml's own commit) — not fatal to this build; re-run via workflow_dispatch if needed."
 
       - run: flutter pub get
       - run: dart run build_runner build --delete-conflicting-outputs

@@ -1,4 +1,4 @@
-import 'package:sqlite3/sqlite3.dart';
+import 'package:sqlite3/common.dart';
 import 'cipher_engine.dart';
 
 /// The ONLY cipher engine in this codebase (review round 2, point 1:
@@ -49,7 +49,9 @@ class MultiCiphersEngine implements CipherEngine {
     // plain SQLite) AND it fails if some other cipher extension is
     // present but answering a different scheme name than we configured.
     final result = rawDb.select('PRAGMA cipher;');
-    final activeCipher = result.isNotEmpty ? result.first.values.firstOrNull?.toString() : null;
+    final activeCipher = (result.isNotEmpty && result.first.values.isNotEmpty)
+        ? result.first.values.first?.toString()
+        : null;
 
     if (activeCipher == null || activeCipher.isEmpty) {
       throw CipherNotActiveException(
@@ -68,8 +70,4 @@ class MultiCiphersEngine implements CipherEngine {
       );
     }
   }
-}
-
-extension _FirstOrNull<T> on Iterable<T> {
-  T? get firstOrNull => isEmpty ? null : first;
 }

@@ -270,7 +270,7 @@ class SyncEngine {
       if (data['parish'] != null) {
         final parish = data['parish'] as Map<String, dynamic>;
         await db.into(db.parishInfo).insertOnConflictUpdate(ParishInfoCompanion.insert(
-              id: parish['id'] as int,
+              id: Value(parish['id'] as int),
               name: parish['name'] as String? ?? '',
               slug: parish['slug'] as String? ?? '',
               serverUrl: parish['server_url'] as String? ?? '',

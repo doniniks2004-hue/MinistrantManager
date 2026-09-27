@@ -43,6 +43,13 @@ if [ -d "$PACKAGE_ROOT/public/.well-known" ]; then
 fi
 
 if [ -d "$PACKAGE_ROOT/tests/Feature" ]; then
+  # Real CI result: the fresh Laravel skeleton's own tests/Feature/ExampleTest.php
+  # (asserts GET / returns 200) was being merged alongside ours instead of
+  # removed — our app correctly returns 302 (redirect to /admin) at that
+  # route, so ExampleTest failed every run despite our own tests passing.
+  # Remove ONLY the skeleton's own example tests — keep tests/TestCase.php
+  # (our ActivationApiTest.php extends it) and any Pest bootstrap intact.
+  rm -f "$LARAVEL_APP/tests/Feature/ExampleTest.php" "$LARAVEL_APP/tests/Unit/ExampleTest.php"
   mkdir -p "$LARAVEL_APP/tests/Feature"
   cp -r "$PACKAGE_ROOT/tests/Feature/." "$LARAVEL_APP/tests/Feature/"
 fi

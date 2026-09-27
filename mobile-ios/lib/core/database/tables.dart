@@ -117,8 +117,10 @@ class PendingActions extends Table {
   IntColumn get attemptCount => integer().withDefault(const Constant(0))();
   TextColumn get lastError => text().nullable()();
 
-  @override
-  Set<Column> get primaryKey => {id};
+  // No explicit `primaryKey` override here (review round 3.x point 7):
+  // `integer().autoIncrement()()` on `id` ALREADY makes it the primary
+  // key — build_runner correctly rejected the redundant override with
+  // "Tables can't override primaryKey and use autoIncrement()".
 }
 
 /// Single-row table tracking sync + auth-check state.

@@ -130,8 +130,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _openStoreListing() async {
     final url = Theme.of(context).platform == TargetPlatform.iOS
-        ? _clientConfig?['ios_store_url'] as String?
-        : _clientConfig?['android_store_url'] as String?;
+        ? (_clientConfig?['ios_store_url'] as String?)
+        : (_clientConfig?['android_store_url'] as String?);
     if (url == null || url.isEmpty) return; // spec decision #15: no link yet published — button simply does nothing extra
     final uri = Uri.tryParse(url);
     if (uri != null) {

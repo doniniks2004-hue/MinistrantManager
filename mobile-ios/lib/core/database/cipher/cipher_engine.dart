@@ -1,4 +1,4 @@
-import 'package:sqlite3/sqlite3.dart';
+import 'package:sqlite3/common.dart';
 
 /// Iteration 1.1 point 11: encryption-at-rest is isolated behind this
 /// interface so the actual cipher implementation can be swapped without

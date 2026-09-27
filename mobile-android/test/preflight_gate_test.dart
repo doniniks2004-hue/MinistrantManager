@@ -109,5 +109,9 @@ void main() {
     await tester.pumpAndSettle(const Duration(seconds: 15)); // real (failing) network call needs time to time out
 
     expect(find.text('FIRST_ACTIVATION_ALLOWED'), findsOneWidget);
-  }, skip: 'Requires real network round-trip to time out (or a mocked Dio adapter) — see test docblock; not run in this sandbox.');
+  // Skipped (review round 3.x point 6): requires a real network round-trip
+  // to time out, or a mocked Dio adapter — not run in this sandbox. `skip:`
+  // takes bool? in this flutter_test version; a String reason isn't a
+  // valid argument type, so the reason lives in this comment instead.
+  }, skip: true);
 }
