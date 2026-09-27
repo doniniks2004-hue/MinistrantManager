@@ -42,19 +42,27 @@ jobs:
       - name: Run framework-free standalone tests
         run: for f in package/backend/standalone-tests/test_*.php; do php "$f"; done
 
-      - name: Disable Composer's security-advisory install block
-        # Real error hit on the first CI run: Composer 2.8+'s
-        # "policy.advisories.block" refuses to RESOLVE (not just report on)
-        # any laravel/framework version matched by laravel/laravel's own
-        # ^11.31 constraint, because every one of 11.31.0..11.56.1 is
-        # flagged by at least one security advisory. --no-audit (tried
-        # first) only skips the post-install audit REPORT — it does not
-        # touch this separate, resolution-time policy — so the global
-        # config must be disabled before create-project ever runs.
-        run: composer global config policy.advisories.block false
+      - name: Scaffold a fresh Laravel 11 app (composer.json only, no install yet)
+        # Real errors hit on the first two CI runs, in order tried:
+        #   1. --no-audit alone: only skips the post-install audit REPORT,
+        #      not this separate, resolution-time block.
+        #   2. `composer global config policy.advisories.block false`:
+        #      silently has no effect — "policy.*" is a per-PROJECT
+        #      composer.json config section, not part of composer's global
+        #      config schema, so setting it globally is simply ignored.
+        # Fix: split create-project into "generate composer.json, don't
+        # install" (--no-install) + set the policy directly in that real,
+        # generated project composer.json (where Composer actually reads
+        # it) + THEN install.
+        run: composer create-project laravel/laravel laravel-app "^11.0" --no-interaction --no-install
 
-      - name: Scaffold a fresh Laravel 11 app
-        run: composer create-project laravel/laravel laravel-app "^11.0" --no-interaction --no-audit
+      - name: Disable Composer's security-advisory install block (project-level)
+        working-directory: laravel-app
+        run: composer config policy.advisories.block false
+
+      - name: Install Laravel's own dependencies
+        working-directory: laravel-app
+        run: composer install --no-interaction --no-audit
 
       - name: Overlay this package onto the fresh app
         run: bash package/backend/ci/overlay-package.sh package/backend laravel-app
