@@ -54,7 +54,12 @@ jobs:
         # install" (--no-install) + set the policy directly in that real,
         # generated project composer.json (where Composer actually reads
         # it) + THEN install.
-        run: composer create-project laravel/laravel laravel-app "^11.0" --no-interaction --no-install
+        # --no-scripts (added per confirmed CI log): without it, --no-install
+        # still fires Laravel's post-create-project-cmd hook (php artisan
+        # key:generate), which needs vendor/autoload.php that doesn't
+        # exist yet at this point — "Failed opening required
+        # .../vendor/autoload.php".
+        run: composer create-project laravel/laravel laravel-app "^11.0" --no-interaction --no-install --no-scripts
 
       - name: Disable Composer's security-advisory install block (project-level)
         working-directory: laravel-app
@@ -62,7 +67,7 @@ jobs:
 
       - name: Install Laravel's own dependencies
         working-directory: laravel-app
-        run: composer install --no-interaction --no-audit
+        run: composer install --no-interaction --prefer-dist --no-audit
 
       - name: Overlay this package onto the fresh app
         run: bash package/backend/ci/overlay-package.sh package/backend laravel-app

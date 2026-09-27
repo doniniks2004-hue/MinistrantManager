@@ -21,7 +21,7 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.27.0' # ships Dart 3.6.0 — matches pubspec.yaml's 'sdk: >=3.6.0' constraint (Drift >=2.32/sqlite3 3.x). Review round 3, point 2: 3.24.0 shipped Dart 3.5.x and would have failed `flutter pub get` on this SDK constraint.
+          flutter-version: '3.47.3' # bumped per confirmed CI log: drift_dev ^2.32.0's own deps need Dart >=3.7, which 3.27.0's Dart 3.6.0 doesn't satisfy.
           channel: 'stable'
 
       - name: Snapshot our customized files BEFORE flutter create
@@ -32,7 +32,7 @@ jobs:
           cp ios/Podfile /tmp/pre-create-snapshot/
 
       - name: flutter create (regenerate Xcode project + missing native scaffolding)
-        run: flutter create --org eu.ministrant --project-name ministrant_manager --platforms ios .
+        run: flutter create --no-pub --org eu.ministrant --project-name ministrant_manager --platforms ios .
 
       - name: Verify flutter create did NOT overwrite our Universal Links / camera-permission customizations
         # Iteration 1.1 point 13 — see android-build.yml's identical step
