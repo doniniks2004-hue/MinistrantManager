@@ -1,10 +1,21 @@
+import java.util.Properties
+import java.io.FileInputStream
+import com.android.build.api.dsl.ApplicationExtension
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
 }
 
-android {
+// AGP 9.1's Kotlin DSL: `java.util`/`java.io` collide with Gradle's own
+// `java` DSL accessor inside a plain `android { ... }` block (real CI
+// error: "Unresolved reference 'util'" / "'io'"), and the classic
+// `android { ... }` block itself is being phased out in favor of
+// explicitly configuring the ApplicationExtension — hence the explicit
+// imports above and `extensions.configure<ApplicationExtension>` below,
+// exactly as confirmed against the real build log.
+extensions.configure<ApplicationExtension> {
     // Matches spec §3 app_icon/branding requirement — see assets/branding.
     // Deliberately "eu.ministrant.manager", NOT the "eu.ministrant.ministrant_manager"
     // flutter create derives by default from --org/--project-name — this
@@ -40,9 +51,9 @@ android {
             // keystore" CI step, which writes android/key.properties.
             val keystorePropertiesFile = rootProject.file("key.properties")
             if (keystorePropertiesFile.exists()) {
-                val keystoreProperties = java.util.Properties()
-                keystoreProperties.load(java.io.FileInputStream(keystorePropertiesFile))
-                storeFile = keystoreProperties["storeFile"]?.let { rootProject.file(it) }
+                val keystoreProperties = Properties()
+                keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+                storeFile = keystoreProperties["storeFile"]?.let { rootProject.file(it as String) }
                 storePassword = keystoreProperties["storePassword"] as String?
                 keyAlias = keystoreProperties["keyAlias"] as String?
                 keyPassword = keystoreProperties["keyPassword"] as String?
