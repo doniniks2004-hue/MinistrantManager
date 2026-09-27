@@ -8,6 +8,11 @@ on:
 jobs:
   build:
     runs-on: macos-14
+    # Same fix as android-build.yml: `secrets` context is not allowed in
+    # `if:` conditions at all — surfaced as job-level env vars instead.
+    env:
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' }}
+      HAS_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID != '' }}
     defaults:
       run:
         working-directory: mobile-ios
@@ -53,7 +58,7 @@ jobs:
         run: flutter build ios --simulator --no-codesign
 
       - name: Import signing certificate + provisioning profile (only if configured)
-        if: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' }}
+        if: ${{ env.HAS_APPLE_CERT == 'true' }}
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -67,7 +72,7 @@ jobs:
           cp profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
 
       - name: Build signed IPA (only if configured — requires APPLE_TEAM_ID too)
-        if: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' && secrets.APPLE_TEAM_ID != '' }}
+        if: ${{ env.HAS_APPLE_CERT == 'true' && env.HAS_APPLE_TEAM_ID == 'true' }}
         run: flutter build ipa --export-options-plist=ios/ExportOptions.plist
 
       - uses: actions/upload-artifact@v4

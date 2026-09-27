@@ -43,14 +43,22 @@ jobs:
         run: for f in package/backend/standalone-tests/test_*.php; do php "$f"; done
 
       - name: Scaffold a fresh Laravel 11 app
-        run: composer create-project laravel/laravel laravel-app "^11.0" --no-interaction
+        # --no-audit: Composer 2.8+'s "policy.advisories.block" refuses to
+        # resolve to ANY laravel/framework version currently matched by
+        # laravel/laravel's own ^11.31 constraint, because every one of
+        # them (11.31.0..11.56.1, per Composer's own audit output on the
+        # first real CI run) is flagged by at least one security advisory.
+        # That's Composer's own default safety net, not a real installability
+        # problem for this scaffolding step — the fresh app's dependencies
+        # get immediately overlaid by this package's own code anyway.
+        run: composer create-project laravel/laravel laravel-app "^11.0" --no-interaction --no-audit
 
       - name: Overlay this package onto the fresh app
         run: bash package/backend/ci/overlay-package.sh package/backend laravel-app
 
       - name: Require additional packages
         working-directory: laravel-app
-        run: composer require pragmarx/google2fa bacon/bacon-qr-code --no-interaction
+        run: composer require pragmarx/google2fa bacon/bacon-qr-code --no-interaction --no-audit
 
       - name: Configure environment
         working-directory: laravel-app

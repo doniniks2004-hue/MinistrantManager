@@ -8,6 +8,15 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # GitHub restricts the `secrets` context from `if:` conditions
+    # entirely (job- and step-level) — it is only usable as a VALUE
+    # (env:, with:, run:), never inside a condition. Real error hit on
+    # first CI run: "context 'secrets' is not allowed here" — the
+    # workflow failed to parse at all (zero jobs created). The standard
+    # workaround: surface presence-as-boolean through job-level `env:`
+    # (secrets ARE allowed there), then branch on `env.*` in `if:`.
+    env:
+      HAS_ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
     defaults:
       run:
         working-directory: mobile-android
@@ -56,7 +65,7 @@ jobs:
       # exist; until then this step is a no-op rather than a failure, so
       # the workflow stays green for everyone before a keystore exists.
       - name: Decode release keystore (if configured)
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        if: ${{ env.HAS_ANDROID_KEYSTORE == 'true' }}
         run: |
           echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/release.keystore
           cat > android/key.properties << KEYPROPS
@@ -70,7 +79,7 @@ jobs:
         run: flutter build apk --debug
 
       - name: Build release APK + AAB (only if keystore secrets are configured)
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        if: ${{ env.HAS_ANDROID_KEYSTORE == 'true' }}
         run: |
           flutter build apk --release
           flutter build appbundle --release
