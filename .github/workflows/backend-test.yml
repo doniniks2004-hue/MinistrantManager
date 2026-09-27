@@ -67,14 +67,20 @@ jobs:
 
       - name: Install Laravel's own dependencies
         working-directory: laravel-app
-        run: composer install --no-interaction --prefer-dist --no-audit
+        # --no-audit removed: confirmed via real CI error ("The '--no-audit'
+        # option does not exist.") that this Composer version doesn't
+        # support the flag on `install` at all. Not needed anyway once
+        # policy.advisories.block is properly disabled at the project
+        # level (previous step) — that's the real fix; --no-audit was
+        # always belt-and-braces on top of it.
+        run: composer install --no-interaction --prefer-dist
 
       - name: Overlay this package onto the fresh app
         run: bash package/backend/ci/overlay-package.sh package/backend laravel-app
 
       - name: Require additional packages
         working-directory: laravel-app
-        run: composer require pragmarx/google2fa bacon/bacon-qr-code --no-interaction --no-audit
+        run: composer require pragmarx/google2fa bacon/bacon-qr-code --no-interaction
 
       - name: Configure environment
         working-directory: laravel-app
