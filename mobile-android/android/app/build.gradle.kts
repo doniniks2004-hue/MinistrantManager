@@ -5,7 +5,12 @@ plugins {
 }
 
 android {
-    namespace = "eu.ministrant.ministrant_manager"
+    // Matches spec §3 app_icon/branding requirement — see assets/branding.
+    // Deliberately "eu.ministrant.manager", NOT the "eu.ministrant.ministrant_manager"
+    // flutter create derives by default from --org/--project-name — this
+    // must match MainActivity.kt's actual package path
+    // (android/app/src/main/kotlin/eu/ministrant/manager/MainActivity.kt).
+    namespace = "eu.ministrant.manager"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -15,25 +20,49 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "eu.ministrant.ministrant_manager"
-        // You can update the following values to match your application needs.
-        // For more information, see: https://flutter.dev/to/review-gradle-config.
+        applicationId = "eu.ministrant.manager"
+        // Dynamic (flutter.*Version) rather than hardcoded: Flutter 3.47.3's
+        // own bundled defaults already satisfy the minSdk>=24/compileSdk>=36/
+        // targetSdk=36 floor from review — letting Flutter's tooling own
+        // these means they track forward automatically on the next Flutter
+        // upgrade instead of silently drifting stale again.
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
-        // Uses the version code from pubspec.yaml. When using split APKs, 1000 * ABI_VERSION
-        // is added automatically by Flutter. (https://developer.android.com/studio/build/configure-apk-splits#configure-APK-versions)
-        // You can force using the value of versionCode by specifying the `-P force-version-code-ignoring-abi=true`
-        // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }
 
+    signingConfigs {
+        create("release") {
+            // Fill in from a keystore.properties (NOT committed) before
+            // building app-release.aab / app-release.apk for real
+            // distribution — see android-build.yml's "Decode release
+            // keystore" CI step, which writes android/key.properties.
+            val keystorePropertiesFile = rootProject.file("key.properties")
+            if (keystorePropertiesFile.exists()) {
+                val keystoreProperties = java.util.Properties()
+                keystoreProperties.load(java.io.FileInputStream(keystorePropertiesFile))
+                storeFile = keystoreProperties["storeFile"]?.let { rootProject.file(it) }
+                storePassword = keystoreProperties["storePassword"] as String?
+                keyAlias = keystoreProperties["keyAlias"] as String?
+                keyPassword = keystoreProperties["keyPassword"] as String?
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            // Falls back to debug signing when no key.properties exists
+            // (e.g. `flutter build apk --debug` / CI's non-release runs),
+            // so the app still builds out of the box for testing.
+            signingConfig = if (rootProject.file("key.properties").exists()) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
 }

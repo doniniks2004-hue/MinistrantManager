@@ -5,12 +5,6 @@ on:
     branches: [main, develop]
   workflow_dispatch:
 
-# Needed for the one-time "Commit generated native scaffold" step to push
-# back to the repo using the default GITHUB_TOKEN (default permissions are
-# often read-only for contents).
-permissions:
-  contents: write
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -36,51 +30,15 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.47.3' # bumped per confirmed CI log: drift_dev ^2.32.0's own deps need Dart >=3.7, which 3.27.0's Dart 3.6.0 doesn't satisfy.
+          flutter-version: '3.47.3' # ships Dart >=3.7, required by drift ^2.32.0
           channel: 'stable'
 
-      - name: Snapshot our customized files BEFORE flutter create
-        run: |
-          mkdir -p /tmp/pre-create-snapshot
-          cp android/app/src/main/AndroidManifest.xml /tmp/pre-create-snapshot/
-          cp android/app/build.gradle /tmp/pre-create-snapshot/
-
-      - name: flutter create (regenerate gradle wrapper + missing native scaffolding)
-        run: flutter create --no-pub --org eu.ministrant --project-name ministrant_manager --platforms android .
-
-      - name: Verify flutter create did NOT overwrite our App Links / camera-permission customizations
-        # Iteration 1.1 point 13: `flutter create` on an existing project
-        # does not overwrite files by default (no --overwrite flag passed
-        # above) — but that default behavior is exactly the kind of thing
-        # that silently changes between Flutter versions. This step turns
-        # "we assume it's safe" into an actual, enforced check: byte-for-byte
-        # diff against the pre-create snapshot, AND a grep for our App
-        # Links marker comment, either of which failing fails the build
-        # loudly instead of shipping a manifest that silently lost its
-        # App Links intent-filter or camera permission.
-        run: |
-          diff /tmp/pre-create-snapshot/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
-          diff /tmp/pre-create-snapshot/build.gradle android/app/build.gradle
-          grep -q "Android App Links (spec §35" android/app/src/main/AndroidManifest.xml
-
-      # ONE-TIME step (review round 3.x point 11): commits the native
-      # Android scaffold (gradle wrapper jar/properties, gradlew scripts,
-      # any files flutter create added that we didn't already have) back
-      # into the repo, so future runs never need `flutter create` again —
-      # a real project should own its full native project, not regenerate
-      # part of it before every build. Safe to leave in permanently: it's
-      # a no-op ("nothing to commit") once the scaffold is already
-      # committed, and GITHUB_TOKEN-authored pushes don't re-trigger `on:
-      # push` workflows, so this can't create an infinite loop.
-      - name: Commit generated native scaffold (one-time; no-op afterwards)
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A android/
-          git diff --cached --quiet && echo "Nothing new to commit — scaffold already committed." || git commit -m "Commit Flutter-generated native Android scaffold (gradle wrapper etc.) [skip ci reason: one-time, see workflow comment]"
-          git pull --rebase origin main || true
-          git push || echo "Push skipped/failed (e.g. nothing to push, or lost a race with ios-build.yml's own commit) — not fatal to this build; re-run via workflow_dispatch if needed."
-
+      # Review round 3.x point 11: `flutter create` removed from CI
+      # entirely. The full native Android project (Kotlin DSL Gradle
+      # files, gradle wrapper, manifest, etc.) is now committed directly
+      # in this repo — generated once against Flutter 3.47.3 and
+      # hand-verified, not regenerated before every build. CI now only
+      # builds what's actually in the repo.
       - run: flutter pub get
       - run: dart run build_runner build --delete-conflicting-outputs
 
