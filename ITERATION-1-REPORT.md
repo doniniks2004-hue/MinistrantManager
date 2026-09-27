@@ -1,111 +1,131 @@
-# Ministrant Manager — Raport Iteracji 1 (ZAMKNIĘTA — 5/5 GitHub Actions GREEN)
+# Ministrant Manager — ITERATION 1 COMPLETE
 
-**Status: Iteracja 1 zamknięta.** Wszystkie pięć workflowów CI przechodzi
-na commitcie `407e5c3` (i późniejszych) w repo
-`github.com/doniniks2004-hue/MinistrantManager`:
+**Closing commit: `db18b3503d9c311529e385bd5f6c2aca3f4ecbe5`**
+**Repository: `github.com/doniniks2004-hue/MinistrantManager`**
+
+## 5/5 GitHub Actions GREEN — confirmed on the closing commit
 
 | Workflow | Status |
 |---|---|
 | Backend tests | ✅ GREEN |
 | MobileAPI tests | ✅ GREEN |
-| Flutter analyze + test | ✅ GREEN (9 plików testowych faktycznie wykonanych) |
+| Flutter analyze + test | ✅ GREEN (10 test files actually executed) |
 | Android build (`flutter build apk --debug`) | ✅ GREEN |
 | iOS build (`flutter build ios --simulator --no-codesign`) | ✅ GREEN |
 
-To pierwszy moment, w którym możemy powiedzieć: **kod faktycznie się
-kompiluje i przechodzi testy na prawdziwej infrastrukturze CI**, nie tylko
-lokalnie na sucho.
+This is real CI, not a local claim — every green checkmark above was
+confirmed by querying the GitHub Actions API directly against this exact
+commit.
 
 ---
 
-## ZROBIONE (skumulowane, wszystkie rundy przeglądu)
+## History — three review rounds after the first 5/5 green
 
-Backend, MobileAPI i Flutter/Android/iOS przeszły łącznie cztery rundy
-przeglądu kodu + jedną rundę realnego debugowania CI. Kluczowe punkty:
+Two follow-up review rounds found and closed real remaining issues after
+the first fully-green run (commit `407e5c3`). Both rounds are now closed:
 
-**Backend (app.ministrant.eu)**: role SUPER_ADMIN/ADMIN, recovery codes
-(Argon2id, atomowe zużycie, kolumna `code_hash` poprawiona na 255 znaków),
-rate limiting TOTP, `totp_secret` szyfrowany, panel Audit Log, naprawiona
-aktywacja (transakcja + `lockForUpdate`), `DeviceStatusEvaluator`
-(platforma-specyficzna wersja minimalna), `AppConfig::$table` naprawione,
-`/device/status` przyjmuje i zapisuje `app_version`/`os_version` przed
-oceną statusu, audit log/rate limiter używają fingerprintu (SHA-256) —
-nigdy surowego kodu aktywacyjnego.
+### Round: `407e5c3` → `db18b35` — 5 final code-review points + 1 minor
 
-**MobileAPI**: `ActionDispatcher` z atomowym `tryClaim`/`finalize`/
-`failClaim`, `ActionResult::fromCached()` wiernie odtwarzający oryginalny
-status (error/conflict/applied — nigdy fałszywie `already_applied`),
-`SyncService` z prawdziwym `hasMore` i tombstones, `VerifyDeviceTokenService`
-z izolacją tenantów (test §36 dosłownie).
+1. **`ActionResult::fromCached()` fail-open fixed** — an unrecognized
+   cached status now fails closed (`error`, reason
+   `unknown_cached_status`) instead of being replayed as
+   `already_applied`, which could have caused the client to silently drop
+   a pending action that was never actually applied. Test added proving
+   this exact scenario.
+2. **Sync safety cap no longer lies about completion** — hitting the
+   200-page cap while `has_more` was still `true` used to unconditionally
+   mark `lastSyncAt` and send `/device/sync-ack` anyway. `pullChanges()`
+   now returns whether the log was genuinely drained to its end;
+   `lastSyncAt`/sync-ack are gated on that. Two tests added (genuine
+   completion vs. cap-hit) using a fake `Dio` via `InterceptorsWrapper` —
+   no real network needed, fully deterministic.
+3. **`ActionsController` now validates its input** — `actions` (array,
+   max 100), `client_action_id` (UUID), `type`, `payload`,
+   `base_version`, `created_at` are all validated before any
+   `ActionRequest` is constructed. A malformed request now gets a clean
+   `422`, not a risk of an uncaught exception.
+4. **Dead custom URI scheme removed** — the activation fallback page no
+   longer links to `ministrantmanager://activate/{token}` (a scheme no
+   Android/iOS build ever registered). The "OTWÓRZ APLIKACJĘ" button now
+   links back to the same canonical HTTPS activation URL, which App
+   Links/Universal Links intercept directly when configured — a harmless
+   no-op otherwise, never a second unsupported mechanism.
+5. **QR parser now validates host/scheme** — `ActivationService.extractTokenFromQr()`
+   mirrors `DeepLinkService`'s existing host/scheme validation: an
+   activation-shaped link (`/activate/{token}`) on the wrong host or over
+   plain `http` is no longer extracted as if it were a genuine
+   `app.ministrant.eu` token. Bare display codes and genuinely unrelated
+   URLs are unaffected. Tests added for both the accepted and rejected
+   cases, verbatim from the review report.
+6. **`RecoveryCodeService::regenerate()` now transactional** — the
+   DELETE-then-10-INSERTs sequence is wrapped in one DB transaction, so a
+   failure partway through rolls back to the still-complete old set
+   instead of leaving an admin with neither a full old set nor a full new
+   one.
 
-**Android/iOS (Flutter)**: `CipherEngine`/`MultiCiphersEngine` (SQLite3MultipleCiphers,
-poprawny import `package:sqlite3/common.dart`), crypto-erase przy revoke,
-`PreflightGate` (globalny client-config przed Activation/Home, z
-działającym przyciskiem AKTUALIZUJ przez wspólny `StoreLinkLauncher`),
-`DeepLinkService` z walidacją hosta, `checkDeviceStatus()` rozróżniający
-transport failure / 401 / 403 / 5xx (nowy `DeviceAuthState.authError`,
-fail-closed zamiast fail-open), kompletny natywny scaffold Android
-(Kotlin DSL, AGP 9.1.0, Gradle 9.3.1) i iOS (Xcode project, bundle
-identifier i deployment target 15.0 spójne wszędzie) — **wygenerowany
-raz przez Flutter 3.47.3 i faktycznie zweryfikowany w CI**, nie
-regenerowany przed każdym buildem.
+All six changes are mirrored across `mobile-android/`, `mobile-ios/`, and
+the canonical Flutter source tree, and were validated locally (PHP lint,
+Dart brace balance, `actionlint`, full local test suites) **before** being
+pushed — and then confirmed 5/5 green in real CI after the push.
 
-## PRZETESTOWANE REALNIE (lokalnie, w tym środowisku)
+### Earlier rounds (summarized — full detail in git history)
 
-Bez zmian względem poprzednich rund: testy współbieżności na
-prawdziwych dwóch procesach OS (aktywacja, recovery code, MobileAPI
-action claim), pełen zestaw testów framework-free MobileAPI, `php -l`
-na 61 plikach backendu — 0 błędów.
+- Role-based admin panel (SUPER_ADMIN/ADMIN), recovery codes (Argon2id,
+  atomic consume, correct column width), TOTP rate limiting, encrypted
+  `totp_secret`, Audit Log panel, transactional activation with
+  `lockForUpdate()`, platform-specific `DeviceStatusEvaluator`,
+  `AppConfig` table/column fixes, `/device/status` now applies
+  `app_version`/`os_version` before evaluating status, activation
+  audit/rate-limit keys use a SHA-256 fingerprint instead of the raw code.
+- `ActionDispatcher` with atomic `tryClaim`/`finalize`/`failClaim`,
+  `SyncService` with real `has_more` and tombstones,
+  `VerifyDeviceTokenService` with verbatim tenant-isolation test (§36).
+- `CipherEngine`/`MultiCiphersEngine` for SQLite3MultipleCiphers, full
+  crypto-erase on revoke, `PreflightGate` with a working store-link
+  button via a shared `StoreLinkLauncher`, `DeepLinkService` host
+  validation, `checkDeviceStatus()` distinguishing transport failure from
+  401/403/5xx (new `DeviceAuthState.authError`, fail-closed instead of
+  fail-open), and — the single biggest CI unlock — migrating the Android
+  native project fully to Flutter 3.47.3's Kotlin DSL Gradle scaffold
+  (AGP 9.1.0) with the complete, generated-once native project (Android
+  and iOS) committed directly to the repository instead of regenerated by
+  `flutter create` before every build.
 
-## PRZETESTOWANE W CI — TERAZ RZECZYWIŚCIE ZIELONE
-
-To jest fundamentalna zmiana względem poprzednich rund tego raportu,
-gdzie ta sekcja mówiła "nic". Diagnozowanie i naprawa oparte były na
-**prawdziwych logach GitHub Actions** (odczytywanych przez API, gdzie się
-dało, lub dostarczanych bezpośrednio przez Ciebie, gdzie moja sieć nie
-sięgała do Azure Blob Storage przechowującego pełne logi):
-
-- Naprawione po drodze: kontekst `secrets` niedozwolony w `if:` (realne
-  ograniczenie GitHub, nie fałszywy alarm), blokada advisory Composera
-  (`policy.advisories.block` — projektowy, nie globalny config),
-  niekompatybilna wersja Fluttera z Dart SDK wymaganym przez Drift
-  ^2.32.0 (3.24.0→3.47.3), domyślny `ExampleTest.php` świeżego Laravela
-  kolidujący z naszym routingiem, `CommonDatabase` w złym pakiecie
-  (`sqlite3.dart`→`common.dart`), literówki Dart (brakujące nawiasy,
-  `Value()`, `skip: true` zamiast stringa), podwójny `primaryKey` w
-  Drift, przestarzała wersja AGP (8.3.2→9.1.0 przez pełną migrację na
-  Kotlin DSL), niespójny bundle identifier iOS, deployment target 13.0→15.0.
+---
 
 ## IMPLEMENTED / NOT VERIFIED ON REAL DEVICE
 
-**Szyfrowanie lokalnej bazy — częściowy postęp.** Punkt 1 z
-czteropunktowej checklisty (`docs/ENCRYPTION.md`) jest teraz
-**potwierdzony**: `flutter pub get` i `flutter build apk`/`flutter build
-ios` przechodzą realnie w CI z konfiguracją `hooks.user_defines.sqlite3.source:
-sqlite3mc` — mechanizm faktycznie się rozwiązuje i aplikacja faktycznie
-się kompiluje z nim. **Punkty 2-4 (otwarcie z poprawnym kluczem, odrzucenie
-złego klucza, round-trip crypto-erase) nadal wymagają uruchomienia na
-prawdziwym urządzeniu/emulatorze** — CI buduje, ale nie uruchamia
-aplikacji ani nie wykonuje runtime asercji na cipherze.
+**Local SQLite encryption (SQLite3MultipleCiphers).** The build-time
+piece is now genuinely confirmed: `flutter pub get` and both
+`flutter build apk`/`flutter build ios` succeed in real CI with the
+`hooks.user_defines.sqlite3.source: sqlite3mc` configuration in place.
+**Still not verified**: opening an encrypted database with the correct
+key, refusing to open it with the wrong key, and a full crypto-erase
+round-trip — all three require running the compiled app on a real
+device/emulator, which CI's build-only steps do not do. See
+`docs/ENCRYPTION.md` for the exact remaining checklist.
 
 ## BLOCKERY
 
-- Brak realnego keystore Android / konta Apple Developer → sekrety
-  (`ANDROID_KEYSTORE_*`, `APPLE_CERTIFICATE_*`, `APPLE_TEAM_ID`) nie są
-  ustawione w repo, więc release-signing kroki CI pozostają no-op
-  (debug/simulator build wystarcza na tę iterację)
-- Brak dostępu do istniejącego kodu/schematu Ministrant Manager →
-  Iteracja 2
+- Brak realnego keystore Android / konta Apple Developer — sekrety
+  release-signing (`ANDROID_KEYSTORE_*`, `APPLE_CERTIFICATE_*`,
+  `APPLE_TEAM_ID`) nie są ustawione; debug/simulator build wystarczał na
+  tę iterację.
+- Brak dostępu do istniejącego kodu/schematu Ministrant Manager —
+  wszystko, co wymaga tego dostępu, jest jawnie oznaczone
+  `NOT INTEGRATED` i czeka na Iterację 2.
 
 ## PLACEHOLDERY (bez zmian)
 
-`public/.well-known/*`, `ios/ExportOptions.plist` teamID,
-`assets/branding/`, `ConfigController` (MobileAPI) zwraca pusty config.
+`public/.well-known/*` (App Links/Universal Links realne fingerprinty),
+`ios/ExportOptions.plist` teamID, `assets/branding/` (prawdziwe logo),
+`ConfigController` (MobileAPI) zwraca pusty, poprawny strukturalnie
+config.
 
 ## WYMAGA INTEGRACJI Z ISTNIEJĄCYM MM / DO ITERACJI 2
 
-Bez zmian względem poprzednich rund: prawdziwe adaptery repozytoriów
-domenowych, realne dane biznesowe (grafik/obecności/punkty/ranking/
+Prawdziwe adaptery repozytoriów domenowych (`EventsRepositoryInterface`
+i pozostałe), realne dane biznesowe (grafik/obecności/punkty/ranking/
 ogłoszenia/zastępstwa), faktyczne `permissions`, integracja
 `VerifyDeviceToken` z prawdziwym źródłem prawdy o urządzeniach. Każdy
 handler non-versioned musi być idempotentny względem `client_action_id`
@@ -114,8 +134,7 @@ LUB objęty jedną transakcją z action logiem (udokumentowane w
 
 ---
 
-**Iteracja 1 jest zamknięta.** Repozytorium
-`github.com/doniniks2004-hue/MinistrantManager` zawiera pełną,
-zweryfikowaną w CI historię — jeśli potrzebna jest analiza konkretnej
-decyzji, jest ona opisana w odpowiadającym jej commicie. Gotowi do
+**ITERATION 1 COMPLETE.** Fundament — backend, warstwa kontraktowa
+MobileAPI, i aplikacja mobilna Flutter dla Android i iOS — jest gotowy,
+zweryfikowany realnym CI na wszystkich pięciu frontach, i gotowy do
 Iteracji 2 z prawdziwym backendem Ministrant Manager.
