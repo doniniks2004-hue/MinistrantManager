@@ -29,14 +29,57 @@ class ActivationService {
   final SecureStorageService secureStorage;
   final _uuid = const Uuid();
 
+  /// The ONLY host a scanned/typed value is trusted to represent an
+  /// activation link for — mirrors DeepLinkService's identical constant
+  /// (spec §35, review round: QR parser must be as strict as the App
+  /// Link handler, not looser).
+  static const _trustedHost = 'app.ministrant.eu';
+
   /// Extracts the token from a scanned QR value shaped like
   /// "https://app.ministrant.eu/activate/{token}" (spec §12), or returns
-  /// the raw value unchanged if it's already a bare token/display code.
-  String extractTokenFromQr(String scannedValue) {
-    final marker = '/activate/';
-    final idx = scannedValue.indexOf(marker);
-    if (idx == -1) return scannedValue.trim();
-    return scannedValue.substring(idx + marker.length).trim();
+  /// the raw value unchanged if it's already a bare token/display code
+  /// (no recognizable URL structure at all — its own validity is the
+  /// backend's job to check, same as always).
+  ///
+  /// Review round fix: a value that DOES look like an activation link
+  /// (has an `/activate/{token}` path) but is on the WRONG host/scheme is
+  /// no longer extracted and passed through as if it were ours — e.g.
+  /// `https://evil.example/activate/abc` used to yield `abc` exactly like
+  /// a genuine app.ministrant.eu link would. The backend still rejects an
+  /// unknown token either way (this was never an auth bypass), but the
+  /// QR parser has no business being any looser than DeepLinkService's
+  /// own App Link handler is.
+  ///
+  /// Returns null (never a token) for a link that IS activation-shaped
+  /// but fails host/scheme validation — the caller should treat that as
+  /// "not one of ours", not attempt an activation check with it.
+  String? extractTokenFromQr(String scannedValue) {
+    final trimmed = scannedValue.trim();
+    final uri = Uri.tryParse(trimmed);
+
+    final looksLikeUrl = uri != null && (uri.scheme == 'http' || uri.scheme == 'https');
+    if (!looksLikeUrl) {
+      // No recognizable URL shape at all — treat as a bare code/token,
+      // same as always.
+      return trimmed;
+    }
+
+    final segments = uri.pathSegments;
+    final idx = segments.indexOf('activate');
+    final isActivationShaped = idx != -1 && idx + 1 < segments.length;
+
+    if (!isActivationShaped) {
+      // Some other, unrelated URL — not an activation link at all, so
+      // host/scheme validation doesn't even apply. Harmless either way:
+      // the backend rejects whatever this resolves to as an unknown code.
+      return trimmed;
+    }
+
+    if (uri.scheme != 'https' || uri.host != _trustedHost) {
+      return null;
+    }
+
+    return segments[idx + 1];
   }
 
   Future<String> _installationId() async {

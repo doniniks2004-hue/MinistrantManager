@@ -18,8 +18,21 @@
     <h2>Ministrant Manager</h2>
     @if ($valid)
         <p>Aktywuj aplikację parafii <strong>{{ $parishName }}</strong>.</p>
-        <p style="font-size:13px;color:#666;">Otwórz w aplikacji mobilnej Ministrant Manager, żeby dokończyć aktywację — ta strona sama jej nie wykonuje.</p>
-        <a class="btn primary" href="ministrantmanager://activate/{{ $token }}">OTWÓRZ APLIKACJĘ</a>
+        <p style="font-size:13px;color:#666;">Jeśli masz zainstalowaną aplikację Ministrant Manager z poprawnie skonfigurowanym App Link/Universal Link, kliknięcie poniżej otworzy ją bezpośrednio. W przeciwnym razie zeskanuj ten sam kod QR aplikacją.</p>
+        {{-- Review round (final micro-round, point 4): was a dead
+             `ministrantmanager://activate/{token}` custom scheme that no
+             Android/iOS build actually registers — a button whose only
+             possible outcome was "nothing happens" or an OS error dialog.
+             The canonical, ONLY supported deep-link mechanism is HTTPS
+             App Links/Universal Links (spec §35) on this exact URL — if
+             the app is installed and its App Link is verified, the OS
+             intercepts this https:// link and opens the app directly,
+             never even reaching this fallback page. Linking back to the
+             same canonical URL is therefore correct: it's a no-op ("you
+             are already here") when App Links aren't working yet, and
+             the intended deep-link open when they are — never a second,
+             unsupported mechanism. --}}
+        <a class="btn primary" href="{{ url("/activate/{$token}") }}">OTWÓRZ APLIKACJĘ</a>
     @else
         <p>Ten kod aktywacyjny jest nieprawidłowy, wygasł lub został już wykorzystany.</p>
         <p style="font-size:13px;color:#666;">Poproś administratora parafii o wygenerowanie nowego kodu.</p>

@@ -243,4 +243,22 @@ $ctx = new DeviceContext(installationId: 'inst-1', parishId: 'p1', parishSlug: '
     assertEquals('lector', $secondResult->currentRecord['role'], 'replayed conflict still carries the correct (unapplied) current record');
 }
 
+// ===================== TEST GROUP 7 (final micro-round, point 1):
+// ActionResult::fromCached() must fail CLOSED on an unrecognized cached
+// status, never silently report success =====================
+{
+    $result = \MinistrantManager\MobileAPI\DTO\ActionResult::fromCached(
+        ['status' => 'some_future_status_this_version_does_not_know'],
+        'action-unknown-cached-status',
+    );
+    assertEquals('error', $result->status, 'an unrecognized cached status is replayed as error, NEVER already_applied');
+    assertEquals('unknown_cached_status', $result->errorReason, 'the error reason names exactly what happened');
+
+    // Same for a cached row with NO status key at all (defensive — should
+    // not be reachable given ActionLogRepositoryInterface's contract, but
+    // must still fail safe rather than crash or silently succeed).
+    $resultNoStatus = \MinistrantManager\MobileAPI\DTO\ActionResult::fromCached([], 'action-no-status');
+    assertEquals('error', $resultNoStatus->status, 'a cached row with no status at all is also replayed as error');
+}
+
 echo "\nAll ActionDispatcher tests passed (idempotency + optimistic concurrency + unknown-type safety).\n";

@@ -35,5 +35,23 @@ void main() {
     test('a completely unrelated QR payload is still returned trimmed, not crashed on', () {
       expect(service.extractTokenFromQr('https://example.com/something-else'), 'https://example.com/something-else');
     });
+
+    // Review round (final micro-round, point 5): verbatim scenarios from
+    // the review report.
+    test('an activation-shaped link on a DIFFERENT host is rejected — never extracted as if it were ours', () {
+      expect(service.extractTokenFromQr('https://evil.example/activate/abc'), isNull);
+    });
+
+    test('an activation-shaped link over plain http (not https) on the right host is also rejected', () {
+      expect(service.extractTokenFromQr('http://app.ministrant.eu/activate/abc'), isNull);
+    });
+
+    test('the genuine host + https still extracts normally, unaffected by the new validation', () {
+      expect(service.extractTokenFromQr('https://app.ministrant.eu/activate/abc'), 'abc');
+    });
+
+    test('a bare display code is unaffected by the URL validation path at all', () {
+      expect(service.extractTokenFromQr('73FK-92MX'), '73FK-92MX');
+    });
   });
 }

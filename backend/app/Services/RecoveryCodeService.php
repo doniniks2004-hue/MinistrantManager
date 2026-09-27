@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\AdminRecoveryCode;
 use App\Models\AdminUser;
+use Illuminate\Support\Facades\DB;
 
 /**
  * Spec decision #5: 10 single-use codes, shown only at generation time and
@@ -14,19 +15,27 @@ class RecoveryCodeService
 {
     public function regenerate(AdminUser $admin): array
     {
-        $admin->recoveryCodes()->delete();
+        // Review round (final micro-round, point 6): DELETE + 10 INSERTs
+        // now run as one transaction — a crash/DB error partway through
+        // used to be able to leave an admin with NEITHER the old set NOR
+        // a complete new one (e.g. old codes deleted, only 3 of 10 new
+        // ones inserted). Wrapped, a failure anywhere rolls back to the
+        // old, still-complete set instead.
+        return DB::transaction(function () use ($admin) {
+            $admin->recoveryCodes()->delete();
 
-        $rawCodes = [];
-        foreach (range(1, 10) as $_) {
-            $raw = RecoveryCodeFormatter::generateOne();
-            $rawCodes[] = $raw;
-            AdminRecoveryCode::create([
-                'admin_user_id' => $admin->id,
-                'code_hash' => RecoveryCodeFormatter::hashForStorage($raw),
-            ]);
-        }
+            $rawCodes = [];
+            foreach (range(1, 10) as $_) {
+                $raw = RecoveryCodeFormatter::generateOne();
+                $rawCodes[] = $raw;
+                AdminRecoveryCode::create([
+                    'admin_user_id' => $admin->id,
+                    'code_hash' => RecoveryCodeFormatter::hashForStorage($raw),
+                ]);
+            }
 
-        return $rawCodes;
+            return $rawCodes;
+        });
     }
 
     /**

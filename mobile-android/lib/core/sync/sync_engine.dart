@@ -46,12 +46,14 @@ class SyncEngine {
     required this.api,
     required this.secureStorage,
     this.offlineLease = const OfflineLease(),
+    @visibleForTesting this.maxPagesPerRun = 200,
   });
 
   final AppDatabase db;
   final ApiClient api;
   final SecureStorageService secureStorage;
   final OfflineLease offlineLease;
+  final int maxPagesPerRun;
   final _uuid = const Uuid();
 
   bool _isSyncing = false;
@@ -179,14 +181,35 @@ class SyncEngine {
     _isSyncing = true;
     try {
       await pushPendingActions();
-      await pullChanges();
-      await _acknowledgeSyncToCentral();
+      final completed = await pullChanges();
+      // Review round (final micro-round, point 2): sync-ack — and
+      // therefore the panel's "last sync" column — must NEVER report
+      // success for a sync that hit the safety cap while more pages
+      // genuinely remained. See pullChanges()'s own docblock for the
+      // exact scenario this closes.
+      if (completed) {
+        await _acknowledgeSyncToCentral();
+      }
     } finally {
       _isSyncing = false;
     }
   }
 
-  Future<void> pullChanges() async {
+  /// Returns `true` iff the change log was drained to its actual end
+  /// (server reported `has_more: false`) — `false` if the
+  /// [maxPagesPerRun] safety cap was hit while pages genuinely remained.
+  ///
+  /// Review round fix (final micro-round, point 2): this used to
+  /// unconditionally write `lastSyncAt` and let the caller unconditionally
+  /// send `/device/sync-ack` regardless of which case happened — so a
+  /// parish with more than 200 pages of pending changes would have its
+  /// 201st+ page silently left unsynced FOREVER while the panel and the
+  /// device's own `lastSyncAt` both reported success. The per-page cursor
+  /// (already persisted inside `_applyIncremental` on every iteration) is
+  /// unaffected either way — the NEXT call to `pullChanges()` continues
+  /// from exactly where this one stopped; only the "we are fully caught
+  /// up" signal was wrong.
+  Future<bool> pullChanges() async {
     final dio = await api.parish();
     var meta = await db.ensureSyncMetadata();
 
@@ -198,14 +221,28 @@ class SyncEngine {
       // bootstrap forever.
       final resp = await dio.get('/mobile/bootstrap');
       await _applyBootstrap(resp.data as Map<String, dynamic>);
-      meta = await db.ensureSyncMetadata(); // re-read: cursor is now set
     }
 
-    // Iteration 1.1 point 2: keep paging /mobile/sync until the server
-    // reports has_more=false, so ONE runFullSync() call reaches the
-    // current end of the change log — a parish with many pending changes
-    // no longer needs "five more app launches" to catch up.
-    const maxPagesPerRun = 200; // safety cap against a misbehaving server claiming has_more forever
+    return _drainSyncPages(dio);
+  }
+
+  /// Test seam (final micro-round, point 2): the pagination loop itself,
+  /// factored out so a test can drive it against a fake [dio] (e.g. an
+  /// `InterceptorsWrapper` that resolves every request without real
+  /// network I/O) and a small [maxPagesPerRun] (via the constructor),
+  /// without needing a real parish server.
+  @visibleForTesting
+  Future<bool> drainSyncPagesForTesting(Dio dio) => _drainSyncPages(dio);
+
+  /// Iteration 1.1 point 2 / final micro-round point 2: keeps paging
+  /// `/mobile/sync` until the server reports `has_more: false` (bounded by
+  /// [maxPagesPerRun] against a misbehaving server claiming has_more
+  /// forever), and returns whether the log was ACTUALLY drained to its
+  /// end. The per-page cursor is persisted on every iteration inside
+  /// `_applyIncremental` regardless of how this ends — only the
+  /// "fully caught up" signal (`lastSyncAt`, and therefore whether
+  /// `runFullSync()` sends `/device/sync-ack`) depends on the return value.
+  Future<bool> _drainSyncPages(Dio dio) async {
     var page = 0;
     var hasMore = true;
     while (hasMore && page < maxPagesPerRun) {
@@ -215,9 +252,18 @@ class SyncEngine {
       page++;
     }
 
-    await (db.update(db.syncMetadata)..where((t) => t.id.equals(1))).write(
-      SyncMetadataCompanion(lastSyncAt: Value(DateTime.now().toUtc())),
-    );
+    final completed = !hasMore;
+
+    if (completed) {
+      await (db.update(db.syncMetadata)..where((t) => t.id.equals(1))).write(
+        SyncMetadataCompanion(lastSyncAt: Value(DateTime.now().toUtc())),
+      );
+    }
+    // else: intentionally leave lastSyncAt untouched — the last GENUINELY
+    // complete sync (if any) remains what the UI/panel report, rather
+    // than being overwritten with a premature "done".
+
+    return completed;
   }
 
   EventsCompanion _mapEvent(Map<String, dynamic> row) => EventsCompanion.insert(

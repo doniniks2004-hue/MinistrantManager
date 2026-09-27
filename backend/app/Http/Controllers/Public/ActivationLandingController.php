@@ -17,9 +17,12 @@ use Illuminate\Http\Request;
  * This is a deliberately thin fallback page: it does NOT perform
  * activation itself (that still only happens through the app's own
  * check/confirm flow against the JSON API) — it just tells a human what
- * to do next. Deep-linking straight into the app (custom scheme now,
- * Universal Links / App Links later once the app is published) is a
- * follow-up, not blocking.
+ * to do next. Deep-linking straight into the app is HTTPS App Links /
+ * Universal Links (spec §35) on this exact URL — there is deliberately
+ * NO second, custom-scheme mechanism (a dead `ministrantmanager://...`
+ * link was removed here per review — no Android/iOS build actually
+ * registers that scheme, so it could only ever fail silently or throw an
+ * OS-level "no app found" error).
  */
 class ActivationLandingController extends Controller
 {

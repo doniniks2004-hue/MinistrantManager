@@ -70,11 +70,15 @@ final class ActionResult
             'applied' => self::alreadyApplied($clientActionId, $cached['new_version'] ?? null),
             'conflict' => new self($clientActionId, 'conflict', newVersion: $cached['new_version'] ?? null, currentRecord: $cached['current_record'] ?? []),
             'error' => self::error($clientActionId, $cached['reason'] ?? 'unknown_error'),
-            // Defensive default for a status this version doesn't
-            // recognize (e.g. an older/newer writer) — replayed as
-            // already_applied rather than crashing, but this branch
-            // should not be reachable given the state machine above.
-            default => self::alreadyApplied($clientActionId, $cached['new_version'] ?? null),
+            // Review round fix: was `self::alreadyApplied(...)` — fail-OPEN.
+            // A cached row with a status this version doesn't recognize
+            // (future writer, corrupted row, anything unexpected) must
+            // NEVER be replayed as a success — the client reads
+            // already_applied as "safe to delete from pending_actions",
+            // so a false-positive here is exactly the silently-dropped-
+            // action bug this whole mechanism exists to prevent. Fail
+            // closed: report it as an error instead.
+            default => self::error($clientActionId, 'unknown_cached_status'),
         };
     }
 

@@ -43,6 +43,7 @@ class _ActivationScreenState extends State<ActivationScreen> {
   Future<void> _handleScanned(String raw) async {
     if (_busy) return;
     final token = widget.activationService.extractTokenFromQr(raw);
+    if (token == null) return; // not a recognized activation link — silently ignore, keep scanning
     await _check(token: token);
   }
 
