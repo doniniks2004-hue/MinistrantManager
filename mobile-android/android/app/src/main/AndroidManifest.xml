@@ -1,0 +1,49 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Network access for activation, sync, heartbeat -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- QR scanning (mobile_scanner) -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+
+    <application
+        android:label="Ministrant Manager"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <meta-data
+                android:name="io.flutter.embedding.android.NormalTheme"
+                android:resource="@style/NormalTheme" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+
+            <!-- Android App Links (spec §35, decision #9) — PLACEHOLDER,
+                 inert until: (1) this app is signed with the real release
+                 keystore, and (2) app.ministrant.eu/.well-known/assetlinks.json
+                 (see backend package's docs-app-links.md) lists that
+                 keystore's real SHA-256 fingerprint. android:autoVerify
+                 is what makes Android actually check assetlinks.json —
+                 without a verified match, links fall back to opening in
+                 the browser (the /activate/{token} fallback page), which
+                 is exactly the safe degradation spec §3 describes. -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="app.ministrant.eu" android:pathPrefix="/activate" />
+            </intent-filter>
+        </activity>
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+    </application>
+</manifest>

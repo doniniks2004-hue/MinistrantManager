@@ -1,0 +1,18 @@
+# PHP
+/backend/vendor/
+/mobileapi/vendor/
+
+# Flutter/Dart
+**/.dart_tool/
+**/build/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.packages
+**/pubspec.lock
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store

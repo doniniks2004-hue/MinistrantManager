@@ -1,0 +1,73 @@
+name: Backend tests
+
+# Iteration 1.1 point 12 fix: this workflow used to assume a repo root
+# that already WAS a full Laravel project — this standalone package zip
+# is not that. It now scaffolds a fresh Laravel 11 app itself, overlays
+# this package on top (ci/overlay-package.sh), and only then runs
+# migrations/tests — genuinely runnable straight after checkout, no
+# manual "prepare the project first" step.
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: yes
+          MYSQL_DATABASE: ministrant_app_test
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: package
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, pdo_mysql, sqlite3, zip
+          coverage: none
+
+      - name: Syntax-check every PHP file in the package (fast pre-check)
+        run: find package/backend/app package/backend/database package/backend/routes package/backend/tests -name "*.php" -print0 | xargs -0 -n1 php -l
+
+      - name: Run framework-free standalone tests
+        run: for f in package/backend/standalone-tests/test_*.php; do php "$f"; done
+
+      - name: Scaffold a fresh Laravel 11 app
+        run: composer create-project laravel/laravel laravel-app "^11.0" --no-interaction
+
+      - name: Overlay this package onto the fresh app
+        run: bash package/backend/ci/overlay-package.sh package/backend laravel-app
+
+      - name: Require additional packages
+        working-directory: laravel-app
+        run: composer require pragmarx/google2fa bacon/bacon-qr-code --no-interaction
+
+      - name: Configure environment
+        working-directory: laravel-app
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+          sed -i 's/DB_CONNECTION=.*/DB_CONNECTION=mysql/' .env
+          sed -i 's/DB_HOST=.*/DB_HOST=127.0.0.1/' .env
+          sed -i 's/DB_PORT=.*/DB_PORT=3306/' .env
+          sed -i 's/DB_DATABASE=.*/DB_DATABASE=ministrant_app_test/' .env
+          sed -i 's/DB_USERNAME=.*/DB_USERNAME=root/' .env
+          sed -i 's/DB_PASSWORD=.*/DB_PASSWORD=/' .env
+
+      - name: Run migrations
+        working-directory: laravel-app
+        run: php artisan migrate --force
+
+      - name: Run Laravel feature tests
+        working-directory: laravel-app
+        run: php artisan test

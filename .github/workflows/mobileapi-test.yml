@@ -1,0 +1,32 @@
+name: MobileAPI tests
+
+# This one CAN actually run as-is (unlike backend-test.yml / android-build.yml
+# / ios-build.yml) — every test under Tests/ is framework-free plain PHP,
+# exactly what was executed manually during Iteration 1 development (see
+# docs/TESTING.md). This workflow is the automated version of
+# `bash Tests/run_all.sh`.
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobileapi
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+
+      - name: Syntax-check every PHP file
+        run: find . -name "*.php" -not -path "./vendor/*" -print0 | xargs -0 -n1 php -l
+
+      - name: Run framework-free tests
+        run: bash Tests/run_all.sh

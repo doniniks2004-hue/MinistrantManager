@@ -1,0 +1,11 @@
+{
+  "applinks": {
+    "apps": [],
+    "details": [
+      {
+        "appID": "__APPLE_TEAM_ID__.__APPLE_BUNDLE_ID__",
+        "paths": ["/activate/*"]
+      }
+    ]
+  }
+}

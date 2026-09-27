@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- iOS Universal Links (spec §35, decision #9) — PLACEHOLDER, inert
+         until an Apple Developer account + App ID exist and
+         app.ministrant.eu/.well-known/apple-app-site-association (see
+         backend package's docs-app-links.md) lists the real Team ID.
+         Without a verified match, links fall back to opening in Safari
+         (the /activate/{token} fallback page) — same safe degradation
+         as the Android side. -->
+    <key>com.apple.developer.associated-domains</key>
+    <array>
+        <string>applinks:app.ministrant.eu</string>
+    </array>
+</dict>
+</plist>

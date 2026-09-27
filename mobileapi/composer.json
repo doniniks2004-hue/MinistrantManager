@@ -1,0 +1,16 @@
+{
+    "name": "i-ban/ministrant-manager-mobileapi",
+    "description": "Contracts + framework-agnostic sync/action/config engine for integrating the Ministrant Manager mobile app with an existing parish backend (*.ministrant.eu).",
+    "type": "library",
+    "require": {
+        "php": "^8.2"
+    },
+    "require-dev": {
+    },
+    "autoload": {
+        "psr-4": {
+            "MinistrantManager\\MobileAPI\\": "."
+        },
+        "exclude-from-classmap": ["Tests/"]
+    }
+}

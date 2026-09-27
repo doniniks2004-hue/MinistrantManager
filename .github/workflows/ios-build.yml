@@ -1,0 +1,77 @@
+name: iOS build
+
+on:
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: mobile-ios
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.27.0' # ships Dart 3.6.0 — matches pubspec.yaml's 'sdk: >=3.6.0' constraint (Drift >=2.32/sqlite3 3.x). Review round 3, point 2: 3.24.0 shipped Dart 3.5.x and would have failed `flutter pub get` on this SDK constraint.
+          channel: 'stable'
+
+      - name: Snapshot our customized files BEFORE flutter create
+        run: |
+          mkdir -p /tmp/pre-create-snapshot
+          cp ios/Runner/Info.plist /tmp/pre-create-snapshot/
+          cp ios/Runner/Runner.entitlements /tmp/pre-create-snapshot/
+          cp ios/Podfile /tmp/pre-create-snapshot/
+
+      - name: flutter create (regenerate Xcode project + missing native scaffolding)
+        run: flutter create --org eu.ministrant --project-name ministrant_manager --platforms ios .
+
+      - name: Verify flutter create did NOT overwrite our Universal Links / camera-permission customizations
+        # Iteration 1.1 point 13 — see android-build.yml's identical step
+        # for the full rationale: turns "flutter create shouldn't overwrite
+        # existing files" from an assumption into an enforced check.
+        run: |
+          diff /tmp/pre-create-snapshot/Info.plist ios/Runner/Info.plist
+          diff /tmp/pre-create-snapshot/Runner.entitlements ios/Runner/Runner.entitlements
+          diff /tmp/pre-create-snapshot/Podfile ios/Podfile
+          grep -q "applinks:app.ministrant.eu" ios/Runner/Runner.entitlements
+
+      - run: flutter pub get
+      - run: dart run build_runner build --delete-conflicting-outputs
+
+      - name: pod install
+        run: cd ios && pod install
+
+      # Per spec decision #1/#3: unsigned/simulator build where no Apple
+      # Developer certificate exists yet — this always runs and proves the
+      # Xcode project + Dart code actually compile for iOS. The signed
+      # IPA/TestFlight step below only runs once the four secrets exist.
+      - name: Build for iOS simulator (unsigned, always runs)
+        run: flutter build ios --simulator --no-codesign
+
+      - name: Import signing certificate + provisioning profile (only if configured)
+        if: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' }}
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 -d > certificate.p12
+          echo "$APPLE_PROVISIONING_PROFILE_BASE64" | base64 -d > profile.mobileprovision
+          security create-keychain -p "" build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
+
+      - name: Build signed IPA (only if configured — requires APPLE_TEAM_ID too)
+        if: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' && secrets.APPLE_TEAM_ID != '' }}
+        run: flutter build ipa --export-options-plist=ios/ExportOptions.plist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-outputs
+          path: mobile-ios/build/ios/ipa/*.ipa
+          if-no-files-found: warn
