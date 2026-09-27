@@ -11,7 +11,7 @@ return new class extends Migration
         Schema::create('admin_recovery_codes', function (Blueprint $table) {
             $table->id();
             $table->foreignId('admin_user_id')->constrained('admin_users')->cascadeOnDelete();
-            $table->string('code_hash', 64); // SHA-256, raw code shown once at generation time
+            $table->string('code_hash', 255); // Argon2id (~97 chars) — see RecoveryCodeFormatter::hashForStorage(); raw code shown once at generation time, never stored
             $table->timestamp('used_at')->nullable();
             $table->timestamps();
 

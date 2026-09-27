@@ -1,5 +1,6 @@
 import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
+import '../../core/util/store_link_launcher.dart';
 import '../config/config_service.dart';
 import '../dashboard/module_version_gate.dart';
 
@@ -149,7 +150,7 @@ class _ForcedUpdateScreen extends StatelessWidget {
             Text('Wymagana wersja: $minVersion lub nowsza.', textAlign: TextAlign.center),
             const SizedBox(height: 20),
             if (hasStoreUrl)
-              FilledButton(onPressed: () {/* url_launcher — same pattern as HomeScreen._openStoreListing */}, child: const Text('AKTUALIZUJ'))
+              FilledButton(onPressed: () => StoreLinkLauncher.open(storeUrl), child: const Text('AKTUALIZUJ'))
             else
               const Text('Aktualizacja wkrótce dostępna.', style: TextStyle(color: Colors.grey)),
           ]),

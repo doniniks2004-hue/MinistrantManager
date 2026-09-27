@@ -46,7 +46,25 @@ class DeviceController extends Controller
     public function status(Request $request)
     {
         $device = $this->authenticateDevice($request);
-        $device->update(['last_authorization_check' => now()]);
+
+        // Review round fix: app_version/os_version were accepted by
+        // heartbeat() but NOT here — the client now sends them on every
+        // /device/status call too, and they're applied BEFORE
+        // DeviceStatusEvaluator runs, so UPDATE_REQUIRED is judged
+        // against the version the device says it's running right now,
+        // not whatever was last recorded at activation/heartbeat time
+        // (which could be stale for a device that just updated but
+        // hasn't heartbeat'd yet).
+        $data = $request->validate([
+            'app_version' => ['nullable', 'string', 'max:50'],
+            'os_version' => ['nullable', 'string', 'max:100'],
+        ]);
+
+        $device->update([
+            'last_authorization_check' => now(),
+            'app_version' => $data['app_version'] ?? $device->app_version,
+            'os_version' => $data['os_version'] ?? $device->os_version,
+        ]);
 
         return $this->statusResponse($device);
     }

@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:url_launcher/url_launcher.dart';
+import '../../core/util/store_link_launcher.dart';
 import '../../core/database/app_database.dart';
 import '../../core/sync/sync_engine.dart';
 import '../config/config_service.dart';
@@ -105,6 +105,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
 
+    if (status.state == DeviceAuthState.authError) {
+      // Review round: explicit 401/403/unrecognized-status — fail closed.
+      // Deliberately NOT the same handling as revoked/parishDisabled: this
+      // is not a confirmed revocation signal (could be a transient server
+      // bug, a genuinely unknown token, or a forward-compat gap), so local
+      // data is NOT wiped — just not shown until a real ACTIVE/REVOKED/
+      // PARISH_DISABLED answer is obtained.
+      setState(() => _syncing = false);
+      return;
+    }
+
     if (status.state == DeviceAuthState.active) {
       try {
         await widget.syncEngine.runFullSync();
@@ -132,11 +143,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final url = Theme.of(context).platform == TargetPlatform.iOS
         ? (_clientConfig?['ios_store_url'] as String?)
         : (_clientConfig?['android_store_url'] as String?);
-    if (url == null || url.isEmpty) return; // spec decision #15: no link yet published — button simply does nothing extra
-    final uri = Uri.tryParse(url);
-    if (uri != null) {
-      await launchUrl(uri, mode: LaunchMode.externalApplication);
-    }
+    await StoreLinkLauncher.open(url);
   }
 
   @override
@@ -191,6 +198,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 onPressed: hasStoreUrl ? _openStoreListing : null,
                 child: Text(hasStoreUrl ? 'AKTUALIZUJ' : 'Aktualizacja wkrótce dostępna'),
               ),
+            ]),
+          ),
+        ),
+      );
+    }
+
+    if (_authState == DeviceAuthState.authError) {
+      return Scaffold(
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              const Icon(Icons.lock_outline, size: 48, color: Colors.red),
+              const SizedBox(height: 16),
+              const Text(
+                'Nie udało się potwierdzić autoryzacji tego urządzenia.\nSpróbuj ponownie za chwilę.',
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 20),
+              FilledButton(onPressed: _bootstrapThenSync, child: const Text('SPRÓBUJ PONOWNIE')),
             ]),
           ),
         ),

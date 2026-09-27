@@ -11,7 +11,7 @@ return new class extends Migration
     {
         Schema::create('app_config', function (Blueprint $table) {
             $table->string('key')->primary();
-            $table->string('value');
+            $table->text('value'); // TEXT not string(255): maintenance_message allows up to 500 chars, store URLs up to 500 too
             $table->timestamps();
         });
 

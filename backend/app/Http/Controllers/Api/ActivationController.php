@@ -224,15 +224,25 @@ class ActivationController extends Controller
     {
         $codeKey = $data['display_code'] ?? substr($data['token'] ?? '', 0, 16);
 
+        // Review round fix: was rate-limiting AND audit-logging on the raw
+        // display code / a raw token fragment directly — meaning actual
+        // activation secrets ended up sitting in plaintext in both the
+        // rate limiter's cache keys and the audit_logs table. A
+        // fingerprint (truncated hash of the normalized code) still lets
+        // an admin correlate repeated attempts against the SAME code
+        // without the log itself becoming a place a real code could be
+        // read back out of.
+        $fingerprint = substr(hash('sha256', strtoupper(preg_replace('/[^A-Za-z0-9]/', '', $codeKey))), 0, 12);
+
         $ipKey = 'activation:failed:ip:' . $request->ip();
-        $codeRateKey = 'activation:failed:code:' . $codeKey;
+        $codeRateKey = 'activation:failed:code:' . $fingerprint;
 
         RateLimiter::hit($ipKey, self::FAILED_ATTEMPTS_DECAY_MINUTES * 60);
         RateLimiter::hit($codeRateKey, self::FAILED_ATTEMPTS_DECAY_MINUTES * 60);
 
         AuditLogger::log('activation.failed', null, null, [
             'reason' => $reason,
-            'code' => $codeKey,
+            'code_fingerprint' => $fingerprint,
         ]);
 
         if (RateLimiter::tooManyAttempts($ipKey, self::MAX_FAILED_ATTEMPTS)) {
@@ -240,7 +250,7 @@ class ActivationController extends Controller
             abort(429, 'Zbyt wiele nieudanych prób. Spróbuj ponownie za kilka minut.');
         }
         if (RateLimiter::tooManyAttempts($codeRateKey, self::MAX_FAILED_ATTEMPTS)) {
-            AuditLogger::log('activation.rate_limited', null, null, ['code' => $codeKey, 'scope' => 'failed_code']);
+            AuditLogger::log('activation.rate_limited', null, null, ['code_fingerprint' => $fingerprint, 'scope' => 'failed_code']);
             abort(429, 'Zbyt wiele nieudanych prób dla tego kodu.');
         }
     }

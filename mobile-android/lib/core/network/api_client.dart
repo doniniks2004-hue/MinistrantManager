@@ -57,6 +57,11 @@ class ApiClient {
     return Dio(BaseOptions(
       baseUrl: centralBaseUrl,
       headers: {'Authorization': 'Bearer $deviceToken'},
+      // Review round: `central` (below) already had timeouts; this client
+      // didn't — an unresponsive server could hang checkDeviceStatus()
+      // indefinitely instead of failing into the offline-lease path.
+      connectTimeout: const Duration(seconds: 10),
+      receiveTimeout: const Duration(seconds: 15),
     ));
   }
 }

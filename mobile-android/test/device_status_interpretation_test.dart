@@ -31,10 +31,20 @@ void main() {
       expect(result.minimumSupportedAppVersion, '1.2.0');
     });
 
-    test('ACTIVE (or any unrecognized status) maps to DeviceAuthState.active — fails safe, never crashes', () {
+    test('ACTIVE maps to DeviceAuthState.active — only the exact literal string', () {
       expect(engine.interpretStatusForTesting({'status': 'ACTIVE'}).state, DeviceAuthState.active);
-      expect(engine.interpretStatusForTesting({'status': 'SOMETHING_FUTURE_UNKNOWN'}).state, DeviceAuthState.active);
-      expect(engine.interpretStatusForTesting({}).state, DeviceAuthState.active);
+    });
+
+    // Review round fix: was fail-OPEN (unknown/missing status -> active).
+    // An unrecognized or missing status string must fail CLOSED instead —
+    // never silently treated as active.
+    test('an unrecognized status string maps to DeviceAuthState.authError, NOT active', () {
+      expect(engine.interpretStatusForTesting({'status': 'SOMETHING_FUTURE_UNKNOWN'}).state, DeviceAuthState.authError);
+    });
+
+    test('a missing/null status maps to DeviceAuthState.authError, NOT active', () {
+      expect(engine.interpretStatusForTesting({}).state, DeviceAuthState.authError);
+      expect(engine.interpretStatusForTesting({'status': null}).state, DeviceAuthState.authError);
     });
   });
 }

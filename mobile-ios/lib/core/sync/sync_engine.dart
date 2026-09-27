@@ -9,7 +9,22 @@ import '../network/api_client.dart';
 import '../secure/secure_storage_service.dart';
 import 'offline_lease.dart';
 
-enum DeviceAuthState { active, revoked, parishDisabled, updateRequired, offlineWithinLease, offlineLeaseExpired }
+enum DeviceAuthState {
+  active,
+  revoked,
+  parishDisabled,
+  updateRequired,
+  // Review round: covers BOTH an explicit HTTP 401/403 from a server that
+  // DID respond (invalid/unknown token, or another explicit security
+  // rejection) AND an unrecognized/missing `status` string in an
+  // otherwise-successful response. Neither is "offline" (the server
+  // answered) and neither is safely treated as ACTIVE (fail-open) —
+  // access is blocked, cached data is not shown, without necessarily
+  // being as destructive as a confirmed revoked/parishDisabled signal.
+  authError,
+  offlineWithinLease,
+  offlineLeaseExpired,
+}
 
 class DeviceStatusResult {
   DeviceStatusResult(this.state, {this.minimumSupportedAppVersion});
@@ -51,24 +66,71 @@ class SyncEngine {
 
     try {
       final dio = api.centralWithAuth(token);
-      final resp = await dio.post('/device/status');
+      // Review round: app_version/os_version are now actually SENT — the
+      // backend was evaluating UPDATE_REQUIRED against whatever version
+      // was last recorded at activation/heartbeat time, which could be
+      // stale for a device that just updated but hasn't heartbeat'd yet.
+      final resp = await dio.post('/device/status', data: {
+        'app_version': appVersion,
+        'os_version': osVersion,
+      });
       final data = resp.data as Map<String, dynamic>;
 
       await _persistServerControlledConfig(data);
 
       return _interpretStatus(data);
-    } on DioException {
-      // No connectivity / server unreachable — fall back to offline lease,
-      // using the LAST value of offline_lease_hours this device actually
-      // saw from the server (never a hardcoded client constant).
-      final withinLease = offlineLease.isWithinLease(
-        meta.lastAuthorizationCheck,
-        leaseHours: meta.offlineLeaseHours,
-      );
-      return DeviceStatusResult(
-        withinLease ? DeviceAuthState.offlineWithinLease : DeviceAuthState.offlineLeaseExpired,
-      );
+    } on DioException catch (e) {
+      return _interpretDioFailure(e, meta);
     }
+  }
+
+  /// Review round fix: the previous code treated EVERY DioException as
+  /// "no internet" and fell back to the offline lease — but a DioException
+  /// also wraps ordinary HTTP error responses (401, 403, 5xx). A server
+  /// that explicitly answered "401 unknown token" is reachable and has an
+  /// opinion; silently reading that as "offline, use cached lease" would
+  /// let a device with an invalidated token keep using local data for up
+  /// to the whole lease window.
+  DeviceStatusResult _interpretDioFailure(DioException e, SyncMetadataData meta) {
+    final statusCode = e.response?.statusCode;
+
+    if (statusCode != null) {
+      // The server responded — this is never a connectivity problem.
+      if (statusCode == 401) {
+        // Invalid/unknown device token — fail closed, do not serve cached data.
+        return DeviceStatusResult(DeviceAuthState.authError);
+      }
+      if (statusCode == 403) {
+        // Explicit security rejection — same treatment as 401.
+        return DeviceStatusResult(DeviceAuthState.authError);
+      }
+      if (statusCode >= 500) {
+        // Server-side failure, not a device-auth decision by the server —
+        // treated as a temporary outage, same as a genuine transport
+        // failure below (an explicit, deliberate choice per review, not
+        // an oversight: a device shouldn't be locked out by a backend
+        // deploy blip).
+        return _offlineLeaseResult(meta);
+      }
+      // Any other unexpected HTTP status from a server that DID respond:
+      // fail closed rather than silently trusting cached data.
+      return DeviceStatusResult(DeviceAuthState.authError);
+    }
+
+    // No response at all — genuine transport failure (timeout, DNS,
+    // connection refused, no network reachability). This is the ONLY
+    // case the offline lease is meant to cover.
+    return _offlineLeaseResult(meta);
+  }
+
+  DeviceStatusResult _offlineLeaseResult(SyncMetadataData meta) {
+    final withinLease = offlineLease.isWithinLease(
+      meta.lastAuthorizationCheck,
+      leaseHours: meta.offlineLeaseHours,
+    );
+    return DeviceStatusResult(
+      withinLease ? DeviceAuthState.offlineWithinLease : DeviceAuthState.offlineLeaseExpired,
+    );
   }
 
   /// Persists everything the central server is authoritative for and that
@@ -98,8 +160,14 @@ class SyncEngine {
           DeviceAuthState.updateRequired,
           minimumSupportedAppVersion: data['minimum_supported_app_version'] as String?,
         );
-      default:
+      case 'ACTIVE':
         return DeviceStatusResult(DeviceAuthState.active);
+      default:
+        // Review round fix: was `DeviceAuthState.active` — fail-OPEN. An
+        // unrecognized status string (a future server status this build
+        // predates, or a malformed/empty response) must NEVER be treated
+        // as active. Fail closed instead.
+        return DeviceStatusResult(DeviceAuthState.authError);
     }
   }
 
