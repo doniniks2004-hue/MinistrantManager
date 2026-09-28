@@ -118,8 +118,7 @@ class MyScheduleScreen extends StatelessWidget {
             ],
           );
         },
-      ),
-    );
+      );
   }
 
   Future<void> _confirmLogout(BuildContext context) async {
