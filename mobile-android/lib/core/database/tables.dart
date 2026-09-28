@@ -17,26 +17,47 @@ class ParishInfo extends Table {
 }
 
 class Events extends Table {
-  TextColumn get id => text()(); // server-side UUID/ID as string
-  TextColumn get title => text()();
-  DateTimeColumn get startsAt => dateTime()();
-  DateTimeColumn get endsAt => dateTime().nullable()();
-  TextColumn get payloadJson => text()(); // full record, for fields the UI hasn't modeled yet
-  IntColumn get version => integer().withDefault(const Constant(1))();
-  DateTimeColumn get updatedAt => dateTime()();
+  // Review round fix (point 4/5): `id` is the CANONICAL string key the
+  // real backend sends — "{source}:{raw_id}" (e.g. "events:17" /
+  // "weekday_events:17") — never the bare integer, because events.id and
+  // weekday_events.id are independent sequences that DO collide.
+  TextColumn get id => text()();
+  IntColumn get rawId => integer()();
+  TextColumn get source => text()(); // 'events' | 'weekday_events'
+  DateTimeColumn get eventDate => dateTime()();
+  TextColumn get description => text().nullable()();
+  IntColumn get moduleId => integer().nullable()();
+  BoolColumn get isCancelled => boolean().withDefault(const Constant(false))();
+
+  // Review round fix (point 5): no `version`/`updatedAt` — this is a
+  // snapshot-first, read-only mirror of the real legacy `events`/
+  // `weekday_events` tables, neither of which has anything resembling
+  // those columns. Inventing fake version=1/updatedAt=now() values just
+  // to keep an old incremental-sync-shaped column around was explicitly
+  // rejected ("Nie chcę adaptera pełnego sztucznych pól... Snapshot nie
+  // potrzebuje version ani updated_at do read-only"). The whole table's
+  // content for a given fetch window is replaced atomically on every
+  // successful bootstrap instead — see SyncEngine.replaceScheduleSnapshot().
 
   @override
   Set<Column> get primaryKey => {id};
 }
 
 class ScheduleAssignments extends Table {
+  // Same canonical-key reasoning as Events.id above. For a
+  // weekday_events-sourced assignment, this equals eventId — the
+  // assignment IS the event row, there is no separate "schedule row" for
+  // it (see LegacyMysqlScheduleRepository's docblock on the backend).
   TextColumn get id => text()();
-  TextColumn get eventId => text().nullable()();
-  TextColumn get personName => text()();
-  TextColumn get role => text().nullable()();
-  TextColumn get payloadJson => text()();
-  IntColumn get version => integer().withDefault(const Constant(1))();
-  DateTimeColumn get updatedAt => dateTime()();
+  IntColumn get rawId => integer()();
+  TextColumn get eventId => text()(); // canonical id of the EVENT this assignment is for
+  TextColumn get eventSource => text()(); // 'events' | 'weekday_events'
+  IntColumn get userId => integer().nullable()();
+  TextColumn get guestName => text().nullable()();
+  BoolColumn get isPresent => boolean().withDefault(const Constant(false))();
+  TextColumn get status => text()(); // 'assigned' | 'substitution_needed'
+
+  // No version/updatedAt — same reasoning as Events above.
 
   @override
   Set<Column> get primaryKey => {id};

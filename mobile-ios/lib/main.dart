@@ -10,6 +10,7 @@ import 'core/secure/secure_storage_service.dart';
 import 'core/sync/sync_engine.dart';
 import 'features/activation/activation_screen.dart';
 import 'features/activation/activation_service.dart';
+import 'features/auth/user_session_service.dart';
 import 'features/config/config_service.dart';
 import 'features/home/home_screen.dart';
 import 'features/preflight/preflight_gate.dart';
@@ -35,6 +36,7 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
   ActivationService? _activationService;
   RevocationHandler? _revocationHandler;
   ConfigService? _configService;
+  UserSessionService? _userSessionService;
   final _deepLinkService = DeepLinkService();
   String? _pendingDeepLinkToken;
 
@@ -94,6 +96,7 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
     final activationService = ActivationService(api: _api, secureStorage: _secureStorage);
     final revocationHandler = RevocationHandler(db: db, secureStorage: _secureStorage);
     final configService = ConfigService(db: db, api: _api);
+    final userSessionService = UserSessionService(api: _api, secureStorage: _secureStorage, db: db);
 
     setState(() {
       _db = db;
@@ -101,6 +104,7 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
       _activationService = activationService;
       _revocationHandler = revocationHandler;
       _configService = configService;
+      _userSessionService = userSessionService;
     });
   }
 
@@ -132,6 +136,7 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
       _activationService = null;
       _revocationHandler = null;
       _configService = null;
+      _userSessionService = null;
     });
     _openFreshDatabaseAndWireServices();
   }
@@ -143,7 +148,8 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
         _syncEngine != null &&
         _activationService != null &&
         _revocationHandler != null &&
-        _configService != null;
+        _configService != null &&
+        _userSessionService != null;
 
     return MaterialApp(
       title: 'Ministrant Manager',
@@ -164,6 +170,7 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
                       syncEngine: _syncEngine!,
                       configService: _configService!,
                       revocationHandler: _revocationHandler!,
+                      userSessionService: _userSessionService!,
                       onRevoked: _onRevoked,
                       appVersion: _appVersion,
                       osVersion: _osVersion,

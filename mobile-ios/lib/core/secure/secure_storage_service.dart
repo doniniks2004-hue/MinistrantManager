@@ -20,6 +20,15 @@ class SecureStorageService {
   static const _kParishSlug = 'parish_slug';
   static const _kServerUrl = 'server_url';
   static const _kDbEncryptionKey = 'db_encryption_key';
+  // Review round (milestone: "Mój grafik"): a SEPARATE credential from
+  // device_token, deliberately. device_token proves "this physical
+  // device is activated and not revoked" (app.ministrant.eu, device
+  // control plane); mobile_user_token proves "this specific human is
+  // currently signed in" (the parish's own /session/login) — ApiClient.parish()
+  // now uses ONLY this one, never device_token.
+  static const _kMobileUserToken = 'mobile_user_token';
+  static const _kCurrentUserId = 'current_user_id';
+  static const _kCurrentUserFullName = 'current_user_full_name';
 
   Future<String?> get installationId => _storage.read(key: _kInstallationId);
   Future<void> setInstallationId(String value) => _storage.write(key: _kInstallationId, value: value);
@@ -30,6 +39,54 @@ class SecureStorageService {
   Future<String?> get parishId => _storage.read(key: _kParishId);
   Future<String?> get parishSlug => _storage.read(key: _kParishSlug);
   Future<String?> get serverUrl => _storage.read(key: _kServerUrl);
+
+  Future<String?> get mobileUserToken => _storage.read(key: _kMobileUserToken);
+
+  Future<int?> get currentUserId async {
+    final raw = await _storage.read(key: _kCurrentUserId);
+    return raw != null ? int.tryParse(raw) : null;
+  }
+
+  Future<String?> get currentUserFullName => _storage.read(key: _kCurrentUserFullName);
+
+  Future<bool> get hasUserSession async {
+    // Review round fix: must require BOTH — a process interrupted
+    // between the individual writes in setUserSession() below (now
+    // ordered so this can't happen going forward, but a value already on
+    // disk from before this fix could still be in that state) must never
+    // read as "there is a session" with a null user id.
+    final token = await mobileUserToken;
+    final userId = await currentUserId;
+    return token != null && userId != null;
+  }
+
+  /// Called right after a successful `/session/login`. Review round fix:
+  /// writes user_id (and full_name) FIRST, the token LAST — if the app is
+  /// killed partway through, the WORST case is "user_id is stored but no
+  /// token yet", which `hasUserSession` (above) correctly reads as "no
+  /// session" (fails closed). The old order (token first) could leave
+  /// "token present, no user_id" after an interruption, which is exactly
+  /// the half-written state `hasUserSession` must never treat as valid.
+  Future<void> setUserSession({required String token, required int userId, String? fullName}) async {
+    await _storage.write(key: _kCurrentUserId, value: userId.toString());
+    if (fullName != null) {
+      await _storage.write(key: _kCurrentUserFullName, value: fullName);
+    } else {
+      await _storage.delete(key: _kCurrentUserFullName);
+    }
+    await _storage.write(key: _kMobileUserToken, value: token);
+  }
+
+  /// Explicit logout OR the parish API rejecting the current
+  /// mobile_user_token with a 401 (review round, point 4 — a USER session
+  /// problem, never a device problem). Deliberately leaves installation_id,
+  /// device_token, parish_id/slug/server_url completely untouched — logout
+  /// (or a session 401) never requires re-scanning the activation QR.
+  Future<void> clearUserSession() async {
+    await _storage.delete(key: _kMobileUserToken);
+    await _storage.delete(key: _kCurrentUserId);
+    await _storage.delete(key: _kCurrentUserFullName);
+  }
 
   Future<void> savedActivation({
     required String parishId,
@@ -47,11 +104,14 @@ class SecureStorageService {
   /// Wipes everything EXCEPT installation_id (spec: the UUID must survive
   /// reinstall-free resets so a re-activation reuses the same identity —
   /// if you want a truly fresh identity on reset, clear this too).
+  /// Also clears the user session — a revoked/disabled device can't have
+  /// a meaningfully valid signed-in user either.
   Future<void> clearActivation() async {
     await _storage.delete(key: _kParishId);
     await _storage.delete(key: _kParishSlug);
     await _storage.delete(key: _kServerUrl);
     await _storage.delete(key: _kDeviceToken);
+    await clearUserSession();
   }
 
   Future<bool> get isActivated async => (await deviceToken) != null;

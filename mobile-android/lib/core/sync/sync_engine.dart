@@ -40,20 +40,53 @@ class DeviceStatusResult {
 ///   1. render immediately from SQLite (see AppDatabase streams)
 ///   2. kick off SyncEngine.runFullSync() in the background
 ///   3. UI updates reactively as rows change (drift Streams)
+/// Review round (milestone "Mój grafik", point 4): thrown by
+/// `fetchAndApplySnapshot()` when the PARISH api rejects the current
+/// mobile_user_token with a 401 — a USER session problem. The caller
+/// (HomeScreen) must clear ONLY the user session
+/// (UserSessionService.handleParishSessionExpired()) and route to the
+/// login screen — NEVER treat this as DEVICE_REVOKED, never clear
+/// installation_id/device_token, never re-trigger QR activation.
+class ParishSessionExpiredException implements Exception {
+  @override
+  String toString() => 'ParishSessionExpiredException: the parish API rejected the current mobile_user_token (401).';
+}
+
+/// Review round fix (real bug — a missing X-Installation-Id header
+/// produced exactly this: a 400 that HomeScreen's old generic
+/// `catch (_)` silently swallowed, showing an EMPTY "Mój grafik" as if
+/// the user genuinely had no assignments): thrown for 400/403/422 from
+/// the parish API — a CONTRACT problem (malformed request, a header the
+/// backend now requires but the client stopped sending, a validation
+/// failure), never a transport/connectivity problem. Deliberately a
+/// DIFFERENT exception type from both ParishSessionExpiredException
+/// (401 — re-login) and a plain DioException left to propagate for
+/// transport failures/timeouts/5xx (offline-lease path, cached snapshot
+/// stays valid, no visible error). The caller MUST surface this visibly
+/// (a "couldn't update" banner) and MUST NOT show an empty/stale
+/// snapshot as if it were current.
+class ParishContractErrorException implements Exception {
+  ParishContractErrorException({required this.statusCode, this.message});
+  final int statusCode;
+  final String? message;
+
+  @override
+  String toString() =>
+      'ParishContractErrorException: HTTP $statusCode from parish API${message != null ? " ($message)" : ""}';
+}
+
 class SyncEngine {
   SyncEngine({
     required this.db,
     required this.api,
     required this.secureStorage,
     this.offlineLease = const OfflineLease(),
-    @visibleForTesting this.maxPagesPerRun = 200,
   });
 
   final AppDatabase db;
   final ApiClient api;
   final SecureStorageService secureStorage;
   final OfflineLease offlineLease;
-  final int maxPagesPerRun;
   final _uuid = const Uuid();
 
   bool _isSyncing = false;
@@ -176,114 +209,161 @@ class SyncEngine {
   /// Full sync cycle. Safe to call repeatedly (e.g. from a pull-to-refresh
   /// or a periodic foreground timer) — a re-entrant guard prevents
   /// overlapping runs.
+  ///
+  /// Review round (snapshot-first model): the Legacy/Witosa adapter uses
+  /// NO cursor, NO `/mobile/sync`, NO tombstones — see
+  /// `fetchAndApplySnapshot()`. The OLD incremental-cursor path below
+  /// (`pullChanges()`/`_drainSyncPages()`/`_applyIncremental()`) is kept
+  /// in this file as a reference/FUTURE design (Iteration 1's original
+  /// contract, for a backend that DOES maintain a real change-log) but is
+  /// deliberately NOT called from here anymore — do not wire it back in
+  /// without a deliberate decision to, matching the backend's own
+  /// "⚠ NOT USED BY THE LEGACY SNAPSHOT ADAPTER / FUTURE" markers.
+  ///
+  /// Review round fix, point 3: does NOT call `pushPendingActions()` on
+  /// this read-only milestone. The Witosa adapter has no
+  /// `/mobile/actions` endpoint yet — if a pending action were ever
+  /// queued (it never is on this milestone, nothing in the UI enqueues
+  /// one yet, but "the queue happens to be empty today" is not a
+  /// guarantee), pushing it would throw on a 404, and that exception
+  /// would abort this whole method BEFORE `fetchAndApplySnapshot()` ever
+  /// ran — meaning one stray pending action could block even a plain,
+  /// read-only schedule refresh. Restore the `pushPendingActions()` call
+  /// here once real write/actions support exists for this adapter.
+  ///
+  /// Review round fix, point 5: `sync-ack` is back — dropping it when we
+  /// moved to snapshot-first would have silently blinded
+  /// app.ministrant.eu's admin panel to whether a device is actually
+  /// syncing. Sent ONLY after `fetchAndApplySnapshot()` returns
+  /// successfully (i.e. the GET succeeded AND the SQLite transaction
+  /// committed) — if either fails, the exception propagates out of THIS
+  /// method before reaching the ack call, so a failed/rolled-back
+  /// snapshot never gets falsely reported as a successful sync.
   Future<void> runFullSync() async {
     if (_isSyncing) return;
     _isSyncing = true;
     try {
-      await pushPendingActions();
-      final completed = await pullChanges();
-      // Review round (final micro-round, point 2): sync-ack — and
-      // therefore the panel's "last sync" column — must NEVER report
-      // success for a sync that hit the safety cap while more pages
-      // genuinely remained. See pullChanges()'s own docblock for the
-      // exact scenario this closes.
-      if (completed) {
-        await _acknowledgeSyncToCentral();
-      }
+      await fetchAndApplySnapshot();
+      await _acknowledgeSyncToCentral();
     } finally {
       _isSyncing = false;
     }
   }
 
-  /// Returns `true` iff the change log was drained to its actual end
-  /// (server reported `has_more: false`) — `false` if the
-  /// [maxPagesPerRun] safety cap was hit while pages genuinely remained.
+  /// Snapshot-first sync (review round correction — replaces the
+  /// cursor/incremental model for the Legacy/Witosa adapter): one GET
+  /// `/mobile/bootstrap`, then ONE atomic SQLite transaction that
+  /// REPLACES the local events+schedule snapshot outright — never an
+  /// upsert-only merge. This is what correctly reflects rows deleted
+  /// server-side even though the real legacy tables have no updated_at
+  /// or tombstone column at all (see the backend's
+  /// EventsRepositoryInterface docblock).
   ///
-  /// Review round fix (final micro-round, point 2): this used to
-  /// unconditionally write `lastSyncAt` and let the caller unconditionally
-  /// send `/device/sync-ack` regardless of which case happened — so a
-  /// parish with more than 200 pages of pending changes would have its
-  /// 201st+ page silently left unsynced FOREVER while the panel and the
-  /// device's own `lastSyncAt` both reported success. The per-page cursor
-  /// (already persisted inside `_applyIncremental` on every iteration) is
-  /// unaffected either way — the NEXT call to `pullChanges()` continues
-  /// from exactly where this one stopped; only the "we are fully caught
-  /// up" signal was wrong.
-  Future<bool> pullChanges() async {
+  /// Point 7 (atomicity): `db.transaction()` is Drift's real
+  /// BEGIN/COMMIT/ROLLBACK — if ANYTHING inside throws (a malformed row
+  /// from the server, a disk write error), Drift rolls the whole thing
+  /// back automatically and this function's exception propagates to the
+  /// caller. The previous snapshot is left completely untouched either
+  /// way: never a partial mix of old and new rows. The caller (typically
+  /// a background sync trigger) is expected to swallow/log that
+  /// exception and let the UI keep showing the last good snapshot,
+  /// exactly per spec §26's "UI never blocks on this" pattern — this
+  /// method itself does not swallow anything, so a test or a stricter
+  /// caller can still observe failures.
+  Future<void> fetchAndApplySnapshot() async {
     final dio = await api.parish();
-    var meta = await db.ensureSyncMetadata();
-
-    if (meta.cursor == null) {
-      // First-ever contact with this parish: one full snapshot. The
-      // response's own "cursor" field (Iteration 1.1 point 1 fix on the
-      // server side) is what lets step two below actually start from
-      // "right after this snapshot" instead of looping back into
-      // bootstrap forever.
+    try {
       final resp = await dio.get('/mobile/bootstrap');
-      await _applyBootstrap(resp.data as Map<String, dynamic>);
-    }
+      await _applySnapshot(resp.data as Map<String, dynamic>);
+    } on DioException catch (e) {
+      final statusCode = e.response?.statusCode;
 
-    return _drainSyncPages(dio);
+      // Review round (milestone "Mój grafik", point 4): a 401 from the
+      // PARISH api (this Dio, `api.parish()`) means the mobile_user_token
+      // is invalid/expired/revoked — a USER session problem. This must
+      // NEVER be confused with a 401 from app.ministrant.eu
+      // (checkDeviceStatus's own DioException handling, a DEVICE problem
+      // — see DeviceAuthState.authError) — they are different tokens,
+      // different servers, different remediation (re-login vs.
+      // re-activation).
+      if (statusCode == 401) {
+        throw ParishSessionExpiredException();
+      }
+
+      // Review round fix: 400/403/422 are CONTRACT problems (a header
+      // the backend requires but wasn't sent, a validation failure) —
+      // the exact bug this closes: a missing X-Installation-Id header
+      // produced a 400 that used to be swallowed by HomeScreen's generic
+      // catch, silently rendering an empty "Mój grafik" as if the user
+      // genuinely had no assignments. NEVER conflate this with a
+      // transport failure below.
+      if (statusCode == 400 || statusCode == 403 || statusCode == 422) {
+        String? message;
+        final body = e.response?.data;
+        if (body is Map) {
+          message = body['message'] as String? ?? body['error'] as String?;
+        }
+        throw ParishContractErrorException(statusCode: statusCode!, message: message);
+      }
+
+      // Anything else (no response at all — timeout/DNS/connection
+      // error — or a 5xx) is a genuine transport/server-outage failure:
+      // rethrown as a plain DioException, which the caller (HomeScreen)
+      // is expected to treat as "offline, keep showing the last good
+      // snapshot" — exactly spec §26's "UI never blocks on this".
+      rethrow;
+    }
   }
 
-  /// Test seam (final micro-round, point 2): the pagination loop itself,
-  /// factored out so a test can drive it against a fake [dio] (e.g. an
-  /// `InterceptorsWrapper` that resolves every request without real
-  /// network I/O) and a small [maxPagesPerRun] (via the constructor),
-  /// without needing a real parish server.
+  /// Test seam (review round, point 7): lets a test drive the atomic
+  /// snapshot-replace logic directly with a synthetic payload, without
+  /// needing a real/fake HTTP layer for `/mobile/bootstrap` itself.
   @visibleForTesting
-  Future<bool> drainSyncPagesForTesting(Dio dio) => _drainSyncPages(dio);
+  Future<void> applySnapshotForTesting(Map<String, dynamic> data) => _applySnapshot(data);
 
-  /// Iteration 1.1 point 2 / final micro-round point 2: keeps paging
-  /// `/mobile/sync` until the server reports `has_more: false` (bounded by
-  /// [maxPagesPerRun] against a misbehaving server claiming has_more
-  /// forever), and returns whether the log was ACTUALLY drained to its
-  /// end. The per-page cursor is persisted on every iteration inside
-  /// `_applyIncremental` regardless of how this ends — only the
-  /// "fully caught up" signal (`lastSyncAt`, and therefore whether
-  /// `runFullSync()` sends `/device/sync-ack`) depends on the return value.
-  Future<bool> _drainSyncPages(Dio dio) async {
-    var page = 0;
-    var hasMore = true;
-    while (hasMore && page < maxPagesPerRun) {
-      final cursor = (await db.ensureSyncMetadata()).cursor;
-      final resp = await dio.get('/mobile/sync', queryParameters: {'cursor': cursor});
-      hasMore = await _applyIncremental(resp.data as Map<String, dynamic>);
-      page++;
-    }
+  Future<void> _applySnapshot(Map<String, dynamic> data) async {
+    final generatedAt = DateTime.tryParse(data['generated_at'] as String? ?? '') ?? DateTime.now().toUtc();
 
-    final completed = !hasMore;
+    await db.transaction(() async {
+      await db.delete(db.events).go();
+      for (final row in _rows(data['events'])) {
+        await db.into(db.events).insertOnConflictUpdate(_mapLegacyEvent(row));
+      }
 
-    if (completed) {
-      await (db.update(db.syncMetadata)..where((t) => t.id.equals(1))).write(
-        SyncMetadataCompanion(lastSyncAt: Value(DateTime.now().toUtc())),
-      );
-    }
-    // else: intentionally leave lastSyncAt untouched — the last GENUINELY
-    // complete sync (if any) remains what the UI/panel report, rather
-    // than being overwritten with a premature "done".
+      await db.delete(db.scheduleAssignments).go();
+      for (final row in _rows(data['schedule'])) {
+        await db.into(db.scheduleAssignments).insertOnConflictUpdate(_mapLegacySchedule(row));
+      }
 
-    return completed;
+      // Review round: no cursor to persist — `generated_at` IS this
+      // snapshot's metadata. Reusing the `lastSyncAt` column for it (its
+      // meaning for THIS adapter is now "when the last successful
+      // snapshot was generated", not "cursor position acknowledged" the
+      // way the old incremental model used it).
+      await (db.update(db.syncMetadata)..where((t) => t.id.equals(1)))
+          .write(SyncMetadataCompanion(lastSyncAt: Value(generatedAt)));
+    });
   }
 
-  EventsCompanion _mapEvent(Map<String, dynamic> row) => EventsCompanion.insert(
-        id: row['id'].toString(),
-        title: row['title'] as String? ?? '',
-        startsAt: DateTime.parse(row['starts_at'] as String),
-        endsAt: Value(row['ends_at'] != null ? DateTime.parse(row['ends_at'] as String) : null),
-        payloadJson: jsonEncode(row),
-        version: Value(row['version'] as int? ?? 1),
-        updatedAt: DateTime.parse(row['updated_at'] as String? ?? DateTime.now().toUtc().toIso8601String()),
+  EventsCompanion _mapLegacyEvent(Map<String, dynamic> row) => EventsCompanion.insert(
+        id: row['id'] as String, // canonical "{source}:{raw_id}" — see the backend contract
+        rawId: row['raw_id'] as int,
+        source: row['source'] as String,
+        eventDate: DateTime.parse(row['event_date'] as String),
+        description: Value(row['description'] as String?),
+        moduleId: Value(row['module_id'] as int?),
+        isCancelled: Value(row['is_cancelled'] as bool? ?? false),
       );
 
-  ScheduleAssignmentsCompanion _mapSchedule(Map<String, dynamic> row) => ScheduleAssignmentsCompanion.insert(
-        id: row['id'].toString(),
-        eventId: Value(row['event_id']?.toString()),
-        personName: row['person_name'] as String? ?? '',
-        role: Value(row['role'] as String?),
-        payloadJson: jsonEncode(row),
-        version: Value(row['version'] as int? ?? 1),
-        updatedAt: DateTime.parse(row['updated_at'] as String? ?? DateTime.now().toUtc().toIso8601String()),
+  ScheduleAssignmentsCompanion _mapLegacySchedule(Map<String, dynamic> row) => ScheduleAssignmentsCompanion.insert(
+        id: row['id'] as String,
+        rawId: row['raw_id'] as int,
+        eventId: row['event_id'] as String,
+        eventSource: row['event_source'] as String,
+        userId: Value(row['user_id'] as int?),
+        guestName: Value(row['guest_name'] as String?),
+        isPresent: Value(row['is_present'] as bool? ?? false),
+        status: row['status'] as String,
       );
 
   AttendanceCompanion _mapAttendance(Map<String, dynamic> row) => AttendanceCompanion.insert(
@@ -336,145 +416,14 @@ class SyncEngine {
 
   List<String> _ids(dynamic raw) => raw is List ? raw.map((e) => e.toString()).toList() : const <String>[];
 
-  /// Full bootstrap: replaces the local snapshot of every business table
-  /// with what the server sent. Each list in the payload is expected to
-  /// contain "row-shaped" JSON objects matching the parish backend's
-  /// `/mobile/bootstrap` response (see parish-subdomain-api-reference).
-  /// Tables are cleared then re-inserted inside ONE transaction, so a
-  /// crash mid-bootstrap simply repeats the whole bootstrap next run
-  /// (cursor is only written at the very end) rather than leaving a
-  /// half-populated database.
-  Future<void> _applyBootstrap(Map<String, dynamic> data) async {
-    await db.transaction(() async {
-      await db.delete(db.events).go();
-      for (final row in _rows(data['events'])) {
-        await db.into(db.events).insertOnConflictUpdate(_mapEvent(row));
-      }
-
-      await db.delete(db.scheduleAssignments).go();
-      for (final row in _rows(data['schedule'])) {
-        await db.into(db.scheduleAssignments).insertOnConflictUpdate(_mapSchedule(row));
-      }
-
-      await db.delete(db.attendance).go();
-      for (final row in _rows(data['attendance'])) {
-        await db.into(db.attendance).insertOnConflictUpdate(_mapAttendance(row));
-      }
-
-      await db.delete(db.points).go();
-      for (final row in _rows(data['points'])) {
-        await db.into(db.points).insertOnConflictUpdate(_mapPoint(row));
-      }
-
-      await db.delete(db.ranking).go();
-      for (final row in _rows(data['ranking'])) {
-        await db.into(db.ranking).insertOnConflictUpdate(_mapRanking(row));
-      }
-
-      await db.delete(db.announcements).go();
-      for (final row in _rows(data['announcements'])) {
-        await db.into(db.announcements).insertOnConflictUpdate(_mapAnnouncement(row));
-      }
-
-      await db.delete(db.substitutions).go();
-      for (final row in _rows(data['substitutions'])) {
-        await db.into(db.substitutions).insertOnConflictUpdate(_mapSubstitution(row));
-      }
-
-      if (data['parish'] != null) {
-        final parish = data['parish'] as Map<String, dynamic>;
-        await db.into(db.parishInfo).insertOnConflictUpdate(ParishInfoCompanion.insert(
-              id: Value(parish['id'] as int),
-              name: parish['name'] as String? ?? '',
-              slug: parish['slug'] as String? ?? '',
-              serverUrl: parish['server_url'] as String? ?? '',
-              settingsJson: Value(jsonEncode(parish['settings'] ?? {})),
-            ));
-      }
-
-      final cursor = data['cursor'] as String?;
-      await (db.update(db.syncMetadata)..where((t) => t.id.equals(1)))
-          .write(SyncMetadataCompanion(cursor: Value(cursor)));
-    });
-  }
-
-  /// Incremental sync: upserts only what's in `changes` (same per-table
-  /// shape as bootstrap, but partial), THEN applies tombstones from
-  /// `deleted`. Returns the server's `has_more` flag so the CALLER
-  /// (pullChanges — Iteration 1.1 point 2) can keep paging in a loop
-  /// until it's false, instead of applying exactly one page per
-  /// `runFullSync()` call regardless of how many pages actually exist.
-  Future<bool> _applyIncremental(Map<String, dynamic> data) async {
-    await db.transaction(() async {
-      final changes = (data['changes'] as Map<String, dynamic>?) ?? {};
-
-      for (final row in _rows(changes['events'])) {
-        await db.into(db.events).insertOnConflictUpdate(_mapEvent(row));
-      }
-      for (final row in _rows(changes['schedule'])) {
-        await db.into(db.scheduleAssignments).insertOnConflictUpdate(_mapSchedule(row));
-      }
-      for (final row in _rows(changes['attendance'])) {
-        await db.into(db.attendance).insertOnConflictUpdate(_mapAttendance(row));
-      }
-      for (final row in _rows(changes['points'])) {
-        await db.into(db.points).insertOnConflictUpdate(_mapPoint(row));
-      }
-      for (final row in _rows(changes['ranking'])) {
-        await db.into(db.ranking).insertOnConflictUpdate(_mapRanking(row));
-      }
-      for (final row in _rows(changes['announcements'])) {
-        await db.into(db.announcements).insertOnConflictUpdate(_mapAnnouncement(row));
-      }
-      for (final row in _rows(changes['substitutions'])) {
-        await db.into(db.substitutions).insertOnConflictUpdate(_mapSubstitution(row));
-      }
-
-      // Tombstones: rows the server considers deleted since the last cursor.
-      final deleted = (data['deleted'] as Map<String, dynamic>?) ?? {};
-
-      final deletedEventIds = _ids(deleted['events']);
-      if (deletedEventIds.isNotEmpty) {
-        await (db.delete(db.events)..where((t) => t.id.isIn(deletedEventIds))).go();
-      }
-      final deletedScheduleIds = _ids(deleted['schedule']);
-      if (deletedScheduleIds.isNotEmpty) {
-        await (db.delete(db.scheduleAssignments)..where((t) => t.id.isIn(deletedScheduleIds))).go();
-      }
-      final deletedAttendanceIds = _ids(deleted['attendance']);
-      if (deletedAttendanceIds.isNotEmpty) {
-        await (db.delete(db.attendance)..where((t) => t.id.isIn(deletedAttendanceIds))).go();
-      }
-      final deletedPointsIds = _ids(deleted['points']);
-      if (deletedPointsIds.isNotEmpty) {
-        await (db.delete(db.points)..where((t) => t.id.isIn(deletedPointsIds))).go();
-      }
-      final deletedRankingIds = _ids(deleted['ranking']);
-      if (deletedRankingIds.isNotEmpty) {
-        await (db.delete(db.ranking)..where((t) => t.id.isIn(deletedRankingIds))).go();
-      }
-      final deletedAnnouncementIds = _ids(deleted['announcements']);
-      if (deletedAnnouncementIds.isNotEmpty) {
-        await (db.delete(db.announcements)..where((t) => t.id.isIn(deletedAnnouncementIds))).go();
-      }
-      final deletedSubstitutionIds = _ids(deleted['substitutions']);
-      if (deletedSubstitutionIds.isNotEmpty) {
-        await (db.delete(db.substitutions)..where((t) => t.id.isIn(deletedSubstitutionIds))).go();
-      }
-
-      final cursor = data['cursor'] as String?;
-      await (db.update(db.syncMetadata)..where((t) => t.id.equals(1)))
-          .write(SyncMetadataCompanion(cursor: Value(cursor)));
-    });
-
-    return data['has_more'] as bool? ?? false;
-  }
 
   /// Tells app.ministrant.eu that this device successfully completed a
-  /// business-data sync with its parish. This is what makes the panel's
-  /// `last_sync_at` column meaningful (flagged as dead in review) — the
-  /// central backend has no other way to know a parish-subdomain sync
-  /// happened, since it never sees that traffic.
+  /// business-data sync with its parish — this is what makes the panel's
+  /// `last_sync_at` column meaningful (the central backend has no other
+  /// way to know a parish-subdomain sync happened, since it never sees
+  /// that traffic). Review round point 5: restored after a brief absence
+  /// during the snapshot-first migration — called by `runFullSync()`
+  /// ONLY after `fetchAndApplySnapshot()` returns successfully.
   Future<void> _acknowledgeSyncToCentral() async {
     final token = await secureStorage.deviceToken;
     if (token == null) return;

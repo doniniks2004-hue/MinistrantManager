@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:dio/dio.dart';
 import '../../core/database/app_database.dart';
 import '../../core/network/api_client.dart';
+import 'capabilities_dashboard_adapter.dart';
 
 /// Fetches and caches BOTH configs the app depends on, kept strictly
 /// separate per spec decision #6:
@@ -19,12 +20,28 @@ class ConfigService {
   /// fresh fetch but always falling back to the cached copy on any
   /// network failure. Returns null only if there is NEITHER a fresh
   /// fetch NOR any cached config yet (e.g. very first run, offline).
+  ///
+  /// Review round, point 9: the real Legacy adapter's `/mobile/config`
+  /// returns `{capabilities: {...}}`, not the `{dashboard, modules}` shape
+  /// DashboardRenderer expects — CapabilitiesDashboardAdapter is the one
+  /// place that bridges them, applied right here before caching, so
+  /// everything downstream (including the cached copy) already speaks
+  /// DashboardRenderer's contract.
+  ///
+  /// ⚠ NOT CURRENTLY CALLED from HomeScreen — the "Mój grafik" milestone
+  /// bypasses the generic dashboard-grid system entirely in favor of a
+  /// single, direct schedule screen (see HomeScreen/MyScheduleScreen).
+  /// Kept valid and tested (config_service_test.dart,
+  /// capabilities_dashboard_adapter_test.dart, dashboard_renderer_test.dart)
+  /// for whenever a second/third real module needs an actual dashboard
+  /// grid to choose between them.
   Future<Map<String, dynamic>?> loadDashboardConfig() async {
     try {
       final dio = await api.parish();
       final resp = await dio.get('/mobile/config');
-      final data = resp.data as Map<String, dynamic>;
-      await db.saveDashboardConfig(data['schema_version'] as int? ?? 1, jsonEncode(data));
+      final raw = resp.data as Map<String, dynamic>;
+      final data = CapabilitiesDashboardAdapter.toDashboardConfig(raw);
+      await db.saveDashboardConfig(raw['schema_version'] as int? ?? 1, jsonEncode(data));
       return data;
     } on DioException {
       final cached = await db.getDashboardConfig();

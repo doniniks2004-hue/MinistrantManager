@@ -1,17 +1,24 @@
 import 'package:flutter/material.dart';
 import '../../core/util/store_link_launcher.dart';
 import '../../core/database/app_database.dart';
-import '../../core/sync/sync_engine.dart';
+import '../../core/sync/sync_engine.dart';import '../auth/login_screen.dart';
+import '../auth/user_session_service.dart';
 import '../config/config_service.dart';
-import '../dashboard/dashboard_renderer.dart';
 import '../revocation/revocation_handler.dart';
+import '../schedule/my_schedule_screen.dart';
 
 /// Spec §26–§28: renders instantly from SQLite, shows an OFFLINE banner
 /// with the timestamp of the last known-good sync when relevant, and
-/// updates reactively once the background sync completes. The dashboard
-/// body itself is server-driven (spec §15–§19) via DashboardRenderer —
-/// this screen owns the sync/auth-state lifecycle around it, not the
-/// dashboard's actual layout/content.
+/// updates reactively once the background sync completes.
+///
+/// Milestone "Mój grafik" (review round): this screen owns the
+/// DEVICE-level lifecycle (status/heartbeat/revoke/offline-lease,
+/// maintenance/update-required — all unchanged) AND now also the
+/// USER-level lifecycle on top of it: once the device is confirmed
+/// active/offline-ok, it checks whether a `mobile_user_token` exists
+/// (UserSessionService) and shows LoginScreen if not, or MyScheduleScreen
+/// if so. A device problem and a "no user signed in yet" state are
+/// different things, checked in that order, never conflated.
 class HomeScreen extends StatefulWidget {
   const HomeScreen({
     super.key,
@@ -19,6 +26,7 @@ class HomeScreen extends StatefulWidget {
     required this.syncEngine,
     required this.configService,
     required this.revocationHandler,
+    required this.userSessionService,
     required this.onRevoked,
     required this.appVersion,
     required this.osVersion,
@@ -28,6 +36,7 @@ class HomeScreen extends StatefulWidget {
   final SyncEngine syncEngine;
   final ConfigService configService;
   final RevocationHandler revocationHandler;
+  final UserSessionService userSessionService;
   final VoidCallback onRevoked;
   final String appVersion;
   final String osVersion;
@@ -41,8 +50,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   String? _minimumSupportedAppVersion;
   DateTime? _lastSyncAt;
   bool _syncing = false;
-  Map<String, dynamic>? _dashboardConfig;
+  bool _lastSyncFailed = false;
   Map<String, dynamic>? _clientConfig;
+  bool? _hasUserSession; // null while checking
 
   @override
   void initState() {
@@ -116,27 +126,62 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
 
-    if (status.state == DeviceAuthState.active) {
+    // Milestone "Mój grafik", review round point 2/4: is a USER actually
+    // signed in on this device? Checked regardless of online/offline
+    // device state (offlineWithinLease still shows the login screen if no
+    // one's signed in yet — there's simply nothing user-scoped to show
+    // offline in that case).
+    final hasUserSession = await widget.userSessionService.secureStorage.hasUserSession;
+
+    if (status.state == DeviceAuthState.active && hasUserSession) {
       try {
         await widget.syncEngine.runFullSync();
         await widget.syncEngine.heartbeat(appVersion: widget.appVersion, osVersion: widget.osVersion);
+        _lastSyncFailed = false;
+      } on ParishSessionExpiredException {
+        // Review round point 4: the PARISH rejected the mobile_user_token
+        // — a USER session problem, never a device problem. Clear ONLY
+        // the user session and fall through to the login screen; device
+        // activation is completely untouched.
+        await widget.userSessionService.handleParishSessionExpired();
+        setState(() {
+          _hasUserSession = false;
+          _syncing = false;
+        });
+        return;
+      } on ParishContractErrorException catch (e) {
+        // Review round fix, point 2: a genuine CONTRACT error
+        // (400/403/422 — e.g. the real missing-X-Installation-Id bug)
+        // must NEVER be swallowed as a plain network hiccup — that would
+        // silently render an empty "Mój grafik" as if the user genuinely
+        // had no assignments, while the sync in fact never even ran.
+        // The existing snapshot is untouched either way (the failure
+        // happened before any SQLite write) — this just makes the
+        // failure VISIBLE instead of invisible.
+        debugPrint('Parish contract error during sync: $e');
+        _lastSyncFailed = true;
       } catch (_) {
-        // Network hiccup mid-sync — cached data on screen is still valid.
+        // Genuine transport failure / timeout / 5xx — cached data on
+        // screen is still valid, no visible error needed (spec §26).
       }
     }
-
-    // Dashboard config fetch-or-cache (spec §19) happens regardless of
-    // whether the business-data sync above succeeded — a parish that
-    // changed its module order should see that even on a run where the
-    // bootstrap/sync call itself timed out.
-    final dashboardConfig = await widget.configService.loadDashboardConfig();
 
     final meta = await widget.db.ensureSyncMetadata();
     setState(() {
       _lastSyncAt = meta.lastSyncAt;
-      _dashboardConfig = dashboardConfig;
+      _hasUserSession = hasUserSession;
       _syncing = false;
     });
+  }
+
+  void _onLoggedIn() {
+    setState(() => _hasUserSession = true);
+    _bootstrapThenSync();
+  }
+
+  Future<void> _onLogout() async {
+    await widget.userSessionService.logout();
+    setState(() => _hasUserSession = false);
   }
 
   Future<void> _openStoreListing() async {
@@ -246,49 +291,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       );
     }
 
+    if (_hasUserSession == null) {
+      // Still checking (first frame) — device-level checks above already
+      // completed by the time we'd reach here in practice, but guard
+      // against a flash of the wrong screen regardless.
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
+    if (_hasUserSession == false) {
+      return LoginScreen(userSessionService: widget.userSessionService, onLoggedIn: _onLoggedIn);
+    }
+
     final showOfflineBanner = _authState == DeviceAuthState.offlineWithinLease;
 
-    return Scaffold(
-      appBar: AppBar(title: const Text('Ministrant Manager')),
-      body: RefreshIndicator(
-        onRefresh: _bootstrapThenSync,
-        child: ListView(children: [
-          if (showOfflineBanner)
-            Container(
-              width: double.infinity,
-              color: Colors.amber.shade100,
-              padding: const EdgeInsets.all(12),
-              child: Text(
-                '⚠ OFFLINE — dane z ${_lastSyncAt != null ? _formatDate(_lastSyncAt!) : "poprzedniej synchronizacji"}',
-                textAlign: TextAlign.center,
-              ),
-            )
-          else if (_lastSyncAt != null && !_syncing)
-            Container(
-              width: double.infinity,
-              color: Colors.green.shade50,
-              padding: const EdgeInsets.all(8),
-              child: const Text('✓ Zsynchronizowano', textAlign: TextAlign.center),
-            ),
-          if (_dashboardConfig != null)
-            DashboardRenderer(config: _dashboardConfig!, deviceAppVersion: widget.appVersion)
-          else
-            const Padding(
-              padding: EdgeInsets.all(24),
-              child: Text(
-                'Konfiguracja dashboardu nie jest jeszcze dostępna (brak połączenia i brak wcześniejszego cache).',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: Colors.grey),
-              ),
-            ),
-        ]),
-      ),
+    return MyScheduleScreen(
+      db: widget.db,
+      onLogout: _onLogout,
+      showOfflineBanner: showOfflineBanner,
+      lastSyncAt: _lastSyncAt,
+      showSyncFailedBanner: _lastSyncFailed,
     );
-  }
-
-  String _formatDate(DateTime dt) {
-    final local = dt.toLocal();
-    two(int n) => n.toString().padLeft(2, '0');
-    return '${two(local.day)}.${two(local.month)}, ${two(local.hour)}:${two(local.minute)}';
   }
 }

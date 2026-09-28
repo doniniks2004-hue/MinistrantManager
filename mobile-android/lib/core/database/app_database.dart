@@ -10,16 +10,38 @@ import 'cipher/multi_ciphers_engine.dart';
 
 part 'app_database.g.dart';
 
+/// Plain combined row for "Mój grafik" (milestone scope) — a schedule
+/// assignment joined with the event it's for. Not a Drift table itself,
+/// just the shape `AppDatabase.watchMySchedule()` emits.
+class MyScheduleEntry {
+  const MyScheduleEntry({required this.schedule, required this.event});
+  final ScheduleAssignment schedule;
+  final Event event;
+}
+
+
 /// schemaVersion history — bump this on every structural change and add a
 /// migration step in `_migrate`. NEVER perform a destructive migration
 /// (drop/recreate tables) without first confirming `pending_actions` is
 /// empty and the team has explicitly agreed local data can be safely
-/// re-fetched from the server (see spec §3 / migrations requirement).
+/// re-fetched from the server (see spec §3 / migrations requirement) —
+/// UNLESS the table being recreated is itself a pure read-only server
+/// cache with no user-authored rows and no foreign-key relationship INTO
+/// pending_actions, in which case recreating it is always safe (the next
+/// successful bootstrap simply repopulates it) — see v2 below.
 ///
 ///   v1 — initial schema (parish_info, events, schedule_assignments,
 ///        attendance, points, ranking, announcements, substitutions,
 ///        pending_actions, sync_metadata, dashboard_config_cache,
 ///        client_config_cache)
+///   v2 — review round: Events/ScheduleAssignments' columns changed
+///        completely (Iteration 1's placeholder title/starts_at/
+///        ends_at/person_name/role/version/updated_at shape replaced by
+///        the real legacy backend's actual field names — see tables.dart).
+///        Both are pure read-only snapshot caches (Iteration 2's
+///        snapshot-first model) with no pending_actions foreign key, so
+///        the v1->v2 migration safely DROPS + RECREATES only these two
+///        tables; nothing else is touched.
 @DriftDatabase(tables: [
   ParishInfo,
   Events,
@@ -52,8 +74,16 @@ class AppDatabase extends _$AppDatabase {
   @visibleForTesting
   AppDatabase.forTesting() : super(NativeDatabase.memory());
 
+  /// TEST-ONLY constructor (review round, point 2): like [forTesting], but
+  /// backed by a real FILE instead of an anonymous in-memory database, so
+  /// a migration test can pre-populate that file with a raw v1 schema,
+  /// then reopen it through this constructor and observe the real
+  /// `onUpgrade` path run. No encryption (same caveat as [forTesting]).
+  @visibleForTesting
+  AppDatabase.forTestingAtFile(File file) : super(NativeDatabase(file));
+
   @override
-  int get schemaVersion => 1;
+  int get schemaVersion => 2;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -61,20 +91,26 @@ class AppDatabase extends _$AppDatabase {
           await m.createAll();
         },
         onUpgrade: (Migrator m, int from, int to) async {
-          // Example of how future migrations MUST be written — additive,
-          // never destructive, and never touching pending_actions rows:
+          if (from < 2) {
+            // v1 -> v2 (review round, point 2): Events/ScheduleAssignments
+            // are pure read-only snapshot caches (Iteration 2's
+            // snapshot-first model) — no user-authored data, no foreign
+            // key from pending_actions into either. Recreating them from
+            // scratch is safe; the next successful
+            // SyncEngine.fetchAndApplySnapshot() simply repopulates them,
+            // exactly like any other snapshot fetch already does.
+            // Deliberately NOT touching pending_actions, sync_metadata,
+            // dashboard/client config cache, or parish_info.
+            await m.deleteTable('events');
+            await m.deleteTable('schedule_assignments');
+            await m.createTable(events);
+            await m.createTable(scheduleAssignments);
+          }
           //
-          // if (from < 2) {
+          // Template for the NEXT migration:
+          // if (from < 3) {
           //   await m.addColumn(events, events.someNewColumn);
           // }
-          // if (from < 3) {
-          //   await m.createTable(someNewTable);
-          // }
-          //
-          // If a genuinely destructive change is unavoidable, it must be
-          // gated behind an explicit check that `pendingActions` is empty,
-          // and the user must be warned before local data is rebuilt from
-          // a fresh bootstrap.
         },
         beforeOpen: (details) async {
           await customStatement('PRAGMA foreign_keys = ON');
@@ -122,6 +158,64 @@ class AppDatabase extends _$AppDatabase {
 
   Future<ClientConfigCacheData?> getClientConfig() =>
       (select(clientConfigCache)..where((t) => t.id.equals(1))).getSingleOrNull();
+
+  /// Review round (milestone "Mój grafik", point 3): called whenever a
+  /// DIFFERENT user signs in on this device than whoever was signed in
+  /// before, and on explicit logout — BEFORE the app shows any content to
+  /// the new session. Wipes exactly the user-scoped business tables
+  /// (events/schedule/attendance/points/ranking/announcements/
+  /// substitutions), PLUS pendingActions (a queued write authored by the
+  /// PREVIOUS user must never be submitted under the new user's session
+  /// once actions/write exists). Deliberately does NOT touch: parishInfo
+  /// (same parish, same device — no reason to lose it), syncMetadata
+  /// (device-level auth-check timestamp/offline-lease-hours, unrelated to
+  /// which human is signed in — the very next successful sync overwrites
+  /// its lastSyncAt anyway), dashboardConfigCache/clientConfigCache
+  /// (parish/fleet-level config, not user-specific).
+  Future<void> wipeUserScopedBusinessData() async {
+    await transaction(() async {
+      await delete(events).go();
+      await delete(scheduleAssignments).go();
+      await delete(attendance).go();
+      await delete(points).go();
+      await delete(ranking).go();
+      await delete(announcements).go();
+      await delete(substitutions).go();
+      await delete(pendingActions).go();
+
+      // Review round fix: `lastSyncAt` describes the USER's snapshot
+      // ("when was the data now-being-wiped last fetched") — it must be
+      // cleared here too, or the NEXT user to sign in on this device
+      // would see an offline banner reading "dane z 12:30" from the
+      // PREVIOUS user's last sync, before their own first bootstrap
+      // completes. Deliberately does NOT touch `lastAuthorizationCheck`
+      // or `offlineLeaseHours` — both are DEVICE-level (app.ministrant.eu
+      // auth-check timestamp / fleet-wide lease policy), unrelated to
+      // which human is signed in, and clearing them would incorrectly
+      // reset the device's own offline-lease countdown.
+      await (update(syncMetadata)..where((t) => t.id.equals(1)))
+          .write(const SyncMetadataCompanion(lastSyncAt: Value(null)));
+    });
+  }
+
+  /// "Mój grafik" (milestone scope, point 5/6): the schedule screen reads
+  /// ONLY this stream — never HTTP directly (point 6, non-negotiable).
+  /// The server already filters `schedule` down to the calling user's own
+  /// assignments (see the backend's bootstrap.php) — no further filtering
+  /// happens here, this is a straight join for display.
+  Stream<List<MyScheduleEntry>> watchMySchedule() {
+    final query = select(scheduleAssignments).join([
+      innerJoin(events, events.id.equalsExp(scheduleAssignments.eventId)),
+    ]);
+    return query.watch().map(
+          (rows) => rows
+              .map((row) => MyScheduleEntry(
+                    schedule: row.readTable(scheduleAssignments),
+                    event: row.readTable(events),
+                  ))
+              .toList(),
+        );
+  }
 
   Future<void> wipeAllParishData() async {
     // Called on DEVICE_REVOKED / PARISH_DISABLED / manual reset.
