@@ -189,7 +189,11 @@ void main() {
 
     final meta = await db.ensureSyncMetadata();
     expect(meta.lastSyncAt, isNull, reason: "Bartek must not see Adam's last-sync timestamp in an offline banner");
-    expect(\n      meta.lastAuthorizationCheck?.toUtc(),\n      deviceCheckTime.toUtc(),\n      reason: 'device-level auth-check timestamp is unrelated to which user is signed in',\n    );
+    expect(
+      meta.lastAuthorizationCheck?.toUtc(),
+      deviceCheckTime.toUtc(),
+      reason: 'device-level auth-check timestamp is unrelated to which user is signed in',
+    );
     expect(meta.offlineLeaseHours, 72, reason: 'device-level lease policy is unrelated to which user is signed in');
 
     await db.close();
