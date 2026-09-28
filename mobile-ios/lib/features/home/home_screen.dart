@@ -49,7 +49,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   DeviceAuthState? _authState;
   String? _minimumSupportedAppVersion;
   DateTime? _lastSyncAt;
-  bool _syncing = false;
   bool _lastSyncFailed = false;
   Map<String, dynamic>? _clientConfig;
   bool? _hasUserSession; // null while checking
@@ -77,8 +76,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _bootstrapThenSync() async {
-    setState(() => _syncing = true);
-
     // Client-config (global: store URLs, maintenance mode) is checked
     // unconditionally and first — it has no activation dependency and
     // must be available even to a screen that's about to show a blocking
@@ -111,7 +108,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // Block here — do NOT sync or render cached data past this point
       // until the user updates, since the server has explicitly said
       // this app version is no longer supported (spec §29).
-      setState(() => _syncing = false);
       return;
     }
 
@@ -122,7 +118,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // bug, a genuinely unknown token, or a forward-compat gap), so local
       // data is NOT wiped — just not shown until a real ACTIVE/REVOKED/
       // PARISH_DISABLED answer is obtained.
-      setState(() => _syncing = false);
       return;
     }
 
@@ -146,7 +141,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         await widget.userSessionService.handleParishSessionExpired();
         setState(() {
           _hasUserSession = false;
-          _syncing = false;
         });
         return;
       } on ParishContractErrorException catch (e) {
@@ -170,7 +164,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() {
       _lastSyncAt = meta.lastSyncAt;
       _hasUserSession = hasUserSession;
-      _syncing = false;
     });
   }
 
