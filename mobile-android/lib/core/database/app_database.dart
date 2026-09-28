@@ -193,8 +193,13 @@ class AppDatabase extends _$AppDatabase {
       // auth-check timestamp / fleet-wide lease policy), unrelated to
       // which human is signed in, and clearing them would incorrectly
       // reset the device's own offline-lease countdown.
-      await (update(syncMetadata)..where((t) => t.id.equals(1)))
-          .write(const SyncMetadataCompanion(lastSyncAt: Value(null)));
+      // Same robustness reasoning as SyncEngine._applySnapshot's fix:
+      // insertOnConflictUpdate rather than a bare conditional update, so
+      // this is correct regardless of whether a sync_metadata row already
+      // exists.
+      await into(syncMetadata).insertOnConflictUpdate(
+            SyncMetadataCompanion.insert(id: const Value(1), lastSyncAt: const Value(null)),
+          );
     });
   }
 

@@ -164,6 +164,13 @@ void main() {
 
     await service.login(username: 'adam', password: 'whatever');
     final deviceCheckTime = DateTime.utc(2026, 1, 1, 12, 0);
+    // Real bug in THIS TEST (not production code): sync_metadata has NO
+    // row yet on a fresh AppDatabase.forTesting() — `ensureSyncMetadata()`
+    // creates it lazily on first real use, which login() never triggers.
+    // A bare UPDATE ... WHERE id=1 against zero existing rows is a silent
+    // no-op, so the values below would never actually be set without this
+    // first call — ensure the row exists before updating it.
+    await db.ensureSyncMetadata();
     await (db.update(db.syncMetadata)..where((t) => t.id.equals(1))).write(
       SyncMetadataCompanion(
         lastSyncAt: Value(DateTime.utc(2026, 1, 1, 12, 30)), // Adam's last snapshot time

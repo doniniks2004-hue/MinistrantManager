@@ -335,13 +335,20 @@ class SyncEngine {
         await db.into(db.scheduleAssignments).insertOnConflictUpdate(_mapLegacySchedule(row));
       }
 
-      // Review round: no cursor to persist — `generated_at` IS this
-      // snapshot's metadata. Reusing the `lastSyncAt` column for it (its
-      // meaning for THIS adapter is now "when the last successful
-      // snapshot was generated", not "cursor position acknowledged" the
-      // way the old incremental model used it).
-      await (db.update(db.syncMetadata)..where((t) => t.id.equals(1)))
-          .write(SyncMetadataCompanion(lastSyncAt: Value(generatedAt)));
+      // Review round fix (real bug, found via a direct-call test that
+      // bypasses HomeScreen's usual checkDeviceStatus()-first ordering):
+      // this used to be a bare `update()..where(id.equals(1))`, which is
+      // a SILENT NO-OP if no sync_metadata row exists yet. In the real
+      // app this is normally masked — checkDeviceStatus() always runs
+      // first and calls ensureSyncMetadata(), which creates the row —
+      // but that ordering is an assumption this method itself shouldn't
+      // depend on to correctly persist `generated_at`. insertOnConflictUpdate
+      // is unconditionally correct: creates the row with lastSyncAt set
+      // if none existed, or updates ONLY lastSyncAt (leaving cursor/
+      // lastAuthorizationCheck/offlineLeaseHours untouched) if one did.
+      await db.into(db.syncMetadata).insertOnConflictUpdate(
+            SyncMetadataCompanion.insert(id: const Value(1), lastSyncAt: Value(generatedAt)),
+          );
     });
   }
 
