@@ -189,7 +189,11 @@ void main() {
 
     final meta = await db.ensureSyncMetadata();
     expect(meta.lastSyncAt, isNull, reason: "Bartek must not see Adam's last-sync timestamp in an offline banner");
-    expect(meta.lastAuthorizationCheck, deviceCheckTime, reason: 'device-level auth-check timestamp is unrelated to which user is signed in');
+    expect(
+      meta.lastAuthorizationCheck?.toUtc(),
+      deviceCheckTime.toUtc(),
+      reason: 'device-level auth-check timestamp is unrelated to which user is signed in',
+    );
     expect(meta.offlineLeaseHours, 72, reason: 'device-level lease policy is unrelated to which user is signed in');
 
     await db.close();
@@ -240,13 +244,14 @@ class _TestUserSessionService extends UserSessionService {
       final user = data['user'] as Map<String, dynamic>;
       final newUserId = user['id'] as int;
       final fullName = user['full_name'] as String?;
+      final roleId = user['role_id'] as int?;
 
       final previousUserId = await secureStorage.currentUserId;
       if (previousUserId != null && previousUserId != newUserId) {
         await db.wipeUserScopedBusinessData();
       }
 
-      await secureStorage.setUserSession(token: token, userId: newUserId, fullName: fullName);
+      await secureStorage.setUserSession(token: token, userId: newUserId, fullName: fullName, roleId: roleId);
       api.resetParishClient();
 
       return UserLoginSuccess(fullName: fullName);

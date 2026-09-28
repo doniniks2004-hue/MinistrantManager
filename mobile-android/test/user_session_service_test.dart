@@ -244,13 +244,14 @@ class _TestUserSessionService extends UserSessionService {
       final user = data['user'] as Map<String, dynamic>;
       final newUserId = user['id'] as int;
       final fullName = user['full_name'] as String?;
+      final roleId = user['role_id'] as int?;
 
       final previousUserId = await secureStorage.currentUserId;
       if (previousUserId != null && previousUserId != newUserId) {
         await db.wipeUserScopedBusinessData();
       }
 
-      await secureStorage.setUserSession(token: token, userId: newUserId, fullName: fullName);
+      await secureStorage.setUserSession(token: token, userId: newUserId, fullName: fullName, roleId: roleId);
       api.resetParishClient();
 
       return UserLoginSuccess(fullName: fullName);

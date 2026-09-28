@@ -99,11 +99,19 @@ class Ranking extends Table {
 }
 
 class Announcements extends Table {
+  // Real backend shape (announcements table: id, title, content,
+  // author_id, created_at) — canonical id "announcements:5", raw_id the
+  // bare integer. `author_name` is resolved server-side (a JOIN against
+  // users) so the client never needs a people catalog just to show who
+  // wrote an announcement. Dropped the Iteration-1 placeholder `isRead`/
+  // `body` fields — no read/unread tracking exists in the real schema,
+  // and `content` is the real column name.
   TextColumn get id => text()();
+  IntColumn get rawId => integer()();
   TextColumn get title => text()();
-  TextColumn get body => text()();
-  DateTimeColumn get publishedAt => dateTime()();
-  BoolColumn get isRead => boolean().withDefault(const Constant(false))();
+  TextColumn get content => text()();
+  TextColumn get authorName => text().nullable()();
+  DateTimeColumn get createdAt => dateTime()();
 
   @override
   Set<Column> get primaryKey => {id};

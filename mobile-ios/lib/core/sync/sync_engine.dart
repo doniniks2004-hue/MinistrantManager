@@ -335,6 +335,15 @@ class SyncEngine {
         await db.into(db.scheduleAssignments).insertOnConflictUpdate(_mapLegacySchedule(row));
       }
 
+      // Hybrid dashboard milestone, P1: parish-wide, replaced wholesale
+      // on every snapshot — same reasoning as events/schedule (the real
+      // legacy `announcements` table has no updated_at/tombstone column
+      // either, so a full replace is the only way to reflect a deletion).
+      await db.delete(db.announcements).go();
+      for (final row in _rows(data['announcements'])) {
+        await db.into(db.announcements).insertOnConflictUpdate(_mapLegacyAnnouncement(row));
+      }
+
       // Review round fix (real bug, found via a direct-call test that
       // bypasses HomeScreen's usual checkDeviceStatus()-first ordering):
       // this used to be a bare `update()..where(id.equals(1))`, which is
@@ -371,6 +380,15 @@ class SyncEngine {
         guestName: Value(row['guest_name'] as String?),
         isPresent: Value(row['is_present'] as bool? ?? false),
         status: row['status'] as String,
+      );
+
+  AnnouncementsCompanion _mapLegacyAnnouncement(Map<String, dynamic> row) => AnnouncementsCompanion.insert(
+        id: row['id'] as String,
+        rawId: row['raw_id'] as int,
+        title: row['title'] as String,
+        content: row['content'] as String,
+        authorName: Value(row['author_name'] as String?),
+        createdAt: DateTime.parse(row['created_at'] as String),
       );
 
 

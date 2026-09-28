@@ -83,7 +83,7 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase.forTestingAtFile(File file) : super(NativeDatabase(file));
 
   @override
-  int get schemaVersion => 2;
+  int get schemaVersion => 3;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -106,9 +106,21 @@ class AppDatabase extends _$AppDatabase {
             await m.createTable(events);
             await m.createTable(scheduleAssignments);
           }
+          if (from < 3) {
+            // v2 -> v3 (hybrid dashboard milestone, P1): Announcements'
+            // columns changed to match the real legacy schema
+            // (title/content/author_name/created_at, canonical id) —
+            // replacing Iteration 1's placeholder title/body/publishedAt/
+            // isRead shape (no read/unread tracking exists server-side).
+            // Same reasoning as v1->v2: a pure read-only snapshot cache,
+            // safe to drop and recreate; the next successful sync
+            // repopulates it.
+            await m.deleteTable('announcements');
+            await m.createTable(announcements);
+          }
           //
           // Template for the NEXT migration:
-          // if (from < 3) {
+          // if (from < 4) {
           //   await m.addColumn(events, events.someNewColumn);
           // }
         },
@@ -220,6 +232,14 @@ class AppDatabase extends _$AppDatabase {
                   ))
               .toList(),
         );
+  }
+
+  /// "Ogłoszenia" (hybrid dashboard milestone, P1). Parish-wide, not
+  /// user-scoped — every signed-in user at this parish sees the same
+  /// list. Newest first.
+  Stream<List<Announcement>> watchAnnouncements() {
+    final query = select(announcements)..orderBy([(t) => OrderingTerm.desc(t.createdAt)]);
+    return query.watch();
   }
 
   Future<void> wipeAllParishData() async {

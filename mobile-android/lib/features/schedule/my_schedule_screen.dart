@@ -10,59 +10,15 @@ import '../../core/database/app_database.dart';
 /// immediately, network updates SQLite in the background, Drift's stream
 /// wakes the UI up when that happens.
 class MyScheduleScreen extends StatelessWidget {
-  const MyScheduleScreen({
-    super.key,
-    required this.db,
-    required this.onLogout,
-    this.showOfflineBanner = false,
-    this.lastSyncAt,
-    this.showSyncFailedBanner = false,
-  });
+  const MyScheduleScreen({super.key, required this.db});
 
   final AppDatabase db;
-  final VoidCallback onLogout;
-  final bool showOfflineBanner;
-  final DateTime? lastSyncAt;
-  final bool showSyncFailedBanner;
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Mój grafik'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.logout),
-            tooltip: 'Wyloguj',
-            onPressed: () => _confirmLogout(context),
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          if (showOfflineBanner)
-            Container(
-              width: double.infinity,
-              color: Colors.amber.shade100,
-              padding: const EdgeInsets.all(12),
-              child: Text(
-                '⚠ OFFLINE — dane z ${lastSyncAt != null ? _formatSyncTimestamp(lastSyncAt!) : "poprzedniej synchronizacji"}',
-                textAlign: TextAlign.center,
-              ),
-            )
-          else if (showSyncFailedBanner)
-            Container(
-              width: double.infinity,
-              color: Colors.red.shade100,
-              padding: const EdgeInsets.all(12),
-              child: const Text(
-                'Nie udało się zaktualizować danych. Pokazujemy ostatnią znaną wersję grafiku.',
-                textAlign: TextAlign.center,
-              ),
-            ),
-          Expanded(child: _buildScheduleList()),
-        ],
-      ),
+      appBar: AppBar(title: const Text('Mój grafik')),
+      body: _buildScheduleList(),
     );
   }
 
@@ -119,27 +75,6 @@ class MyScheduleScreen extends StatelessWidget {
           );
         },
       );
-  }
-
-  Future<void> _confirmLogout(BuildContext context) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Wyloguj się?'),
-        content: const Text('Będziesz musiał/a zalogować się ponownie, żeby zobaczyć swój grafik.'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('ANULUJ')),
-          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('WYLOGUJ')),
-        ],
-      ),
-    );
-    if (confirmed == true) onLogout();
-  }
-
-  String _formatSyncTimestamp(DateTime dt) {
-    final local = dt.toLocal();
-    two(int n) => n.toString().padLeft(2, '0');
-    return '${two(local.day)}.${two(local.month)}, ${two(local.hour)}:${two(local.minute)}';
   }
 }
 

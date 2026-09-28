@@ -68,7 +68,6 @@ dependencies:
   # Opening the store listing from the forced-update screen (spec §29/§30
   # — store URLs come from GET /api/client-config, never hardcoded).
   url_launcher: ^6.3.0
-
   # Android App Links / iOS Universal Links (spec §35): receives the
   # https://app.ministrant.eu/activate/{token} link when the OS hands it
   # straight to the app instead of opening it in a browser. Inert until
@@ -76,6 +75,13 @@ dependencies:
   # with real values — until then, every scanned QR opens the fallback
   # web page instead, which is the correct/safe degradation.
   app_links: ^6.3.2
+
+  # Hybrid dashboard milestone: the generic secure WebView shell
+  # (LegacyModuleScreen) that hosts legacy PHP modules the app doesn't
+  # (yet, or ever) reimplement natively. ⚠ VERIFY AT IMPLEMENTATION TIME
+  # (same caveat as drift/sqlite3 above) — no pub.dev access from this
+  # sandbox to confirm this exact version against the live registry.
+  webview_flutter: ^4.10.0
 
 dev_dependencies:
   flutter_test:

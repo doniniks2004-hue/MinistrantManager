@@ -29,6 +29,7 @@ class SecureStorageService {
   static const _kMobileUserToken = 'mobile_user_token';
   static const _kCurrentUserId = 'current_user_id';
   static const _kCurrentUserFullName = 'current_user_full_name';
+  static const _kCurrentUserRoleId = 'current_user_role_id';
 
   Future<String?> get installationId => _storage.read(key: _kInstallationId);
   Future<void> setInstallationId(String value) => _storage.write(key: _kInstallationId, value: value);
@@ -49,6 +50,14 @@ class SecureStorageService {
 
   Future<String?> get currentUserFullName => _storage.read(key: _kCurrentUserFullName);
 
+  /// Hybrid dashboard milestone, review round point 22: the role_id the
+  /// dashboard uses for its DISPLAY-only module filter
+  /// (ModuleDescriptor.visibleFor) — real enforcement stays server-side.
+  Future<int?> get currentUserRoleId async {
+    final raw = await _storage.read(key: _kCurrentUserRoleId);
+    return raw != null ? int.tryParse(raw) : null;
+  }
+
   Future<bool> get hasUserSession async {
     // Review round fix: must require BOTH — a process interrupted
     // between the individual writes in setUserSession() below (now
@@ -67,12 +76,17 @@ class SecureStorageService {
   /// session" (fails closed). The old order (token first) could leave
   /// "token present, no user_id" after an interruption, which is exactly
   /// the half-written state `hasUserSession` must never treat as valid.
-  Future<void> setUserSession({required String token, required int userId, String? fullName}) async {
+  Future<void> setUserSession({required String token, required int userId, String? fullName, int? roleId}) async {
     await _storage.write(key: _kCurrentUserId, value: userId.toString());
     if (fullName != null) {
       await _storage.write(key: _kCurrentUserFullName, value: fullName);
     } else {
       await _storage.delete(key: _kCurrentUserFullName);
+    }
+    if (roleId != null) {
+      await _storage.write(key: _kCurrentUserRoleId, value: roleId.toString());
+    } else {
+      await _storage.delete(key: _kCurrentUserRoleId);
     }
     await _storage.write(key: _kMobileUserToken, value: token);
   }
@@ -86,6 +100,7 @@ class SecureStorageService {
     await _storage.delete(key: _kMobileUserToken);
     await _storage.delete(key: _kCurrentUserId);
     await _storage.delete(key: _kCurrentUserFullName);
+    await _storage.delete(key: _kCurrentUserRoleId);
   }
 
   Future<void> savedActivation({

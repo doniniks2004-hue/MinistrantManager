@@ -167,6 +167,7 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
               child: _isActivated!
                   ? HomeScreen(
                       db: _db!,
+                      api: _api,
                       syncEngine: _syncEngine!,
                       configService: _configService!,
                       revocationHandler: _revocationHandler!,

@@ -1,28 +1,33 @@
 import 'package:flutter/material.dart';
 import '../../core/util/store_link_launcher.dart';
 import '../../core/database/app_database.dart';
-import '../../core/sync/sync_engine.dart';import '../auth/login_screen.dart';
+import '../../core/network/api_client.dart';
+import '../../core/sync/sync_engine.dart';
+import '../auth/login_screen.dart';
 import '../auth/user_session_service.dart';
 import '../config/config_service.dart';
+import '../dashboard/dashboard_screen.dart';
+import '../dashboard/module_descriptor.dart';
 import '../revocation/revocation_handler.dart';
-import '../schedule/my_schedule_screen.dart';
+import '../webview/webview_handoff_service.dart';
 
 /// Spec §26–§28: renders instantly from SQLite, shows an OFFLINE banner
 /// with the timestamp of the last known-good sync when relevant, and
 /// updates reactively once the background sync completes.
 ///
-/// Milestone "Mój grafik" (review round): this screen owns the
-/// DEVICE-level lifecycle (status/heartbeat/revoke/offline-lease,
-/// maintenance/update-required — all unchanged) AND now also the
-/// USER-level lifecycle on top of it: once the device is confirmed
-/// active/offline-ok, it checks whether a `mobile_user_token` exists
-/// (UserSessionService) and shows LoginScreen if not, or MyScheduleScreen
-/// if so. A device problem and a "no user signed in yet" state are
-/// different things, checked in that order, never conflated.
+/// Hybrid dashboard milestone: this screen owns the DEVICE-level
+/// lifecycle (status/heartbeat/revoke/offline-lease, maintenance/update-
+/// required — all unchanged) AND the USER-level lifecycle on top of it:
+/// once the device is confirmed active/offline-ok, it checks whether a
+/// `mobile_user_token` exists (UserSessionService) and shows LoginScreen
+/// if not, or DashboardScreen if so — the dashboard, not a single fixed
+/// screen, is the top-level post-login content now; individual modules
+/// (native or WebView) are reached BY NAVIGATING FROM the dashboard.
 class HomeScreen extends StatefulWidget {
   const HomeScreen({
     super.key,
     required this.db,
+    required this.api,
     required this.syncEngine,
     required this.configService,
     required this.revocationHandler,
@@ -33,6 +38,7 @@ class HomeScreen extends StatefulWidget {
   });
 
   final AppDatabase db;
+  final ApiClient api;
   final SyncEngine syncEngine;
   final ConfigService configService;
   final RevocationHandler revocationHandler;
@@ -52,10 +58,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _lastSyncFailed = false;
   Map<String, dynamic>? _clientConfig;
   bool? _hasUserSession; // null while checking
+  List<ModuleDescriptor>? _modules;
+  int? _userRoleId;
+  late final WebviewHandoffService _handoffService;
 
   @override
   void initState() {
     super.initState();
+    _handoffService = WebviewHandoffService(api: widget.api, secureStorage: widget.userSessionService.secureStorage);
     WidgetsBinding.instance.addObserver(this);
     _bootstrapThenSync();
   }
@@ -121,11 +131,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
 
-    // Milestone "Mój grafik", review round point 2/4: is a USER actually
-    // signed in on this device? Checked regardless of online/offline
-    // device state (offlineWithinLease still shows the login screen if no
-    // one's signed in yet — there's simply nothing user-scoped to show
-    // offline in that case).
+    // Is a USER actually signed in on this device? Checked regardless of
+    // online/offline device state (offlineWithinLease still shows the
+    // login screen if no one's signed in yet).
     final hasUserSession = await widget.userSessionService.secureStorage.hasUserSession;
 
     if (status.state == DeviceAuthState.active && hasUserSession) {
@@ -147,11 +155,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         // Review round fix, point 2: a genuine CONTRACT error
         // (400/403/422 — e.g. the real missing-X-Installation-Id bug)
         // must NEVER be swallowed as a plain network hiccup — that would
-        // silently render an empty "Mój grafik" as if the user genuinely
-        // had no assignments, while the sync in fact never even ran.
-        // The existing snapshot is untouched either way (the failure
-        // happened before any SQLite write) — this just makes the
-        // failure VISIBLE instead of invisible.
+        // silently render an empty dashboard/module as if the user
+        // genuinely had no data, while the sync in fact never even ran.
         debugPrint('Parish contract error during sync: $e');
         _lastSyncFailed = true;
       } catch (_) {
@@ -160,10 +165,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     }
 
+    // Hybrid dashboard milestone: the module list itself also survives
+    // offline (ConfigService's own cache-fallback) — a fresh install with
+    // no cache yet and no connectivity is the only case with nothing to
+    // show, same as any other config-dependent screen.
+    List<ModuleDescriptor>? modules;
+    int? roleId;
+    if (hasUserSession) {
+      final rawModules = await widget.configService.loadModules();
+      modules = rawModules != null ? ModuleDescriptor.parseList(rawModules) : null;
+      roleId = await widget.userSessionService.secureStorage.currentUserRoleId;
+    }
+
     final meta = await widget.db.ensureSyncMetadata();
     setState(() {
       _lastSyncAt = meta.lastSyncAt;
       _hasUserSession = hasUserSession;
+      _modules = modules;
+      _userRoleId = roleId;
     });
   }
 
@@ -174,7 +193,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _onLogout() async {
     await widget.userSessionService.logout();
-    setState(() => _hasUserSession = false);
+    setState(() {
+      _hasUserSession = false;
+      _modules = null;
+      _userRoleId = null;
+    });
   }
 
   Future<void> _openStoreListing() async {
@@ -295,14 +318,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return LoginScreen(userSessionService: widget.userSessionService, onLoggedIn: _onLoggedIn);
     }
 
-    final showOfflineBanner = _authState == DeviceAuthState.offlineWithinLease;
+    if (_modules == null) {
+      // Logged in, but the module list hasn't resolved yet (first frame,
+      // or genuinely offline with no cache at all yet).
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
 
-    return MyScheduleScreen(
+    final showOffline = _authState == DeviceAuthState.offlineWithinLease;
+
+    return DashboardScreen(
+      modules: _modules!,
+      userRoleId: _userRoleId,
       db: widget.db,
-      onLogout: _onLogout,
-      showOfflineBanner: showOfflineBanner,
+      secureStorage: widget.userSessionService.secureStorage,
+      handoffService: _handoffService,
+      appVersion: widget.appVersion,
+      isOnline: !showOffline,
+      syncFailed: _lastSyncFailed,
       lastSyncAt: _lastSyncAt,
-      showSyncFailedBanner: _lastSyncFailed,
+      onSync: _bootstrapThenSync,
+      onLogout: _onLogout,
     );
   }
 }

@@ -39,8 +39,8 @@ jobs:
           test -d test
           count=$(find test -name "*_test.dart" | wc -l)
           echo "Found $count test file(s) under test/"
-          if [ "$count" -lt 13 ]; then
-            echo "Expected at least 13 test files (offline_lease, module_version_gate, activation_service, config_service, dashboard_renderer, device_status_interpretation, pending_action_json_roundtrip, preflight_gate, deep_link_service, sync_snapshot, capabilities_dashboard_adapter, schema_migration, user_session_service) — found $count. Failing rather than silently running fewer tests than intended."
+          if [ "$count" -lt 15 ]; then
+            echo "Expected at least 15 test files (offline_lease, module_version_gate, activation_service, config_service, dashboard_renderer, device_status_interpretation, pending_action_json_roundtrip, preflight_gate, deep_link_service, sync_snapshot, capabilities_dashboard_adapter, schema_migration, user_session_service, api_client_parish_headers, module_descriptor) — found $count. Failing rather than silently running fewer tests than intended."
             exit 1
           fi
 

@@ -2,11 +2,10 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ministrant_manager/features/config/capabilities_dashboard_adapter.dart';
 
 void main() {
-  group('CapabilitiesDashboardAdapter (review round, point 9)', () {
-    test('only capabilities set to true produce a dashboard tile', () {
-      final result = CapabilitiesDashboardAdapter.toDashboardConfig({
+  group('CapabilitiesDashboardAdapter (hybrid dashboard milestone — produces module-descriptor shape)', () {
+    test('only capabilities set to true produce a module, in the SAME shape modules_builder.php uses', () {
+      final modules = CapabilitiesDashboardAdapter.toModuleList({
         'capabilities': {
-          'events': true,
           'schedule': true,
           'attendance': false,
           'points': false,
@@ -16,40 +15,36 @@ void main() {
         },
       });
 
-      final items = (result['dashboard'] as Map)['items'] as List;
-      final modules = result['modules'] as List;
-
-      expect(items.length, 1, reason: 'only "schedule" is true — events has no tile of its own, everything else is false');
-      expect((items[0] as Map)['module_id'], 'schedule');
-      expect((items[0] as Map)['title'], 'Mój grafik');
-      expect(modules.length, 1);
-      expect((modules[0] as Map)['id'], 'schedule');
-      expect((modules[0] as Map)['component'], 'event_list');
+      // schedule + the always-present profile tile.
+      expect(modules.length, 2);
+      expect(modules[0]['id'], 'schedule');
+      expect(modules[0]['type'], 'native');
+      expect(modules[0]['screen'], 'my_schedule');
+      expect(modules[0]['title'], 'Mój grafik');
+      expect(modules.last['id'], 'profile');
     });
 
-    test('no capabilities at all produces an empty dashboard, not an error', () {
-      final result = CapabilitiesDashboardAdapter.toDashboardConfig({'capabilities': <String, dynamic>{}});
-      final items = (result['dashboard'] as Map)['items'] as List;
-      expect(items, isEmpty);
+    test('no capabilities at all still yields the profile tile, not an error', () {
+      final modules = CapabilitiesDashboardAdapter.toModuleList({'capabilities': <String, dynamic>{}});
+      expect(modules.length, 1);
+      expect(modules.single['id'], 'profile');
     });
 
     test('a missing capabilities key entirely does not throw', () {
-      final result = CapabilitiesDashboardAdapter.toDashboardConfig({});
-      final items = (result['dashboard'] as Map)['items'] as List;
-      expect(items, isEmpty);
+      final modules = CapabilitiesDashboardAdapter.toModuleList({});
+      expect(modules.length, 1, reason: 'still just the profile tile');
     });
 
     test('tile order matches the fixed known-modules order, not map iteration order', () {
-      final result = CapabilitiesDashboardAdapter.toDashboardConfig({
+      final modules = CapabilitiesDashboardAdapter.toModuleList({
         'capabilities': {
           'announcements': true,
           'schedule': true,
           'points': true,
         },
       });
-      final items = (result['dashboard'] as Map)['items'] as List<dynamic>;
-      final order = items.map((i) => (i as Map)['module_id']).toList();
-      expect(order, ['schedule', 'points', 'announcements'], reason: 'fixed order: schedule, attendance, points, ranking, substitutions, announcements');
+      final order = modules.map((m) => m['id']).toList();
+      expect(order, ['schedule', 'points', 'announcements', 'profile'], reason: 'fixed order: schedule, attendance, points, ranking, substitutions, announcements, then profile last');
     });
   });
 }

@@ -1,4 +1,5 @@
 import 'package:dio/dio.dart';
+import 'package:webview_flutter/webview_flutter.dart';
 import '../../core/database/app_database.dart';
 import '../../core/network/api_client.dart';
 import '../../core/secure/secure_storage_service.dart';
@@ -69,6 +70,7 @@ class UserSessionService {
       final user = data['user'] as Map<String, dynamic>;
       final newUserId = user['id'] as int;
       final fullName = user['full_name'] as String?;
+      final roleId = user['role_id'] as int?;
 
       // Review round, point 3 — the whole reason this method exists as
       // more than a one-line HTTP call: if a DIFFERENT human is signing
@@ -80,9 +82,10 @@ class UserSessionService {
       final previousUserId = await secureStorage.currentUserId;
       if (previousUserId != null && previousUserId != newUserId) {
         await db.wipeUserScopedBusinessData();
+        await _clearWebviewCookies();
       }
 
-      await secureStorage.setUserSession(token: token, userId: newUserId, fullName: fullName);
+      await secureStorage.setUserSession(token: token, userId: newUserId, fullName: fullName, roleId: roleId);
       // A stale Authorization header (no token, or the previous user's)
       // must never be reused for the very next parish API call.
       api.resetParishClient();
@@ -105,6 +108,25 @@ class UserSessionService {
     await secureStorage.clearUserSession();
     api.resetParishClient();
     await db.wipeUserScopedBusinessData();
+    await _clearWebviewCookies();
+  }
+
+  /// Review round point 19: "Bartek po Adamie nie może odziedziczyć ...
+  /// sesji PHP Adama" — the WebView's cookie jar is shared across EVERY
+  /// LegacyModuleScreen instance (it's the platform's single WebView
+  /// cookie store, not per-widget), so a stale PHP session cookie from
+  /// the previous user must be gone before the next one could ever open
+  /// a legacy module and silently inherit it. Wrapped defensively — a
+  /// platform without a real WebView binding (e.g. a unit test with no
+  /// platform channel registered) must never abort logout/user-switch
+  /// over this; the user-scoped SQLite wipe above is what actually
+  /// matters for correctness, this is defense in depth on top of it.
+  Future<void> _clearWebviewCookies() async {
+    try {
+      await WebViewCookieManager().clearCookies();
+    } catch (_) {
+      // Best-effort — see docblock above.
+    }
   }
 
   /// Review round, point 4: the PARISH API (not app.ministrant.eu)
