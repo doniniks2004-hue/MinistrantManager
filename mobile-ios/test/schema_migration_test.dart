@@ -48,7 +48,7 @@ void main() {
         VALUES ('pre-migration-action-1', 'attendance.mark', '{}', 0);
       PRAGMA user_version = 1;
     ''');
-    seed.dispose();
+    seed.close();
 
     // Reopen through the REAL AppDatabase (schemaVersion 2) — this is the
     // actual code path a real app upgrade runs through.
