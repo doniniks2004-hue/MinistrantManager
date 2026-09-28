@@ -368,6 +368,9 @@ class SyncEngine {
 
 
 
+  List<Map<String, dynamic>> _rows(dynamic raw) =>
+      raw is List ? raw.cast<Map<String, dynamic>>() : const <Map<String, dynamic>>[];
+
   /// Tells app.ministrant.eu that this device successfully completed a
   /// business-data sync with its parish — this is what makes the panel's
   /// `last_sync_at` column meaningful (the central backend has no other
