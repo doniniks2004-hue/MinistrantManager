@@ -366,55 +366,6 @@ class SyncEngine {
         status: row['status'] as String,
       );
 
-  AttendanceCompanion _mapAttendance(Map<String, dynamic> row) => AttendanceCompanion.insert(
-        id: row['id'].toString(),
-        eventId: row['event_id'].toString(),
-        personName: row['person_name'] as String? ?? '',
-        status: row['status'] as String? ?? 'unknown',
-        recordedAt: DateTime.parse(row['recorded_at'] as String? ?? DateTime.now().toUtc().toIso8601String()),
-        payloadJson: jsonEncode(row),
-      );
-
-  PointsCompanion _mapPoint(Map<String, dynamic> row) => PointsCompanion.insert(
-        id: row['id'].toString(),
-        personName: row['person_name'] as String? ?? '',
-        amount: row['amount'] as int? ?? 0,
-        reason: Value(row['reason'] as String?),
-        awardedAt: DateTime.parse(row['awarded_at'] as String? ?? DateTime.now().toUtc().toIso8601String()),
-      );
-
-  RankingCompanion _mapRanking(Map<String, dynamic> row) => RankingCompanion.insert(
-        id: row['id'].toString(),
-        personName: row['person_name'] as String? ?? '',
-        totalPoints: row['total_points'] as int? ?? 0,
-        position: Value(row['position'] as int?),
-        payloadJson: Value(jsonEncode(row)),
-        updatedAt: DateTime.parse(row['updated_at'] as String? ?? DateTime.now().toUtc().toIso8601String()),
-      );
-
-  AnnouncementsCompanion _mapAnnouncement(Map<String, dynamic> row) => AnnouncementsCompanion.insert(
-        id: row['id'].toString(),
-        title: row['title'] as String? ?? '',
-        body: row['body'] as String? ?? '',
-        publishedAt: DateTime.parse(row['published_at'] as String? ?? DateTime.now().toUtc().toIso8601String()),
-        isRead: Value(row['is_read'] as bool? ?? false),
-      );
-
-  SubstitutionsCompanion _mapSubstitution(Map<String, dynamic> row) => SubstitutionsCompanion.insert(
-        id: row['id'].toString(),
-        eventId: Value(row['event_id']?.toString()),
-        fromPerson: row['from_person'] as String? ?? '',
-        toPerson: Value(row['to_person'] as String?),
-        status: row['status'] as String? ?? 'requested',
-        payloadJson: jsonEncode(row),
-        version: Value(row['version'] as int? ?? 1),
-        updatedAt: DateTime.parse(row['updated_at'] as String? ?? DateTime.now().toUtc().toIso8601String()),
-      );
-
-  List<Map<String, dynamic>> _rows(dynamic raw) =>
-      raw is List ? raw.cast<Map<String, dynamic>>() : const <Map<String, dynamic>>[];
-
-  List<String> _ids(dynamic raw) => raw is List ? raw.map((e) => e.toString()).toList() : const <String>[];
 
 
   /// Tells app.ministrant.eu that this device successfully completed a
