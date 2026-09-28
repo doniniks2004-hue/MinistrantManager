@@ -50,11 +50,13 @@ class _LoginScreenState extends State<LoginScreen> {
     switch (result) {
       case UserLoginSuccess():
         widget.onLoggedIn();
+        break;
       case UserLoginInvalidCredentials():
         setState(() {
           _submitting = false;
           _errorMessage = 'Nieprawidłowy login lub hasło.';
         });
+        break;
       case UserLoginNetworkError():
         setState(() {
           _submitting = false;
