@@ -53,7 +53,10 @@ void main() {
       });
 
       final meta = await db.ensureSyncMetadata();
-      expect(\n        meta.lastSyncAt?.toUtc(),\n        DateTime.parse('2026-10-01T08:00:00+02:00').toUtc(),\n      );
+      expect(
+        meta.lastSyncAt?.toUtc(),
+        DateTime.parse('2026-10-01T08:00:00+02:00').toUtc(),
+      );
 
       await db.close();
     });
@@ -97,7 +100,11 @@ void main() {
         expect(events.first.id, 'events:1', reason: 'the ORIGINAL good snapshot is exactly what survives — not a half-applied mix');
 
         final meta = await db.ensureSyncMetadata();
-        expect(\n          meta.lastSyncAt?.toUtc(),\n          DateTime.parse('2026-10-01T08:00:00+02:00').toUtc(),\n          reason: 'generated_at from the FAILED attempt must not have been persisted either',\n        );
+        expect(
+          meta.lastSyncAt?.toUtc(),
+          DateTime.parse('2026-10-01T08:00:00+02:00').toUtc(),
+          reason: 'generated_at from the FAILED attempt must not have been persisted either',
+        );
 
         await db.close();
       },
