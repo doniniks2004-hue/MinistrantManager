@@ -53,6 +53,13 @@ class DashboardScreen extends StatelessWidget {
     // bootstrap.php / webview_handoff.php's allowlist) happens server-side
     // regardless of what this filter lets through to the grid.
     final visible = modules.where((m) => m.visibleFor(userRoleId)).toList();
+    // UX pass: everyday modules stay on the main grid; the ~40 admin
+    // "Konfiguracja" items (mirroring the real sidebar.php's own section
+    // title) move behind one "Administracja" entry point instead of
+    // flooding the dashboard — review round point 3/5: "dashboard ma
+    // wyglądać jak właściwa aplikacja, a nie techniczny launcher".
+    final everyday = visible.where((m) => m.section != 'config').toList();
+    final adminItems = visible.where((m) => m.section == 'config').toList();
 
     return Scaffold(
       appBar: AppBar(title: const Text('Ministrant Manager')),
@@ -69,7 +76,7 @@ class DashboardScreen extends StatelessWidget {
               text: 'Nie udało się zaktualizować danych. Pokazujemy ostatnią znaną wersję.',
             ),
           Expanded(
-            child: visible.isEmpty
+            child: everyday.isEmpty && adminItems.isEmpty
                 ? const Center(child: Text('Brak dostępnych modułów.'))
                 : GridView.builder(
                     padding: const EdgeInsets.all(16),
@@ -79,9 +86,15 @@ class DashboardScreen extends StatelessWidget {
                       crossAxisSpacing: 12,
                       childAspectRatio: 1.1,
                     ),
-                    itemCount: visible.length,
+                    itemCount: everyday.length + (adminItems.isEmpty ? 0 : 1),
                     itemBuilder: (context, i) {
-                      final module = visible[i];
+                      if (i == everyday.length) {
+                        // The one synthetic "Administracja" tile — only
+                        // shown at all if this user's role has ANY
+                        // visible config-section item.
+                        return _AdminEntryTile(onTap: () => _openAdminSection(context, adminItems));
+                      }
+                      final module = everyday[i];
                       return _ModuleTile(module: module, onTap: () => _openModule(context, module));
                     },
                   ),
@@ -177,6 +190,72 @@ class DashboardScreen extends StatelessWidget {
     two(int n) => n.toString().padLeft(2, '0');
     return '${two(local.day)}.${two(local.month)}, ${two(local.hour)}:${two(local.minute)}';
   }
+
+  void _openAdminSection(BuildContext context, List<ModuleDescriptor> adminItems) {
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => _AdminSectionScreen(
+        items: adminItems,
+        onOpenModule: (module) => _openModule(context, module),
+      ),
+    ));
+  }
+}
+
+/// UX pass: the real legacy `sidebar.php` groups these under one
+/// "Konfiguracja" section title — this screen is that same grouping,
+/// just as its own scrollable list instead of 40 tiles crammed into the
+/// main dashboard grid.
+class _AdminSectionScreen extends StatelessWidget {
+  const _AdminSectionScreen({required this.items, required this.onOpenModule});
+
+  final List<ModuleDescriptor> items;
+  final void Function(ModuleDescriptor) onOpenModule;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Administracja')),
+      body: ListView.separated(
+        itemCount: items.length,
+        separatorBuilder: (_, __) => const Divider(height: 1),
+        itemBuilder: (context, i) {
+          final module = items[i];
+          return ListTile(
+            leading: Icon(_ModuleTile.iconFor(module.icon)),
+            title: Text(module.title),
+            trailing: module.type == ModuleType.webview ? const Icon(Icons.public, size: 16) : null,
+            onTap: () => onOpenModule(module),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _AdminEntryTile extends StatelessWidget {
+  const _AdminEntryTile({required this.onTap});
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: const Padding(
+          padding: EdgeInsets.all(16),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.admin_panel_settings_outlined, size: 36),
+              SizedBox(height: 12),
+              Text('Administracja', textAlign: TextAlign.center),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _Banner extends StatelessWidget {
@@ -223,9 +302,11 @@ class _ModuleTile extends StatelessWidget {
     'settings': Icons.settings_outlined,
   };
 
+  static IconData iconFor(String icon) => _icons[icon] ?? Icons.apps;
+
   @override
   Widget build(BuildContext context) {
-    final icon = _icons[module.icon] ?? Icons.apps;
+    final icon = iconFor(module.icon);
     return Card(
       child: InkWell(
         onTap: onTap,

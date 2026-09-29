@@ -71,4 +71,21 @@ void main() {
       expect(list.map((m) => m.id).toList(), ['a', 'b']);
     });
   });
+
+  group('ModuleDescriptor.section (legacy inventory milestone — mirrors real sidebar.php\'s "Konfiguracja" grouping)', () {
+    test('parses the section field when present', () {
+      final m = ModuleDescriptor.fromJson({
+        'id': 'groups_admin', 'title': 'Zarządzaj grupami', 'type': 'webview', 'path': '/public/groups.php',
+        'enabled': true, 'required_role': [1, 2], 'section': 'config',
+      });
+      expect(m.section, 'config');
+    });
+
+    test('section is null when absent — an everyday module, not grouped', () {
+      final m = ModuleDescriptor.fromJson({
+        'id': 'schedule', 'title': 'Mój grafik', 'type': 'native', 'screen': 'my_schedule', 'enabled': true,
+      });
+      expect(m.section, isNull);
+    });
+  });
 }

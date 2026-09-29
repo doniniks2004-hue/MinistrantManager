@@ -21,6 +21,7 @@ class ModuleDescriptor {
     required this.requiredRoles,
     this.screen,
     this.path,
+    this.section,
   });
 
   final String id;
@@ -45,6 +46,13 @@ class ModuleDescriptor {
   /// konfigurację" — this is why the wire format is `path`, not `url`).
   final String? path;
 
+  /// Legacy inventory milestone: mirrors the real sidebar.php's own
+  /// "Konfiguracja" section title — grouping admin modules under a
+  /// header instead of flattening 40+ tiles into one grid (review round
+  /// point 3, UX pass: "dashboard ma wyglądać jak właściwa aplikacja, a
+  /// nie techniczny launcher"). null = ungrouped, shown at the top level.
+  final String? section;
+
   factory ModuleDescriptor.fromJson(Map<String, dynamic> json) {
     final rawType = json['type'] as String?;
     final type = switch (rawType) {
@@ -67,6 +75,7 @@ class ModuleDescriptor {
       requiredRoles: requiredRoles,
       screen: json['screen'] as String?,
       path: json['path'] as String?,
+      section: json['section'] as String?,
     );
   }
 
