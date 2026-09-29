@@ -63,7 +63,11 @@ class _LoginScreenState extends State<LoginScreen> {
         // and NEVER the generic network-error message below —
         // 'central_unavailable' is a retriable hiccup, the other four
         // states mean a human needs to sort this out.
-        final deviceState = (result as UserLoginDeviceNotAuthorized).deviceState;
+        //
+        // Dart already promotes `result` to UserLoginDeviceNotAuthorized
+        // inside this case (empty-pattern object match) — no cast needed;
+        // `analyze` flags the explicit cast as `unnecessary_cast`.
+        final deviceState = result.deviceState;
         setState(() {
           _submitting = false;
           _errorMessage = deviceState == 'central_unavailable'
