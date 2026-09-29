@@ -16,6 +16,7 @@ Nie składamy produkcyjnej paczki ręcznie z plików z różnych commitów.
 - `public_html-additions/` — pięć stubów API, handoff i config template,
 - `migrations/` — migracje 001–005,
 - `scripts/preflight.php`,
+- `scripts/apply_legacy_security_hardening.php`,
 - `scripts/apply_substitution_hotfix.php`,
 - `scripts/create_test_account.php`,
 - `scripts/cleanup_test_account.php`,
@@ -35,8 +36,8 @@ wersjonowane tutaj, ponieważ musi współpracować z jej istniejącym
 - Android JKS/hasła nie trafiają do repo,
 - paczka zawiera tylko placeholder config dla
   `MOBILE_INTERNAL_API_SECRET`,
-- hotfix legacy odmawia nadpisania pliku, jeśli SHA-256 produkcji różni się
-  od audytowanego baseline,
+- oba instalatory legacy odmawiają nadpisania pliku, jeśli SHA-256 produkcji
+  różni się od audytowanego baseline,
 - finalne uruchomienie na Witosie odbywa się zgodnie z
   `docs/WITOSA-DEPLOYMENT.md`.
 
