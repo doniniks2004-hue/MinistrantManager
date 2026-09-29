@@ -65,7 +65,7 @@ class RankingScreen extends StatelessWidget {
                         style: TextStyle(fontWeight: entry.isCurrentUser ? FontWeight.bold : FontWeight.normal),
                       ),
                       trailing: Text('${entry.totalPoints} pkt', style: const TextStyle(fontWeight: FontWeight.bold)),
-                      tileColor: entry.isCurrentUser ? Theme.of(context).colorScheme.primaryContainer.withOpacity(0.3) : null,
+                      tileColor: entry.isCurrentUser ? Theme.of(context).colorScheme.primaryContainer.withValues(alpha: 0.3) : null,
                     );
                   },
                 ),

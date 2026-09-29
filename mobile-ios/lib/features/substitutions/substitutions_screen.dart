@@ -82,7 +82,7 @@ class _RequestTile extends StatelessWidget {
         ].join(' • ')),
         trailing: Chip(
           label: Text(_statusLabel(request.status), style: const TextStyle(fontSize: 12)),
-          backgroundColor: _statusColor(request.status).withOpacity(0.15),
+          backgroundColor: _statusColor(request.status).withValues(alpha: 0.15),
         ),
       ),
     );
