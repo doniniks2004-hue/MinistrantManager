@@ -1,75 +1,120 @@
 # RELEASE-READINESS.md
 
-## Gotowe już dziś
+Stan po finalnym domknięciu funkcjonalnym przed brandingiem i testem
+akceptacyjnym na realnym urządzeniu.
 
-| Element | Status | Gdzie |
-|---|---|---|
-| Nazwa aplikacji | ✅ „Ministrant Manager" | `AndroidManifest.xml`, `Info.plist` |
-| Application ID / Bundle ID | ✅ `eu.ministrant.manager` (oba) | `build.gradle.kts`, `project.pbxproj` |
-| Numer wersji | ✅ `1.0.0+1` | `pubspec.yaml` |
-| Uprawnienia | ✅ INTERNET, CAMERA (skaner QR) + opis użycia kamery na iOS | `AndroidManifest.xml`, `Info.plist` |
-| Ikona aplikacji | 🔶 domyślna ikona Fluttera (wszystkie gęstości obecne, ale nie logo Ministrant Manager) | `android/.../mipmap-*`, `ios/.../AppIcon.appiconset` |
-| Infrastruktura AAB (Android) | ✅ `flutter build appbundle` w CI, warunkowe na realnym keystore | `.github/workflows/android-build.yml` |
-| Infrastruktura podpisanego IPA (iOS) | ✅ `flutter build ipa`, warunkowe na realnym certyfikacie | `.github/workflows/ios-build.yml` |
-| CI 5/5 | ✅ | patrz ostatni commit |
+## Gotowe w kodzie
 
-## Zablokowane — wymaga danych od Ciebie, nie da się tego zrobić za Ciebie
+| Element | Status |
+|---|---|
+| Nazwa aplikacji „Ministrant Manager” | ✅ |
+| Android Application ID | ✅ `eu.ministrant.manager` |
+| iOS Bundle ID | ✅ `eu.ministrant.manager` |
+| Wersja startowa | ✅ `1.0.0+1` |
+| INTERNET + CAMERA / opis kamery iOS | ✅ |
+| 7/7 modułów native/offline | ✅ |
+| Dynamiczny dashboard native/WebView | ✅ |
+| WebView handoff + role + one-time ticket | ✅ |
+| Device-control-plane app.ministrant.eu ↔ parafia | ✅ |
+| Wymuszona pierwsza zmiana hasła | ✅ |
+| Legacy substitutions hardening | ✅ instalator w paczce Witosy |
+| Automatyczny ZIP wdrożeniowy Witosy w CI | ✅ |
+| Android debug build / iOS unsigned build | ✅ |
 
-### 1. Prawdziwe logo/ikona/splash
+## Branding — jedyny brakujący element UI
 
-Folder `assets/branding/` **już istnieje i czeka** (`README.txt` w
-środku, prawdopodobnie z wcześniejszej rundy) na:
-- `logo.png` — pełne poziome logo
-- `app_icon.png` — kwadratowy symbol graficzny (nie pomniejszone logo)
-- `splash_logo.png` — logo na ekran powitalny
+Czekamy na prawdziwe materiały marki:
+- logo Ministrant Manager (preferowane SVG lub duży PNG z przezroczystym tłem),
+- kwadratowy symbol/app icon (preferowane SVG/PNG 1024×1024 lub większy).
 
-**Świadomie nie odtworzyłem tych plików ręcznie** — to prawdziwy znak
-firmowy Ministrant Managera, nie coś, co powinienem zgadywać/rysować.
-Podeślij oryginalne pliki źródłowe (SVG/AI/wysokiej rozdzielczości PNG),
-a dokończę generowanie ikon dla wszystkich gęstości Android + iOS i
-konfigurację splash screena (`flutter_native_splash`, już dodany jako
-zależność — patrz niżej).
+Z tych dwóch źródeł generujemy:
+- `logo.png`,
+- `app_icon.png`,
+- `splash_logo.png`,
+- komplet mipmap Android,
+- komplet AppIcon iOS,
+- finalny splash przez `flutter_native_splash`.
 
-### 2. Prawdziwe sekrety podpisywania (Android)
+Do tego czasu w aplikacji nadal może być domyślna ikona Fluttera.
 
-CI ma już gotową, warunkową ścieżkę — potrzebuje w **Settings → Secrets
-and variables → Actions** tego repo:
-- `ANDROID_KEYSTORE_BASE64` — Twój release keystore (`.jks`), zakodowany
-  `base64 -w0 twoj-plik.jks`
+## Android release signing — klucz GOTOWY
+
+Docelowy klucz release został wygenerowany i zweryfikowany.
+
+- alias: `ministrant_manager_release`
+- RSA 2048
+- ważność: 2026-09-29 → 2054-02-14
+- certificate SHA-256:
+  `B0:48:52:A5:08:9D:AC:71:14:2F:56:C3:81:62:2A:BE:6B:75:DC:C8:CE:5C:2D:38:56:3F:E4:19:C2:D1:C7:4F`
+- keystore SHA-256:
+  `a145c7fd5e3ad244eec6d5355ddc96d5ea5fa1e55d716863bf3296386769a2a3`
+
+Zaszyfrowany, testowo odtworzony backup jest poza repo, w prywatnej
+Bibliotece użytkownika:
+`/MinistrantManager/Secrets/android-signing-backup.tar.enc`.
+
+Repo **nie zawiera** JKS ani haseł.
+
+### Jedyny ręczny krok GitHub
+
+Obecne narzędzia nie pozwalają bezpośrednio zapisywać GitHub Actions
+Secrets. Trzeba jednorazowo ustawić cztery sekrety repo:
+
+- `ANDROID_KEYSTORE_BASE64`
 - `ANDROID_KEYSTORE_PASSWORD`
 - `ANDROID_KEY_ALIAS`
 - `ANDROID_KEY_PASSWORD`
 
-**Nie mogę i nie powinienem generować tego keystore'a za Ciebie** — to
-prywatny klucz, który MUSISZ wygenerować i przechowywać samodzielnie
-(`keytool -genkey -v -keystore release.jks -keyalg RSA -keysize 2048
--validity 10000 -alias <alias>`). Zgubienie go = utrata możliwości
-aktualizacji aplikacji w Google Play pod tym samym ID.
+Workflow:
+- działa normalnie w trybie debug, gdy nie ma żadnego sekretu,
+- odmawia pracy przy częściowo ustawionym komplecie,
+- po ustawieniu wszystkich czterech buduje podpisany release APK i AAB.
 
-### 3. Prawdziwe sekrety podpisywania (iOS / TestFlight)
+Hasła/klucz nigdy nie mogą zostać wpisane do pliku w repo.
 
-Analogicznie, w tych samych ustawieniach repo:
-- `APPLE_TEAM_ID`
-- certyfikat dystrybucyjny + provisioning profile (dokładne nazwy
-  sekretów w `.github/workflows/ios-build.yml`)
+## iOS release signing
 
-Wymaga aktywnego konta Apple Developer Program — to też coś, co musi
-istnieć po Twojej/firmy stronie.
+Kod i workflow są przygotowane, ale podpisanie IPA/TestFlight wymaga
+zewnętrznych danych Apple:
+- aktywne Apple Developer Program,
+- Team ID,
+- Distribution Certificate,
+- provisioning profile.
 
-## Co zrobiłem w tej rundzie
+To nie blokuje funkcjonalnego ukończenia aplikacji; blokuje wyłącznie
+podpisaną dystrybucję iOS/TestFlight/App Store.
 
-- `flutter_native_splash` dodany jako zależność deweloperska + wpis
-  konfiguracyjny w `pubspec.yaml`, wskazujący na
-  `assets/branding/splash_logo.png` — **nieaktywny, dopóki ten plik nie
-  istnieje** (polecenie generujące splash po prostu nic nie zrobi/da
-  błąd braku pliku, dopóki go nie podeślesz — to zamierzone, nie bug).
+## Wdrożenie Witosy
 
-## Kiedy będzie można faktycznie opublikować
+CI buduje artefakt `witosa-deployment.zip`, zawierający:
+- MobileAPI,
+- migracje 001–005,
+- pięć publicznych stubów API,
+- WebView handoff,
+- flow pierwszej zmiany hasła,
+- konfigurację device-control-plane,
+- `scripts/apply_substitution_hotfix.php`,
+- preflight/smoke/cleanup,
+- aktualną instrukcję wdrożenia.
 
-1. Podeślij 3 pliki logo → dokończę ikony + splash w jednej rundzie.
-2. Wygeneruj i dodaj sekrety Android + iOS w ustawieniach repo → następny
-   push automatycznie zacznie produkować podpisane artefakty (AAB + IPA)
-   zamiast tylko debug APK.
-3. Dopiero wtedy realny upload do Google Play Console / App Store
-   Connect — to już świadomie poza zakresem tego etapu (release
-   readiness ≠ publikacja).
+Hotfix zamian jest fail-closed:
+- sprawdza SHA-256 audytowanego legacy,
+- robi backup,
+- podmienia pliki atomowo,
+- sprawdza końcowe SHA-256,
+- rollbackuje przy błędzie,
+- drugie uruchomienie jest bezpiecznym no-op.
+
+## Co oznacza „gotowe”
+
+**Funkcjonalnie:** po przejściu aktualnego CI i dodaniu brandingu kod jest
+zamknięty do finalnej rundy acceptance/hardening.
+
+**Do publikacji sklepów:** dodatkowo wymagane są:
+1. branding,
+2. ustawienie 4 sekretów Androida,
+3. Apple Developer + signing dla iOS,
+4. finalny test realnego urządzenia/Witosy,
+5. upload do Google Play Console / App Store Connect.
+
+Publikacja do sklepów jest celowo dopiero po pełnym teście akceptacyjnym.
