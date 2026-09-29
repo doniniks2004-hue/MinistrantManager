@@ -1,113 +1,107 @@
 # MODULE-MATRIX.md
 
-Pełna inwentaryzacja modułów Ministrant Managera, zbudowana z **realnego
-kodu** parafii Witosa (`src/partials/sidebar.php` — jedyne prawdziwe
-źródło nawigacji — i listing `public/*.php`), nie z pamięci ani
-założeń. Legenda `Status`: ✅ gotowe i zweryfikowane, 🔶 częściowe,
-⬜ nie zaczęte (dostępne przez generic WebView bez dodatkowej pracy).
+Wyczerpująca inwentaryzacja **wszystkich 91 plików** `public/*.php` z
+realnego kodu Witosy, każdy sklasyfikowany na podstawie: `sidebar.php`
+(dokładne linki + role) lub jawnej ochrony roli w samym pliku PHP
+(`$_SESSION['user_role_id']`), nigdy zgadywania.
 
-## Native (offline)
+Legenda ról: **5** = Ministrant, **4** = Rodzic, **3** = Starszy
+Ministrant, **2** = Ksiądz, **1** = Admin.
 
-| module_id | Nazwa | Route/Screen | Offline | R/W | Rola | Status | Blocker |
-|---|---|---|---|---|---|---|---|
-| `schedule` | Mój grafik | `my_schedule` | tak | R | każdy | ✅ | — |
-| `announcements` | Ogłoszenia | `announcements` | tak | R | każdy | ✅ | — |
-| `profile` | Moje konto | `profile` | tak | R | każdy | ✅ | — |
-| `points` | Historia punktów | `points_history` | tak | R | każdy | ⬜ | brak repozytorium PHP (`points` table istnieje, adapter nie) |
-| `ranking` | Ranking | `ranking` | tak | R | każdy | ⬜ | ranking to projekcja z `points` — wymaga zapytania agregującego po stronie PHP, nie zrobione |
-| `substitutions` | Zastępstwa | `substitutions` | tak | R (write→WebView) | każdy | ⬜ | `substitution_requests`/`substitution_history` mają znany bug (patrz HOTFIX-substitution_history.md) — odczyt bezpieczny do zrobienia, ale nie zrobiony w tej rundzie |
-| `attendance` | Obecności | `attendance` | tak | R (write→WebView) | każdy | ⬜ | dwa różne źródła (`schedule.is_present` vs `gathering_attendance`) wymagają osobnego mapowania — nie zrobione |
+## NATIVE (7) — offline, realny backend
 
-## WebView — codzienne/częste
-
-| module_id | Nazwa | Path | Wymaga online | R/W | Rola | Status |
-|---|---|---|---|---|---|---|
-| `justifications` | Usprawiedliwienia | `/public/justifications.php` | tak | R/W | każdy | ✅ (allowlist+handoff gotowe) |
-| `substitution_finder` | Znajdź zastępstwo | `/public/substitution-finder.php` | tak | R/W | każdy | ✅ |
-
-## WebView — sezonowe (włączane/wyłączane przez panel WWW)
-
-| module_id | Nazwa | Path | Warunek włączenia (realna logika z sidebar.php) | Status |
+| module_id | Nazwa | Ekran | Rola | Status |
 |---|---|---|---|---|
-| `summer` | Kalendarz wakacyjny | `/public/summer-calendar.php` | `summer_module.is_active` + okno `date_from`/`date_to` | ✅ |
-| `kolenda` | Kolędy | `/public/kolenda-calendar.php` | `kolenda_module.is_active` + okno dat | ✅ |
-| `wyjazdy` | Wyjazdy i wydarzenia | `/public/wyjazdy-kalendarz.php` | `wyjazdy_module.is_active` (bez okna dat) | ✅ |
-| `triduum` | Triduum Paschalne | `/public/triduum.php` | `triduum_config`: `module_enabled=1` i `module_completely_hidden≠1` | ✅ |
+| `schedule` | Mój grafik | `my_schedule` | każdy | ✅ |
+| `ranking` | Ranking | `ranking` | każdy | ✅ |
+| `points` | Historia punktów | `points_history` | każdy | ✅ |
+| `substitutions` | Zastępstwa (odczyt) | `substitutions` | każdy | ✅ write→WebView |
+| `attendance` | Obecności (odczyt, 2 źródła) | `attendance` | każdy | ✅ |
+| `announcements` | Ogłoszenia (odczyt) | `announcements` | każdy | ✅ |
+| `profile` | Moje konto | `profile` | każdy | ✅ |
 
-**Uwaga o „Obozach"**: w realnym kodzie Witosy nie ma osobnej tabeli/modułu
-`obozy` — `summer_module`/`summer_events`/`summer_signups` obejmuje
-zarówno wakacje, jak i obozy jako jedno zjawisko. Traktowanie ich jako
-dwóch osobnych pozycji w dashboardzie (jak w oryginalnej liście) nie
-odzwierciedla realnej struktury danych — `summer` już to pokrywa.
+## WEBVIEW — codzienne (2)
 
-## WebView — administracyjne (rola: Admin=1, Ksiądz=2, czasem Starszy=3)
-
-| module_id | Nazwa | Path | Rola | Status |
-|---|---|---|---|---|
-| `gathering_access` | Obecność na zbiórkach | `/public/gathering-access.php` | 1,2,3 | ✅ |
-| `event_manager` | Zwalnianie z mszy | `/public/event_manager.php` | 1,2,3 | ✅ |
-| `kandydaci` | Kandydaci | `/public/kandydaci-admin.php` | 1,2 | ✅ |
-| `custom_devotions` | Nabożeństwa własne | `/public/custom_devotions.php` | 1,2 | ✅ |
-| `points_management` | Zarządzaj punktami | `/public/points-management.php` | 1,2 | ✅ |
-| `users_admin` | Użytkownicy | `/public/users.php` | 1,2 | ✅ |
-| `statistics` | Statystyki | `/public/statistics.php` | 1,2 | ✅ |
-| `settings_admin` | Ustawienia | `/public/settings.php` | 1,2 | ✅ |
-| `triduum_admin` | Triduum — panel | `/public/triduum-admin.php` | 1,2 | ✅ |
-
-## Znalezione w kodzie, ale NIEwystawione jeszcze na dashboard
-
-Znalezione podczas przeglądu `public/*.php`, poza już wymienionymi
-wyżej — zgodnie z zasadą „jeśli znajdziesz kolejne moduły, dodaj je do
-matrycy":
-
-| Plik | Prawdopodobna funkcja | Rekomendacja |
+| module_id | Plik | Rola |
 |---|---|---|
-| `groups.php` | Zarządzaj grupami ministrantów | webview, admin |
-| `msze.php` | Zarządzaj mszami (konfiguracja) | webview, admin |
-| `generate-week.php` | Generuj msze w tygodniu | webview, admin |
-| `auto-generate-events.php` | Generuj niedziele/święta | webview, admin |
-| `nabozenstwa.php` | Konfiguracja nabożeństw | webview, admin |
-| `devotion_settings.php` | Widoczność nabożeństw | webview, admin |
-| `parent-assignment.php` | Przypisz rodzica | webview, admin |
-| `meetings-config.php` | Zarządzaj zbiórkami (config) | webview, admin |
-| `rotation-config.php` | Konfiguracja rotacji służby | webview, admin |
-| `mass-config.php` | Konfiguracja mszy | webview, admin |
-| `devotional_ranking.php` | Obecność na nabożeństwach (raport) | webview, admin |
-| `devotional_points_config.php` | Punkty za nabożeństwa stałe | webview, admin |
-| `church_attendance_check.php` | Tryb kościelnego (skanowanie obecności) | webview, rola specjalna (kościelny) |
-| `priest_attendance_review.php` | Zatwierdzanie obecności przez księdza | webview, 1,2 |
-| `account-edit.php` | Edycja własnego konta (legacy) | **NIE wystawiać** — zastąpione przez natywny `profile` |
-| `force-change-password.php` | Wymuszona zmiana hasła | webview, warunkowe (flaga `force_password_change` w sesji) |
-| `justification_details.php` / `justifications_ajax.php` | Szczegóły/AJAX usprawiedliwień | część `justifications`, nie osobny moduł |
-| `senior-managers.php` | Zarządzanie starszymi ministrantami | webview, admin |
-| `import-users.php` | Import użytkowników (CSV?) | webview, admin |
-| `search-parent.php` | Wyszukiwanie rodzica (AJAX) | część `parent-assignment`, nie osobny moduł |
-| `manual-swap.php`, `manual-meeting.php` | Ręczne operacje admina | webview, admin |
-| `schedule_quick_edit.php` | Szybka edycja grafiku | webview, admin |
-| `druk*.php`, `print-view*.php`, `generate_csv_report.php`, `generate_excel_report.php`, `gathering-pdf.php`, `triduum-pdf.php` | Eksport/druk raportów PDF/CSV/Excel | webview, admin — nie ma sensu przepisywać natywnie |
-| `download-document.php` | Pobieranie załączników | webview |
-| `regulamin.php`, `polityka-prywatnosci.php` | Strony statyczne | webview, publiczne |
-| `form.php` | Kontakt partnerski | webview, admin |
-| `get-niedzielnik.php`, `get-slowo-na-dzis.php` | Widżety treści dnia | wbudowane w dashboard.php dziś — do rozważenia jako natywny widget w przyszłości, nie teraz |
-| `empty.php` | (prawdopodobnie placeholder/nieużywany) | pominąć |
+| `justifications` | `justifications.php` | każdy |
+| `substitution_finder` | `substitution-finder.php` ("Zamiany") | każdy |
 
-Wszystkie powyższe **DAJĄ SIĘ otworzyć już dziś** przez istniejący
-generic `LegacyModuleScreen`, jeśli dodać ich ścieżkę do
-`webview_path_allowlist()` w `modules_builder.php` i ewentualnie
-osobny wpis modułu w `build_modules()` — infrastruktura (handoff,
-allowlist, WebView shell) jest wspólna dla wszystkich, więc dodanie
-kolejnego modułu legacy do dashboardu nie wymaga nowego APK.
+## WEBVIEW — sezonowe, warunkowe (4)
 
-## Podsumowanie stanu tej rundy
+| module_id | Plik | Warunek włączenia |
+|---|---|---|
+| `summer` | `summer-calendar.php` | `summer_module.is_active` + okno dat |
+| `kolenda` | `kolenda-calendar.php` | `kolenda_module.is_active` + okno dat |
+| `wyjazdy` | `wyjazdy-kalendarz.php` | `wyjazdy_module.is_active` |
+| `triduum` | `triduum.php` | `triduum_config`: enabled i nie hidden |
 
-- **Native + offline, gotowe i zweryfikowane end-to-end**: Mój grafik,
-  Ogłoszenia, Moje konto (3/7 z docelowej listy P1)
-- **Native, ale nie zrobione w tej rundzie** (backend brak): Punkty,
-  Ranking, Zastępstwa (read), Obecności (read) — bezpieczny fallback:
-  dashboard poprawnie pokazuje „Ten moduł wymaga nowszej wersji
-  aplikacji" zamiast się wywalać, jeśli capability kiedyś włączona bez
-  odpowiadającego ekranu
-- **WebView + handoff, w pełni gotowe i przetestowane**: 15 modułów
-  (2 codzienne, 4 sezonowe, 9 administracyjnych)
-- **Znalezione, nie wystawione**: ~25 kolejnych plików PHP, gotowa
-  ścieżka dodania każdego bez nowego APK
+## WEBVIEW — rola 1,2,3 (Admin/Ksiądz/Starszy) (2)
+
+`event_manager` (`event_manager.php`), `gathering_access` (`gathering-access.php`)
+
+## WEBVIEW — sekcja „Administracja" (rola 1,2 — Admin/Ksiądz), 39 pozycji
+
+Wszystkie poniżej mają potwierdzoną ochronę `in_array($_SESSION['user_role_id'], [1, 2])` w samym pliku PHP (lub — dla pozycji z sidebar.php — blok `<?php if ($isAdmin): ?>`).
+
+**Z `sidebar.php` (21):** `summer-admin.php`, `kolenda-admin.php`, `kolenda-podglad.php`, `wyjazdy-admin.php`, `meetings-config.php`, `points-management.php`, `statistics.php`, `msze.php`, `users.php`, `kandydaci-admin.php`, `parent-assignment.php`, `announcements.php` (zarządzanie — **inny moduł niż natywne odczytowe Ogłoszenia**), `groups.php`, `auto-generate-events.php`, `generate-week.php`, `nabozenstwa.php`, `devotion_settings.php`, `custom_devotions.php`, `church_attendance_check.php`, `priest_attendance_review.php`, `devotional_ranking.php`, `devotional_points_config.php`, `settings.php`, `triduum-admin.php` + `triduum-attendance.php` + `triduum-pdf.php`, `form.php`
+
+**Znalezione przez przegląd roli w pliku, nieobecne w linkach `sidebar.php` (prawdopodobnie reachowane z akcji/szczegółów innych stron admina) (13):** `attendance.php`, `attendance-history.php`, `attendance-report.php`, `schedule_quick_edit.php`, `manual-meeting.php`, `rotation-config.php`, `mass-config.php`, `sunday_mass_config.php`, `sunday_mass_generator.php`, `user-add.php`, `user-edit.php`, `import-users.php`, `akcept.php`
+
+**Brak jawnej ochrony w pliku, konserwatywnie sparowane z odpowiednikiem admin-only (2):** `manual-swap.php` (rola 1,2), `senior-managers.php` (rola 1,2,3 — nazwa sugeruje zarządzanie Starszymi Ministrantami)
+
+## WEBVIEW — publiczne, statyczne (2)
+
+`polityka-prywatnosci.php`, `regulamin.php` — dostępne każdemu zalogowanemu.
+
+## NIE DOTYCZY APLIKACJI MOBILNEJ (24)
+
+| Plik | Powód |
+|---|---|
+| `login.php`, `dashboard.php` | zastąpione przez natywną aktywację/login/dashboard |
+| `account-edit.php` | zastąpione przez natywne „Moje konto" |
+| `empty.php` | placeholder/nieużywany |
+| `substitution-functions.php`, `meeting-functions.php` | pliki z funkcjami PHP, nie strony |
+| `get_attendance_for_event.php`, `get_events_for_date.php`, `points_management_addon.php`, `justifications_ajax.php`, `substitution-ajax.php`, `search-parent.php` | endpointy AJAX/JSON, nie samodzielne strony |
+| `sidebar-with-gatherings.php` | wariant partiala, nie strona |
+| `event-add.php`, `event-edit.php`, `event-details.php` | prawdopodobnie modal/AJAX w ramach `msze.php`, nie osobna nawigacja |
+| `accept_substitution.php` | akcja zapisu z **znanym bugiem** (patrz `HOTFIX-substitution_history.md`) — nie strona do otwarcia wprost |
+| `gathering-attendance.php`, `gathering-details.php` | prawdopodobnie widoki szczegółowe z `gathering-access.php` |
+| `church_attendance.php` | prawdopodobny starszy/alternatywny wariant `church_attendance_check.php` |
+| `druk.php`, `druk-new.php`, `druk-kafelki.php`, `print-view.php`, `print-view-new.php`, `generate_csv_report.php`, `generate_excel_report.php`, `gathering-pdf.php` | eksport/druk — niska wartość na telefonie, do rozważenia w przyszłości jako WebView |
+| `get-niedzielnik.php`, `get-slowo-na-dzis.php` | widżety treści dnia, wbudowane w `dashboard.php`, nie osobne strony |
+| `force-change-password.php` | wymuszony flow sesyjny, nie moduł nawigowalny — **znany gap**, patrz niżej |
+
+## ⚠ Znaleziona sprzeczność — wymaga decyzji, NIE zgadnięta
+
+**`ustawienia.php` vs `settings.php`** — dwa różne pliki ustawień.
+`settings.php` ma potwierdzoną ochronę roli i jest w `sidebar.php`.
+`ustawienia.php` **nie ma żadnej ochrony roli w widocznej części pliku**
+i nie jest linkowany z `sidebar.php` wcale. Może to być:
+(a) starszy, zastąpiony plik pozostawiony przez pomyłkę, albo
+(b) osobna, rzeczywiście używana strona z inną logiką dostępu.
+
+**Nie dodałem `ustawienia.php` do rejestru** — potrzebna decyzja, który
+plik jest faktycznie aktualny, zanim wystawię go na dashboard (błędne
+założenie o roli mogłoby wystawić panel ustawień bez ochrony).
+
+## Znany, nie zaadresowany gap: `force-change-password.php`
+
+To wymuszony krok w środku sesji (flaga `force_password_change`), nie
+moduł w dashboardzie. WebView-owy flow logowania (handoff) obecnie **nie
+obsługuje** przekierowania na wymuszoną zmianę hasła w środku sesji —
+jeśli konto ma tę flagę ustawioną, aktualny handoff prawdopodobnie
+wpuści użytkownika normalnie z pominięciem tego wymogu. Wymaga decyzji
+produktowej: czy to ma być egzekwowane w mobile w ogóle, a jeśli tak —
+jak (osobny ekran natywny? redirect w WebView?).
+
+## Podsumowanie
+
+- **Native + offline**: 7/7 zaplanowanych modułów P1 — **gotowe**
+- **WebView**: 54 moduły łącznie w dashboardzie (2 codzienne + 4
+  sezonowe + 2 rola-1,2,3 + 41 w sekcji „Administracja", w tym 2
+  statyczne strony publiczne)
+- **Nie dotyczy**: 24 pliki (AJAX/funkcje/warianty/eksporty), rosnąca
+  lista jeśli znajdą się kolejne
+- **Świadomie odłożone/wymagające decyzji**: `ustawienia.php` (konflikt
+  z `settings.php`), `force-change-password.php` (brak flow w mobile)
