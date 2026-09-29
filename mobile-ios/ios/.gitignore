@@ -36,3 +36,6 @@ Runner/GeneratedPluginRegistrant.*
 Flutter/Signing.xcconfig
 
 ExportOptions.generated.plist
+
+*.p12
+*.mobileprovision
