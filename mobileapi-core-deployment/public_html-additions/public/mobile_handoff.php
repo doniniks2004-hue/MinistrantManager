@@ -45,7 +45,7 @@ if ($consumed === null) {
     handoff_fail('Bilet dostępu jest nieprawidłowy, wygasł, lub został już użyty.');
 }
 
-$stmt = $conn->prepare('SELECT id, full_name, role_id, is_active FROM users WHERE id = ?');
+$stmt = $conn->prepare('SELECT id, full_name, role_id, password_changed, is_active FROM users WHERE id = ?');
 $stmt->bind_param('i', $consumed['user_id']);
 $stmt->execute();
 $user = $stmt->get_result()->fetch_assoc();
@@ -53,6 +53,9 @@ $stmt->close();
 
 if ($user === null || (int) $user['is_active'] !== 1) {
     handoff_fail('Konto jest nieaktywne.');
+}
+if ((int) $user['password_changed'] !== 1) {
+    handoff_fail('Wymagana jest zmiana hasła w aplikacji.');
 }
 
 // Same session-regeneration pattern as src/auth.php's password login.
