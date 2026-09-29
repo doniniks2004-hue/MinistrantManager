@@ -72,7 +72,7 @@ final class MobileUserTokenService
     {
         $stmt = $this->conn->prepare(
             'SELECT t.id, t.user_id, t.token_hash, u.role_id, r.name AS role_name,
-                    u.parent_id, u.can_request_substitution, u.can_accept_substitution, u.is_active
+                    u.parent_id, u.can_request_substitution, u.can_accept_substitution, u.is_active, u.password_changed
              FROM mobile_user_tokens t
              JOIN users u ON u.id = t.user_id
              LEFT JOIN roles r ON r.id = u.role_id
@@ -98,6 +98,13 @@ final class MobileUserTokenService
             // device-status checks (Iteration 1 review): a stored
             // credential is never enough on its own once the account it
             // belongs to is no longer active.
+            return null;
+        }
+
+        // A reset / first-login password requirement is security state,
+        // not a UI hint. Tokens stop working immediately while
+        // password_changed=0.
+        if ((int) $row['password_changed'] !== 1) {
             return null;
         }
 
@@ -127,6 +134,20 @@ final class MobileUserTokenService
              WHERE installation_id = ? AND revoked_at IS NULL'
         );
         $stmt->bind_param('s', $installationId);
+        $stmt->execute();
+        $affected = $stmt->affected_rows;
+        $stmt->close();
+
+        return $affected;
+    }
+
+    public function revokeAllForUser(int $userId): int
+    {
+        $stmt = $this->conn->prepare(
+            'UPDATE mobile_user_tokens SET revoked_at = NOW()
+             WHERE user_id = ? AND revoked_at IS NULL'
+        );
+        $stmt->bind_param('i', $userId);
         $stmt->execute();
         $affected = $stmt->affected_rows;
         $stmt->close();
