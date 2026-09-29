@@ -74,8 +74,14 @@ jobs:
           security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
           PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PROFILE_PLIST")
           PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PROFILE_PLIST")
+          PROFILE_TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$PROFILE_PLIST")
           PROFILE_APP_ID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PROFILE_PLIST")
           PROFILE_BUNDLE_ID="${PROFILE_APP_ID#*.}"
+
+          if [ "$PROFILE_TEAM_ID" != "$APPLE_TEAM_ID" ]; then
+            echo "Provisioning profile Team ID is '$PROFILE_TEAM_ID', but APPLE_TEAM_ID is '$APPLE_TEAM_ID'."
+            exit 1
+          fi
 
           if [ "$PROFILE_BUNDLE_ID" != "eu.ministrant.manager" ]; then
             echo "Provisioning profile bundle id is '$PROFILE_BUNDLE_ID', expected 'eu.ministrant.manager'."
