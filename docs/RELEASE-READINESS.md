@@ -47,13 +47,17 @@ Docelowy klucz release został wygenerowany i zweryfikowany.
 - RSA 2048
 - ważność: 2026-09-29 → 2054-02-14
 - certificate SHA-256:
-  `B0:48:52:A5:08:9D:AC:71:14:2F:56:C3:81:62:2A:BE:6B:75:DC:C8:CE:5C:2D:38:56:3F:E4:19:C2:D1:C7:4F`
+  `7B:A4:5D:C9:80:41:DA:E0:BC:96:B2:7B:E1:EB:E2:3F:D5:26:B6:6B:A2:CD:C3:BF:B4:74:C4:68:2E:E7:16:28`
 - keystore SHA-256:
-  `a145c7fd5e3ad244eec6d5355ddc96d5ea5fa1e55d716863bf3296386769a2a3`
+  `b2faafa3d057d1c705616faac59d3cf12048288a8f7a63734665c1b3cdb011c7`
 
 Zaszyfrowany, testowo odtworzony backup jest poza repo, w prywatnej
 Bibliotece użytkownika:
 `/MinistrantManager/Secrets/android-signing-backup.tar.enc`.
+
+Dane odzyskiwania potrzebne do odtworzenia JKS i ustawienia GitHub Secrets
+są zapisane osobno w prywatnej Bibliotece:
+`/MinistrantManager/Secrets/android-signing-recovery.txt`.
 
 Repo **nie zawiera** JKS ani haseł.
 
