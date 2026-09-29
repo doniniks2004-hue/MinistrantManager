@@ -61,8 +61,8 @@ jobs:
           KEYCHAIN_PATH="$RUNNER_TEMP/mm-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
 
-          printf '%s' "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
-          printf '%s' "$APPLE_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
+          printf '%s' "$APPLE_CERTIFICATE_BASE64" | base64 -D > "$CERT_PATH"
+          printf '%s' "$APPLE_PROVISIONING_PROFILE_BASE64" | base64 -D > "$PROFILE_PATH"
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
@@ -89,7 +89,7 @@ jobs:
           DEVELOPMENT_TEAM=$APPLE_TEAM_ID
           CODE_SIGN_STYLE=Manual
           PROVISIONING_PROFILE_SPECIFIER=$PROFILE_UUID
-          CODE_SIGN_IDENTITY=iPhone Distribution
+          CODE_SIGN_IDENTITY=Apple Distribution
           EOF
 
           cat > ios/ExportOptions.generated.plist <<EOF
