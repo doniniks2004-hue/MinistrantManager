@@ -93,6 +93,32 @@ jobs:
       - name: Build debug APK (always)
         run: flutter build apk --debug
 
+      - name: Validate release AAB with ephemeral CI key (when production signing is absent)
+        if: ${{ env.HAS_ANDROID_KEYSTORE == 'false' && env.HAS_ANDROID_STORE_PASSWORD == 'false' && env.HAS_ANDROID_KEY_ALIAS == 'false' && env.HAS_ANDROID_KEY_PASSWORD == 'false' }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          keytool -genkeypair -noprompt \
+            -keystore android/ci-release-test.keystore \
+            -storepass ci-release-test-password \
+            -keypass ci-release-test-password \
+            -alias ci-release-test \
+            -keyalg RSA -keysize 2048 -validity 2 \
+            -dname "CN=Ministrant Manager CI,O=Ministrant Manager,C=PL"
+
+          cat > android/key.properties << KEYPROPS
+          storePassword=ci-release-test-password
+          keyPassword=ci-release-test-password
+          keyAlias=ci-release-test
+          storeFile=ci-release-test.keystore
+          KEYPROPS
+
+          flutter build appbundle --release
+
+          rm -f android/key.properties android/ci-release-test.keystore
+          rm -f build/app/outputs/bundle/release/*.aab
+
       - name: Build release APK + AAB (only if keystore secrets are configured)
         if: ${{ env.HAS_ANDROID_KEYSTORE == 'true' && env.HAS_ANDROID_STORE_PASSWORD == 'true' && env.HAS_ANDROID_KEY_ALIAS == 'true' && env.HAS_ANDROID_KEY_PASSWORD == 'true' }}
         run: |
