@@ -313,6 +313,7 @@ class _ModuleTile extends StatelessWidget {
     'users-cog': Icons.manage_accounts_outlined,
     'chart': Icons.bar_chart_outlined,
     'settings': Icons.settings_outlined,
+    'music': Icons.music_note_outlined,
   };
 
   static IconData iconFor(String icon) => _icons[icon] ?? Icons.apps;
