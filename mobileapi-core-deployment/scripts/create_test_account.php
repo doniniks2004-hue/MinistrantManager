@@ -58,15 +58,15 @@ $stmt->close();
 
 if ($existing) {
     $userId = (int) $existing['id'];
-    $stmt = $conn->prepare('UPDATE users SET password = ? WHERE id = ?');
+    $stmt = $conn->prepare('UPDATE users SET password = ?, password_changed = 1 WHERE id = ?');
     $stmt->bind_param('si', $hash, $userId);
     $stmt->execute();
     $stmt->close();
     echo "Konto już istniało (id=$userId) — zaktualizowano TYLKO hasło.\n";
 } else {
     $stmt = $conn->prepare(
-        'INSERT INTO users (username, password, full_name, role_id, is_active, can_request_substitution, can_accept_substitution)
-         VALUES (?, ?, ?, ?, 1, 1, 1)'
+        'INSERT INTO users (username, password, full_name, role_id, is_active, password_changed, can_request_substitution, can_accept_substitution)
+         VALUES (?, ?, ?, ?, 1, 1, 1, 1)'
     );
     $roleId = TEST_ROLE_ID;
     $fullName = TEST_FULL_NAME;
