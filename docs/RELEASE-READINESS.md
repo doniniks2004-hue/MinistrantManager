@@ -67,9 +67,14 @@ Secrets. Trzeba jednorazowo ustawić cztery sekrety repo:
 - `ANDROID_KEY_PASSWORD`
 
 Workflow:
-- działa normalnie w trybie debug, gdy nie ma żadnego sekretu,
-- odmawia pracy przy częściowo ustawionym komplecie,
-- po ustawieniu wszystkich czterech buduje podpisany release APK i AAB.
+- zawsze buduje debug APK,
+- bez produkcyjnych sekretów generuje wyłącznie na runnerze tymczasowy
+  keystore, buduje release AAB z minifikacją i natychmiast usuwa ten AAB
+  oraz tymczasowy klucz — dzięki temu release path jest testowany w CI,
+- odmawia pracy przy częściowo ustawionym komplecie sekretów,
+- przy 4/4 sekretach dekoduje prawdziwy JKS do `android/release.keystore`,
+  weryfikuje hasło magazynu i alias przez `keytool`,
+- następnie buduje podpisany release APK i AAB.
 
 Hasła/klucz nigdy nie mogą zostać wpisane do pliku w repo.
 
