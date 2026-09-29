@@ -36,7 +36,7 @@ final class LegacyPasswordAuthenticator
     }
 
     /**
-     * @return array{id:int, full_name:?string, role_id:int, is_active:bool}|null
+     * @return array{id:int, full_name:?string, role_id:int, password_changed:bool, is_active:bool}|null
      *   null means "invalid credentials OR rate-limited" — deliberately
      *   the same outward result for both, exactly like auth.php's
      *   existing behavior, so a client can't distinguish "wrong password"
@@ -59,7 +59,7 @@ final class LegacyPasswordAuthenticator
         $dummyHash = '$2y$12$' . str_repeat('a', 53);
 
         $stmt = $this->conn->prepare(
-            'SELECT id, password, role_id, full_name, is_active FROM users WHERE username = ? LIMIT 1'
+            'SELECT id, password, role_id, full_name, password_changed, is_active FROM users WHERE username = ? LIMIT 1'
         );
         $stmt->bind_param('s', $username);
         $stmt->execute();
@@ -80,6 +80,7 @@ final class LegacyPasswordAuthenticator
             'id' => (int) $user['id'],
             'full_name' => $user['full_name'],
             'role_id' => (int) $user['role_id'],
+            'password_changed' => (int) $user['password_changed'] === 1,
             'is_active' => true,
         ];
     }
