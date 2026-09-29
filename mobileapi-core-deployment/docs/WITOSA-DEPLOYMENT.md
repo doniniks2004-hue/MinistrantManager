@@ -18,6 +18,7 @@ backup
 → install_mobile_meta
 → wdrożenie mobileapi-core + 5 stubów + .htaccess
 → legacy security hardening
+→ legacy web hardening
 → legacy substitutions hotfix
 → smoke/acceptance
 → cleanup danych testowych
@@ -211,7 +212,43 @@ Jeżeli skrypt zgłosi nieznany SHA-256, **nie wymuszaj podmiany** — oznacza
 to, że produkcyjny legacy różni się od audytowanego backupu i trzeba
 najpierw zrobić diff.
 
-## 8. Zastosuj hotfix zastępstw
+## 8. Zastosuj legacy web hardening
+
+Pakiet zawiera:
+`scripts/apply_legacy_web_hardening.php`.
+
+Skopiuj go do `/home/<user>/apply_legacy_web_hardening.php`, czyli obok
+`public_html/`, i uruchom:
+
+```bash
+cd /home/<user>
+php apply_legacy_web_hardening.php
+```
+
+Poprawny wynik:
+
+```
+LEGACY WEB HARDENING OK
+```
+
+Drugie uruchomienie jest bezpiecznym no-op.
+
+Instalator jest fail-closed: przed zmianą sprawdza SHA-256 audytowanej
+wersji, robi backup, zapisuje atomowo, weryfikuje końcowe hashe i
+rollbackuje przy błędzie.
+
+Domyka trzy dodatkowe problemy:
+- centralny same-origin guard dla mutujących żądań legacy wykonywanych
+  w zalogowanej sesji,
+- realną weryfikację CSRF na destrukcyjnych akcjach `public/empty.php`,
+- bezpieczniejszą obsługę screenshotów w `public/form.php`: MIME jest
+  rozpoznawany z zawartości pliku, a upload nie trafia do wykonywalnego
+  publicznego webrootu.
+
+Jeżeli produkcyjny plik ma inny SHA niż audytowany baseline, instalator
+odmawia podmiany — najpierw wykonaj diff.
+
+## 9. Zastosuj hotfix zastępstw
 
 Pakiet zawiera:
 `scripts/apply_substitution_hotfix.php`.
@@ -252,7 +289,7 @@ Hotfix m.in.:
 Jeżeli skrypt zgłosi różny hash — **nie wymuszaj podmiany**. Najpierw porównaj
 produkcyjny plik z audytowaną wersją.
 
-## 9. Wymuszona pierwsza zmiana hasła
+## 10. Wymuszona pierwsza zmiana hasła
 
 Mobile nie obchodzi legacy `password_changed`.
 
@@ -267,7 +304,7 @@ Flow:
 7. wydawany jest świeży token,
 8. WebView handoff także odmawia dostępu przy `password_changed=0`.
 
-## 10. Konto testowe — dopiero w finalnej rundzie acceptance
+## 11. Konto testowe — dopiero w finalnej rundzie acceptance
 
 ```bash
 php create_test_account.php
@@ -281,7 +318,7 @@ Skrypt:
 
 Nie zapisuj hasła do repo.
 
-## 11. Smoke test
+## 12. Smoke test
 
 ```bash
 chmod +x smoke_test.sh
@@ -307,7 +344,7 @@ Po podstawowym smoke sprawdź w acceptance dodatkowo:
 - maintenance,
 - update-required.
 
-## 12. Cleanup
+## 13. Cleanup
 
 ```bash
 php cleanup_test_account.php
@@ -315,7 +352,7 @@ php cleanup_test_account.php
 
 Usuwa wyłącznie dane oznaczone przez test oraz konto testowe.
 
-## 13. Rollback
+## 14. Rollback
 
 Jeżeli problem dotyczy MobileAPI:
 - przywróć poprzedni `.htaccess`,
@@ -326,6 +363,10 @@ Jeżeli problem dotyczy legacy security hardening:
 - użyj timestampowanego katalogu
   `backup_legacy_security_*/`.
 
+Jeżeli problem dotyczy legacy web hardening:
+- użyj timestampowanego katalogu backupu utworzonego przez
+  `apply_legacy_web_hardening.php`.
+
 Jeżeli problem dotyczy zastępstw:
 - użyj timestampowanego katalogu
   `backup_substitution_hotfix_*/` utworzonego przez instalator.
@@ -333,7 +374,7 @@ Jeżeli problem dotyczy zastępstw:
 Nie kasuj tabel/migracji w panice — najpierw odłącz routing i przywróć kod,
 a dopiero potem analizuj dane.
 
-## 14. Co jest celowo poza tym wdrożeniem
+## 15. Co jest celowo poza tym wdrożeniem
 
 - publikacja Google Play / App Store,
 - podpis iOS bez Apple Developer,
