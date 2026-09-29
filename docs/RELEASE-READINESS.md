@@ -75,15 +75,24 @@ Hasła/klucz nigdy nie mogą zostać wpisane do pliku w repo.
 
 ## iOS release signing
 
-Kod i workflow są przygotowane, ale podpisanie IPA/TestFlight wymaga
-zewnętrznych danych Apple:
-- aktywne Apple Developer Program,
-- Team ID,
-- Distribution Certificate,
-- provisioning profile.
+Kod i workflow są przygotowane. Podpisane IPA/TestFlight wymaga czterech
+sekretów repo:
 
-To nie blokuje funkcjonalnego ukończenia aplikacji; blokuje wyłącznie
-podpisaną dystrybucję iOS/TestFlight/App Store.
+- `APPLE_CERTIFICATE_BASE64` — certyfikat Apple Distribution w formacie P12, base64,
+- `APPLE_CERTIFICATE_PASSWORD`,
+- `APPLE_PROVISIONING_PROFILE_BASE64` — profil App Store dla `eu.ministrant.manager`, base64,
+- `APPLE_TEAM_ID`.
+
+Workflow jest fail-closed:
+- bez żadnego sekretu buduje unsigned simulator build,
+- częściowy komplet 1–3/4 sekretów kończy job błędem konfiguracji,
+- przy 4/4 dekoduje P12 i provisioning profile na runnerze,
+- sprawdza Team ID i Bundle ID profilu,
+- generuje tymczasowe `Signing.xcconfig` i `ExportOptions.generated.plist`,
+- buduje podpisane IPA.
+
+Repo nie zawiera certyfikatu, profilu, Team ID ani haseł. Aktywne Apple
+Developer Program pozostaje zewnętrznym warunkiem dystrybucji iOS.
 
 ## Wdrożenie Witosy
 
