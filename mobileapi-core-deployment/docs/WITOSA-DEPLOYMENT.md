@@ -17,6 +17,7 @@ backup
 → migracje 001–005
 → install_mobile_meta
 → wdrożenie mobileapi-core + 5 stubów + .htaccess
+→ legacy security hardening
 → legacy substitutions hotfix
 → smoke/acceptance
 → cleanup danych testowych
@@ -33,8 +34,8 @@ mysqldump -u <user> -p <nazwa_bazy> > witosa_backup_przed_mobileapi_$(date +%Y%m
 Dodatkowo zachowaj bieżące `public_html/.htaccess` i
 `public_html/config/`.
 
-Hotfix zamian tworzy własny timestampowany backup wszystkich plików, które
-modyfikuje.
+Oba instalatory legacy (security hardening i hotfix zamian) tworzą własne
+timestampowane backupy wszystkich plików, które modyfikują.
 
 ## 2. Przygotuj device-control-plane PRZED preflightem
 
@@ -168,7 +169,49 @@ Finalnie muszą działać:
 - `/api/v1/mobile/session/change-password`
 - `/api/v1/mobile/webview/handoff`.
 
-## 7. Zastosuj hotfix zastępstw
+## 7. Zastosuj legacy security hardening
+
+Pakiet zawiera:
+`scripts/apply_legacy_security_hardening.php`.
+
+Skopiuj go do `/home/<user>/apply_legacy_security_hardening.php`, czyli
+obok `public_html/`, i uruchom:
+
+```bash
+cd /home/<user>
+php apply_legacy_security_hardening.php
+```
+
+Poprawny wynik:
+
+```
+LEGACY SECURITY HARDENING OK
+```
+
+Drugie uruchomienie jest bezpiecznym no-op:
+
+```
+LEGACY SECURITY HARDENING: already applied
+```
+
+Skrypt przed jakąkolwiek zmianą sprawdza SHA-256 audytowanej wersji legacy,
+robi backup, podmienia pliki atomowo, weryfikuje końcowe SHA i rollbackuje
+przy błędzie.
+
+Domyka pięć realnych problemów produkcyjnych:
+- `upd.php` — wyłącza webowy updater z hardcoded hasłem,
+- `receiver.php` — wyłącza publiczny uploader z globalnym tokenem,
+- `fix.php` — wyłącza jednorazowy skrypt DB z kluczem w query string,
+- `reset.php` — wyłącza publiczny destrukcyjny reset instalacji,
+- `public/settings.php` — wymusza CSRF dla destrukcyjnych akcji i usuwa
+  przewidywalne `admin/admin` po factory resecie; nowe hasło admina jest
+  losowe, jednorazowo wyświetlane i wymusza zmianę przy pierwszym logowaniu.
+
+Jeżeli skrypt zgłosi nieznany SHA-256, **nie wymuszaj podmiany** — oznacza
+to, że produkcyjny legacy różni się od audytowanego backupu i trzeba
+najpierw zrobić diff.
+
+## 8. Zastosuj hotfix zastępstw
 
 Pakiet zawiera:
 `scripts/apply_substitution_hotfix.php`.
@@ -209,7 +252,7 @@ Hotfix m.in.:
 Jeżeli skrypt zgłosi różny hash — **nie wymuszaj podmiany**. Najpierw porównaj
 produkcyjny plik z audytowaną wersją.
 
-## 8. Wymuszona pierwsza zmiana hasła
+## 9. Wymuszona pierwsza zmiana hasła
 
 Mobile nie obchodzi legacy `password_changed`.
 
@@ -224,7 +267,7 @@ Flow:
 7. wydawany jest świeży token,
 8. WebView handoff także odmawia dostępu przy `password_changed=0`.
 
-## 9. Konto testowe — dopiero w finalnej rundzie acceptance
+## 10. Konto testowe — dopiero w finalnej rundzie acceptance
 
 ```bash
 php create_test_account.php
@@ -238,7 +281,7 @@ Skrypt:
 
 Nie zapisuj hasła do repo.
 
-## 10. Smoke test
+## 11. Smoke test
 
 ```bash
 chmod +x smoke_test.sh
@@ -264,7 +307,7 @@ Po podstawowym smoke sprawdź w acceptance dodatkowo:
 - maintenance,
 - update-required.
 
-## 11. Cleanup
+## 12. Cleanup
 
 ```bash
 php cleanup_test_account.php
@@ -272,12 +315,16 @@ php cleanup_test_account.php
 
 Usuwa wyłącznie dane oznaczone przez test oraz konto testowe.
 
-## 12. Rollback
+## 13. Rollback
 
 Jeżeli problem dotyczy MobileAPI:
 - przywróć poprzedni `.htaccess`,
 - usuń/wycofaj nowe stuby,
 - przywróć poprzedni `mobileapi-core/`.
+
+Jeżeli problem dotyczy legacy security hardening:
+- użyj timestampowanego katalogu
+  `backup_legacy_security_*/`.
 
 Jeżeli problem dotyczy zastępstw:
 - użyj timestampowanego katalogu
@@ -286,7 +333,7 @@ Jeżeli problem dotyczy zastępstw:
 Nie kasuj tabel/migracji w panice — najpierw odłącz routing i przywróć kod,
 a dopiero potem analizuj dane.
 
-## 13. Co jest celowo poza tym wdrożeniem
+## 14. Co jest celowo poza tym wdrożeniem
 
 - publikacja Google Play / App Store,
 - podpis iOS bez Apple Developer,
