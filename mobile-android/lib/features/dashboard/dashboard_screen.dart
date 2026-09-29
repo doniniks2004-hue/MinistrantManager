@@ -2,8 +2,11 @@ import 'package:flutter/material.dart';
 import '../../core/database/app_database.dart';
 import '../../core/secure/secure_storage_service.dart';
 import '../announcements/announcements_screen.dart';
+import '../points/points_screen.dart';
 import '../profile/profile_screen.dart';
+import '../ranking/ranking_screen.dart';
 import '../schedule/my_schedule_screen.dart';
+import '../substitutions/substitutions_screen.dart';
 import '../webview/legacy_module_screen.dart';
 import '../webview/webview_handoff_service.dart';
 import 'module_descriptor.dart';
@@ -132,6 +135,12 @@ class DashboardScreen extends StatelessWidget {
         return MyScheduleScreen(db: db);
       case 'announcements':
         return AnnouncementsScreen(db: db);
+      case 'points_history':
+        return PointsScreen(db: db);
+      case 'ranking':
+        return RankingScreen(db: db);
+      case 'substitutions':
+        return SubstitutionsScreen(db: db);
       case 'profile':
         return ProfileScreen(
           db: db,
@@ -141,8 +150,11 @@ class DashboardScreen extends StatelessWidget {
           onLogout: onLogout,
         );
       default:
-        // points_history / ranking / substitutions / attendance: not yet
-        // implemented natively on this build — safe fallback, never a crash.
+        // attendance: not yet implemented natively on this build (two
+        // different legacy data sources need reconciling first — see
+        // MODULE-MATRIX.md) — safe fallback, never a crash. Also the
+        // general safety net for any future `screen` name an older app
+        // build doesn't recognize yet (review round point 23).
         return null;
     }
   }

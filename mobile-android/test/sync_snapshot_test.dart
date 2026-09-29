@@ -133,5 +133,58 @@ void main() {
 
       await db.close();
     });
+
+    test('P1: points/ranking/substitutions from bootstrap are applied correctly', () async {
+      final db = AppDatabase.forTesting();
+      final engine = SyncEngine(db: db, api: ApiClient(SecureStorageService()), secureStorage: SecureStorageService());
+
+      await engine.applySnapshotForTesting({
+        'generated_at': '2026-10-01T08:00:00+02:00',
+        'events': [],
+        'schedule': [],
+        'points': {
+          'total': 3,
+          'history': [
+            {'id': 'points:2', 'raw_id': 2, 'points_value': -2, 'reason': 'Spóźnienie', 'event_type': 'mass', 'assigner_name': 'Ks. Testowy', 'created_at': '2026-09-28T06:31:50+00:00'},
+            {'id': 'points:1', 'raw_id': 1, 'points_value': 5, 'reason': 'Obecność', 'event_type': 'mass', 'assigner_name': 'Ks. Testowy', 'created_at': '2026-09-27T06:31:50+00:00'},
+          ],
+        },
+        'ranking': {
+          'entries': [
+            {'position': 1, 'user_id': 9002, 'full_name': 'Inny Ministrant', 'total_points': 10, 'is_current_user': false},
+            {'position': 2, 'user_id': 9001, 'full_name': 'Final Verify User', 'total_points': 3, 'is_current_user': true},
+          ],
+          'my_position': 2,
+        },
+        'substitutions': {
+          'mine': [
+            {'id': 'substitution_requests:1', 'raw_id': 1, 'status': 'pending', 'requesting_user_name': 'Final Verify User', 'accepted_by_name': null, 'event_id': 'events:1', 'event_source': 'events', 'event_date': '2026-10-11T10:00:00+02:00', 'event_description': 'Msza niedzielna', 'created_at': '2026-09-29T06:31:50+02:00'},
+          ],
+          'available': [
+            {'id': 'substitution_requests:2', 'raw_id': 2, 'status': 'pending', 'requesting_user_name': 'Inny Ministrant', 'accepted_by_name': null, 'event_id': 'events:2', 'event_source': 'events', 'event_date': '2026-10-18T10:00:00+02:00', 'event_description': 'Kolejna msza', 'created_at': '2026-09-29T06:31:50+02:00'},
+          ],
+        },
+      });
+
+      final points = await db.select(db.points).get();
+      expect(points.length, 2);
+      expect(points.map((p) => p.pointsValue).toList()..sort(), [-2, 5]);
+
+      final ranking = await db.select(db.rankingEntries).get();
+      expect(ranking.length, 2);
+      final myEntry = ranking.firstWhere((r) => r.isCurrentUser);
+      expect(myEntry.position, 2);
+      expect(myEntry.totalPoints, 3);
+
+      final subs = await db.select(db.substitutionRequests).get();
+      expect(subs.length, 2);
+      final mine = subs.where((s) => s.isMine).toList();
+      final available = subs.where((s) => !s.isMine).toList();
+      expect(mine.length, 1);
+      expect(available.length, 1);
+      expect(mine.first.eventDescription, 'Msza niedzielna');
+
+      await db.close();
+    });
   });
 }

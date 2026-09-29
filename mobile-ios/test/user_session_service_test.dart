@@ -79,7 +79,7 @@ void main() {
     // Pre-seed activation (installation_id + server_url) — login() requires
     // both to be present before it will even attempt a request.
     fakeStore['installation_id'] = '550e8400-e29b-41d4-a716-446655440000';
-    fakeStore['server_url'] = 'https://witosa.ministrant.eu';
+    fakeStore['server_url'] = 'https://parafia-witosa.ministrant.eu';
 
     final dio = Dio();
     dio.interceptors.add(InterceptorsWrapper(onRequest: (options, handler) {

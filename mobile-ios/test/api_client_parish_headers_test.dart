@@ -49,7 +49,7 @@ void main() {
 
   group('ApiClient.parish() header contract (review round — real bug this closes)', () {
     test('sends BOTH Authorization and X-Installation-Id — missing the latter was a real 400 against the real backend', () async {
-      fakeStore['server_url'] = 'https://witosa.ministrant.eu';
+      fakeStore['server_url'] = 'https://parafia-witosa.ministrant.eu';
       fakeStore['mobile_user_token'] = 'fake-user-token-abc';
       fakeStore['installation_id'] = '550e8400-e29b-41d4-a716-446655440000';
 
@@ -67,7 +67,7 @@ void main() {
     });
 
     test('fails closed with StateError when installation_id is missing, even if token+server_url are present', () async {
-      fakeStore['server_url'] = 'https://witosa.ministrant.eu';
+      fakeStore['server_url'] = 'https://parafia-witosa.ministrant.eu';
       fakeStore['mobile_user_token'] = 'fake-user-token-abc';
       // installation_id deliberately NOT set.
 
@@ -77,7 +77,7 @@ void main() {
     });
 
     test('fails closed with StateError when mobile_user_token is missing, even if installation_id+server_url are present', () async {
-      fakeStore['server_url'] = 'https://witosa.ministrant.eu';
+      fakeStore['server_url'] = 'https://parafia-witosa.ministrant.eu';
       fakeStore['installation_id'] = '550e8400-e29b-41d4-a716-446655440000';
       // mobile_user_token deliberately NOT set.
 

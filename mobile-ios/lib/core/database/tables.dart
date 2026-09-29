@@ -76,23 +76,59 @@ class Attendance extends Table {
 }
 
 class Points extends Table {
-  TextColumn get id => text()();
-  TextColumn get personName => text()();
-  IntColumn get amount => integer()();
+  // Real schema: points (id, user_id, points_value, reason, event_type,
+  // assigner_id, created_at, attendance_id) — assigner_name resolved
+  // server-side (JOIN), same principle as announcements' author_name.
+  // Replaces Iteration-1 placeholder personName/amount/awardedAt shape.
+  TextColumn get id => text()(); // "points:5"
+  IntColumn get rawId => integer()();
+  IntColumn get pointsValue => integer()();
   TextColumn get reason => text().nullable()();
-  DateTimeColumn get awardedAt => dateTime()();
+  TextColumn get eventType => text().nullable()();
+  TextColumn get assignerName => text().nullable()();
+  DateTimeColumn get createdAt => dateTime()();
 
   @override
   Set<Column> get primaryKey => {id};
 }
 
-class Ranking extends Table {
-  TextColumn get id => text()(); // person id/name as used by the server, stable across syncs
-  TextColumn get personName => text()();
+class RankingEntries extends Table {
+  // Real shape from LegacyMysqlRankingRepository — a fresh projection
+  // computed from `points` on every sync, never a locally-owned source
+  // of truth (review round: "Serwer liczy ranking. Telefon przechowuje
+  // ostatni wynik jako cache."). Replaces Iteration-1 placeholder
+  // personName/totalPoints/position/payloadJson shape.
+  TextColumn get id => text()(); // "ranking:{user_id}"
+  IntColumn get userId => integer()();
+  TextColumn get fullName => text()();
   IntColumn get totalPoints => integer()();
-  IntColumn get position => integer().nullable()();
-  TextColumn get payloadJson => text().withDefault(const Constant('{}'))();
-  DateTimeColumn get updatedAt => dateTime()();
+  IntColumn get position => integer()();
+  BoolColumn get isCurrentUser => boolean().withDefault(const Constant(false))();
+
+  @override
+  Set<Column> get primaryKey => {id};
+}
+
+class SubstitutionRequests extends Table {
+  // Real schema: substitution_requests, joined server-side against
+  // events/weekday_events for event_date/description and against users
+  // for requesting_user_name/accepted_by_name (see
+  // LegacyMysqlSubstitutionsRepository). READ ONLY — no local write path
+  // exists yet (review round: known accept_substitution.php bug, write
+  // stays on the substitution-finder.php WebView until fixed).
+  // Replaces Iteration-1 placeholder fromPerson/toPerson/payloadJson/
+  // version shape.
+  TextColumn get id => text()(); // "substitution_requests:12"
+  IntColumn get rawId => integer()();
+  TextColumn get status => text()(); // pending/accepted/cancelled/expired
+  TextColumn get requestingUserName => text()();
+  TextColumn get acceptedByName => text().nullable()();
+  TextColumn get eventId => text()(); // canonical "events:1" / "weekday_events:6"
+  TextColumn get eventSource => text()();
+  DateTimeColumn get eventDate => dateTime().nullable()();
+  TextColumn get eventDescription => text().nullable()();
+  BoolColumn get isMine => boolean()();
+  DateTimeColumn get createdAt => dateTime()();
 
   @override
   Set<Column> get primaryKey => {id};
@@ -117,19 +153,8 @@ class Announcements extends Table {
   Set<Column> get primaryKey => {id};
 }
 
-class Substitutions extends Table {
-  TextColumn get id => text()();
-  TextColumn get eventId => text().nullable()();
-  TextColumn get fromPerson => text()();
-  TextColumn get toPerson => text().nullable()();
-  TextColumn get status => text()(); // requested / approved / rejected
-  TextColumn get payloadJson => text()();
-  IntColumn get version => integer().withDefault(const Constant(1))();
-  DateTimeColumn get updatedAt => dateTime()();
-
-  @override
-  Set<Column> get primaryKey => {id};
-}
+// Substitutions (old placeholder shape) replaced by SubstitutionRequests
+// above — real backend contract, review round P1.
 
 /// Queue of user actions performed while offline (or just to decouple UI
 /// writes from network timing). Each row is pushed to

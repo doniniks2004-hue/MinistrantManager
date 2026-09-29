@@ -344,6 +344,43 @@ class SyncEngine {
         await db.into(db.announcements).insertOnConflictUpdate(_mapLegacyAnnouncement(row));
       }
 
+      // Points: history is per-user already (bootstrap.php scopes the
+      // query to the caller), replaced wholesale — same reasoning as
+      // everything else in this snapshot.
+      await db.delete(db.points).go();
+      final pointsData = data['points'];
+      if (pointsData is Map) {
+        for (final row in _rows(pointsData['history'])) {
+          await db.into(db.points).insertOnConflictUpdate(_mapLegacyPoint(row));
+        }
+      }
+
+      // Ranking: a fresh server-computed projection every sync — see
+      // LegacyMysqlRankingRepository's own docblock ("nie twórz lokalnego
+      // źródła prawdy rankingu"). Replaced wholesale like everything else.
+      await db.delete(db.rankingEntries).go();
+      final rankingData = data['ranking'];
+      if (rankingData is Map) {
+        for (final row in _rows(rankingData['entries'])) {
+          await db.into(db.rankingEntries).insertOnConflictUpdate(_mapLegacyRankingEntry(row));
+        }
+      }
+
+      // Substitutions: READ ONLY (review round — write stays on the
+      // substitution-finder.php WebView until the known
+      // accept_substitution.php bug is fixed). "mine" and "available" are
+      // mutually exclusive server-side, so no id collision between them.
+      await db.delete(db.substitutionRequests).go();
+      final substitutionsData = data['substitutions'];
+      if (substitutionsData is Map) {
+        for (final row in _rows(substitutionsData['mine'])) {
+          await db.into(db.substitutionRequests).insertOnConflictUpdate(_mapLegacySubstitution(row, isMine: true));
+        }
+        for (final row in _rows(substitutionsData['available'])) {
+          await db.into(db.substitutionRequests).insertOnConflictUpdate(_mapLegacySubstitution(row, isMine: false));
+        }
+      }
+
       // Review round fix (real bug, found via a direct-call test that
       // bypasses HomeScreen's usual checkDeviceStatus()-first ordering):
       // this used to be a bare `update()..where(id.equals(1))`, which is
@@ -388,6 +425,40 @@ class SyncEngine {
         title: row['title'] as String,
         content: row['content'] as String,
         authorName: Value(row['author_name'] as String?),
+        createdAt: DateTime.parse(row['created_at'] as String),
+      );
+
+  PointsCompanion _mapLegacyPoint(Map<String, dynamic> row) => PointsCompanion.insert(
+        id: row['id'] as String,
+        rawId: row['raw_id'] as int,
+        pointsValue: row['points_value'] as int,
+        reason: Value(row['reason'] as String?),
+        eventType: Value(row['event_type'] as String?),
+        assignerName: Value(row['assigner_name'] as String?),
+        createdAt: DateTime.parse(row['created_at'] as String),
+      );
+
+  RankingEntriesCompanion _mapLegacyRankingEntry(Map<String, dynamic> row) => RankingEntriesCompanion.insert(
+        id: 'ranking:${row['user_id']}',
+        userId: row['user_id'] as int,
+        fullName: row['full_name'] as String,
+        totalPoints: row['total_points'] as int,
+        position: row['position'] as int,
+        isCurrentUser: Value(row['is_current_user'] as bool? ?? false),
+      );
+
+  SubstitutionRequestsCompanion _mapLegacySubstitution(Map<String, dynamic> row, {required bool isMine}) =>
+      SubstitutionRequestsCompanion.insert(
+        id: row['id'] as String,
+        rawId: row['raw_id'] as int,
+        status: row['status'] as String,
+        requestingUserName: row['requesting_user_name'] as String,
+        acceptedByName: Value(row['accepted_by_name'] as String?),
+        eventId: row['event_id'] as String,
+        eventSource: row['event_source'] as String,
+        eventDate: Value(row['event_date'] != null ? DateTime.parse(row['event_date'] as String) : null),
+        eventDescription: Value(row['event_description'] as String?),
+        isMine: isMine,
         createdAt: DateTime.parse(row['created_at'] as String),
       );
 

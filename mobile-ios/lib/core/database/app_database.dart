@@ -48,9 +48,9 @@ class MyScheduleEntry {
   ScheduleAssignments,
   Attendance,
   Points,
-  Ranking,
+  RankingEntries,
   Announcements,
-  Substitutions,
+  SubstitutionRequests,
   PendingActions,
   SyncMetadata,
   DashboardConfigCache,
@@ -83,7 +83,7 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase.forTestingAtFile(File file) : super(NativeDatabase(file));
 
   @override
-  int get schemaVersion => 3;
+  int get schemaVersion => 4;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -118,9 +118,27 @@ class AppDatabase extends _$AppDatabase {
             await m.deleteTable('announcements');
             await m.createTable(announcements);
           }
+          if (from < 4) {
+            // v3 -> v4 (hybrid dashboard milestone, P1 continued):
+            // Points/Ranking/Substitutions replaced with their real
+            // backend shapes (Points: points_value/reason/event_type/
+            // assigner_name; RankingEntries: a fresh server-computed
+            // projection, replacing the old `Ranking` table entirely;
+            // SubstitutionRequests: real substitution_requests shape
+            // with resolved event_date/description, replacing the old
+            // `Substitutions` table entirely). All three are pure
+            // read-only snapshot caches — same drop+recreate reasoning
+            // as every migration before this one.
+            await m.deleteTable('points');
+            await m.createTable(points);
+            await m.deleteTable('ranking');
+            await m.createTable(rankingEntries);
+            await m.deleteTable('substitutions');
+            await m.createTable(substitutionRequests);
+          }
           //
           // Template for the NEXT migration:
-          // if (from < 4) {
+          // if (from < 5) {
           //   await m.addColumn(events, events.someNewColumn);
           // }
         },
@@ -190,9 +208,9 @@ class AppDatabase extends _$AppDatabase {
       await delete(scheduleAssignments).go();
       await delete(attendance).go();
       await delete(points).go();
-      await delete(ranking).go();
+      await delete(rankingEntries).go();
       await delete(announcements).go();
-      await delete(substitutions).go();
+      await delete(substitutionRequests).go();
       await delete(pendingActions).go();
 
       // Review round fix: `lastSyncAt` describes the USER's snapshot
@@ -242,6 +260,32 @@ class AppDatabase extends _$AppDatabase {
     return query.watch();
   }
 
+  /// "Historia punktów" (hybrid dashboard milestone, P1). Already
+  /// scoped to the current user server-side (bootstrap.php's own
+  /// per-user query) — nothing further to filter client-side.
+  Stream<List<Point>> watchPoints() {
+    final query = select(points)..orderBy([(t) => OrderingTerm.desc(t.createdAt)]);
+    return query.watch();
+  }
+
+  /// "Ranking" (hybrid dashboard milestone, P1). A fresh server-computed
+  /// projection replaced wholesale on every sync — see
+  /// LegacyMysqlRankingRepository's docblock ("nie twórz lokalnego
+  /// źródła prawdy rankingu").
+  Stream<List<RankingEntry>> watchRanking() {
+    final query = select(rankingEntries)..orderBy([(t) => OrderingTerm.asc(t.position)]);
+    return query.watch();
+  }
+
+  /// "Zastępstwa" (hybrid dashboard milestone, P1 — READ ONLY). Both
+  /// "mine" and "available" live in the same table, distinguished by
+  /// `isMine` — the screen splits them, this just returns everything
+  /// currently cached.
+  Stream<List<SubstitutionRequest>> watchSubstitutions() {
+    final query = select(substitutionRequests)..orderBy([(t) => OrderingTerm.desc(t.createdAt)]);
+    return query.watch();
+  }
+
   Future<void> wipeAllParishData() async {
     // Called on DEVICE_REVOKED / PARISH_DISABLED / manual reset.
     // Deliberately does NOT touch schemaVersion — only row data. This is
@@ -263,9 +307,9 @@ class AppDatabase extends _$AppDatabase {
       await delete(scheduleAssignments).go();
       await delete(attendance).go();
       await delete(points).go();
-      await delete(ranking).go();
+      await delete(rankingEntries).go();
       await delete(announcements).go();
-      await delete(substitutions).go();
+      await delete(substitutionRequests).go();
       await delete(pendingActions).go();
       await delete(syncMetadata).go();
       await delete(dashboardConfigCache).go();
