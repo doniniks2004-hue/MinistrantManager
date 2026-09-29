@@ -1,235 +1,294 @@
-# Wdrożenie MobileAPI na Witosie — instrukcja krok po kroku
+# Wdrożenie MobileAPI + mobile legacy hotfix na Witosie
 
-**Zanim zaczniesz: nie mam dostępu sieciowego do prawdziwej Witosy z tego
-środowiska.** Wszystko poniżej jest przygotowane i **zweryfikowane
-lokalnie** (realny MariaDB + realny PHP + realny HTTP) na dokładnie tym
-samym zestawie plików — ale wykonanie na prawdziwym serwerze musi zrobić
-ktoś z dostępem.
+Ta instrukcja opisuje finalny pakiet generowany przez CI jako
+`witosa-deployment.zip`.
+
+> Produkcja nie była jeszcze testowana na realnej Witosie/telefonie — zgodnie
+> z decyzją produktową acceptance wykonujemy dopiero po funkcjonalnym domknięciu
+> aplikacji i brandingu. Kod/paczka są przygotowane tak, aby ten test był
+> ostatnim etapem, a nie częścią budowy funkcji.
 
 ## Kolejność
 
 ```
-backup → preflight → migracje → install_mobile_meta.php → pliki →
-.htaccess → konto testowe → smoke test → ręczne porównanie web vs
-bootstrap → cleanup danych testowych
+backup
+→ przygotowanie sekretu device-control-plane
+→ preflight
+→ migracje 001–005
+→ install_mobile_meta
+→ wdrożenie mobileapi-core + 5 stubów + .htaccess
+→ legacy substitutions hotfix
+→ smoke/acceptance
+→ cleanup danych testowych
 ```
 
 ## 1. Backup
+
+Baza:
 
 ```bash
 mysqldump -u <user> -p <nazwa_bazy> > witosa_backup_przed_mobileapi_$(date +%Y%m%d_%H%M).sql
 ```
 
-## 2. Preflight (PRZED migracjami)
+Dodatkowo zachowaj bieżące `public_html/.htaccess` i
+`public_html/config/`.
+
+Hotfix zamian tworzy własny timestampowany backup wszystkich plików, które
+modyfikuje.
+
+## 2. Przygotuj device-control-plane PRZED preflightem
+
+Po stronie `app.ministrant.eu`:
+1. centralna migracja dodająca `parishes.mobile_internal_api_secret` musi być
+   wdrożona,
+2. wygeneruj sekret dla Witosy.
+
+Na Witosie:
+1. skopiuj
+   `public_html-additions/config/mobile_internal_api_secret.php`
+   do `public_html/config/mobile_internal_api_secret.php`,
+2. zamień placeholder na prawdziwy sekret tej parafii,
+3. nie commituj tej wartości do repo.
+
+`MOBILE_CENTRAL_BASE_URL` pozostaje `https://app.ministrant.eu`.
+
+## 3. Preflight
+
+Skopiuj `scripts/preflight.php` do katalogu domowego użytkownika hostingu,
+czyli obok `public_html/`, i uruchom:
 
 ```bash
-# Skopiuj scripts/preflight.php do /home/<user>/ (obok mobileapi-core/
-# i public_html/), potem:
 cd /home/<user>
 php preflight.php
 ```
 
-Sprawdza twardo: PHP >= 8.1, rozszerzenie `mysqli`, że `PASSWORD_ARGON2ID`
-faktycznie działa (nie tylko że stała istnieje), oraz — jeśli
-`mobile_user_tokens` już istnieje z jakiegoś wcześniejszego powodu — czy
-jej `UNIQUE KEY` jest poprawnie na samym `installation_id`.
+Musi zakończyć się:
 
-**Kończy się kodem wyjścia 1 i czytelnym błędem, jeśli cokolwiek jest
-nie tak — nie przechodź do migracji, dopóki `preflight.php` nie zwróci
-`PREFLIGHT OK` (kod 0).**
+```
+PREFLIGHT OK
+```
 
-### Jeśli preflight zgłosi stary, błędny klucz unikalności
+Sprawdza m.in.:
+- PHP >= 8.1,
+- mysqli,
+- Argon2id,
+- poprawny UNIQUE po `installation_id`,
+- obecność prawdziwego `MOBILE_INTERNAL_API_SECRET`.
 
-(Nie powinno się zdarzyć przy pierwszym wdrożeniu — `mobile_user_tokens`
-jeszcze nie istnieje na Witosie — ale gdyby kiedyś trzeba było to
-naprawić ręcznie po jakimś wcześniejszym, innym wdrożeniu:)
+Jeżeli zgłasza błąd — **nie uruchamiaj migracji**.
+
+### Naprawa starego UNIQUE, jeśli preflight tego wymaga
 
 ```sql
--- 1. Sprawdź, czy są konflikty (ten sam installation_id, różni userzy)
 SELECT installation_id, COUNT(DISTINCT user_id) AS user_count
 FROM mobile_user_tokens
 GROUP BY installation_id
 HAVING user_count > 1;
 
--- 2. Jeśli są konflikty: zachowaj NAJNOWSZY wiersz per installation_id
---    (najwyższe id), usuń starsze duplikaty
 DELETE t1 FROM mobile_user_tokens t1
 INNER JOIN mobile_user_tokens t2
   ON t1.installation_id = t2.installation_id AND t1.id < t2.id;
 
--- 3. Dopiero teraz zmień klucz
 ALTER TABLE mobile_user_tokens DROP INDEX uniq_user_device;
-ALTER TABLE mobile_user_tokens ADD UNIQUE KEY uniq_installation_id (installation_id);
+ALTER TABLE mobile_user_tokens
+  ADD UNIQUE KEY uniq_installation_id (installation_id);
 ```
 
-Uruchom `preflight.php` ponownie, żeby potwierdzić naprawę, dopiero potem
-przejdź dalej.
+Potem uruchom preflight ponownie.
 
-## 3. Migracje (bezpieczne do wielokrotnego uruchomienia)
+## 4. Migracje 001–005
+
+Uruchom w kolejności:
 
 ```bash
 mysql -u <user> -p <nazwa_bazy> < migrations/001_mobile_user_tokens.sql
 mysql -u <user> -p <nazwa_bazy> < migrations/002_mobile_meta.sql
 mysql -u <user> -p <nazwa_bazy> < migrations/003_webview_handoff_tickets.sql
 mysql -u <user> -p <nazwa_bazy> < migrations/004_device_authorization_cache.sql
+mysql -u <user> -p <nazwa_bazy> < migrations/005_device_authorization_cache_lease_hours.sql
 ```
 
-```sql
-SHOW TABLES LIKE 'mobile_%';
--- oczekiwane: mobile_user_tokens, mobile_meta (obie puste)
-SHOW TABLES LIKE 'webview_handoff_tickets';
--- oczekiwana: webview_handoff_tickets (pusta) — hybrydowy dashboard, milestone 2
-```
+Migracja 005 dodaje `offline_lease_hours` do lokalnego cache autoryzacji.
+Zapobiega bezterminowemu zaufaniu staremu statusowi `active` podczas awarii
+centrali.
 
-**Uwaga (jeśli 001/002 były już wdrożone wcześniejszą paczką):** ta
-runda poszerzyła `mobile_meta.adapter_version` z `VARCHAR(20)` na
-`VARCHAR(40)` (nowa wartość `2.1.0-hybrid-dashboard` się nie mieściła).
-Migracja 002 w tej paczce ma już poprawny rozmiar — jeśli 002 była
-uruchomiona WCZEŚNIEJ z starą wersją pliku, dodatkowo wykonaj:
+Jeżeli bardzo stara wersja migracji 002 była już wykonana z
+`adapter_version VARCHAR(20)`, wykonaj dodatkowo:
+
 ```sql
 ALTER TABLE mobile_meta MODIFY adapter_version VARCHAR(40) NOT NULL;
 ```
 
-## 4. `install_mobile_meta.php`
+## 5. Zainstaluj metadata adaptera
 
 ```bash
 php /home/<user>/mobileapi-core/ParishAdapters/Witosa/install_mobile_meta.php
 ```
 
-Wypełnia `mobile_meta` (`capabilities: {events:true, schedule:true, ...
-reszta:false}`).
+## 6. Wgraj MobileAPI
 
-## 5. Pliki
+### A. Core poza public_html
 
-### A. `mobileapi-core/` → POZA `public_html/`, jako sąsiad (tak jak dziś `.env`)
+Finalny układ:
 
 ```
-/home/<user>/mobileapi-core/          <- cała zawartość z tej paczki
-/home/<user>/public_html/             <- już istnieje
+/home/<user>/mobileapi-core/
+/home/<user>/public_html/
 ```
 
-Nigdy nie jest dostępny przez HTTP.
+Cały katalog `mobileapi-core/` leży poza webrootem.
 
-### B. `public_html-additions/api/mobile/*.php` → do `public_html/api/mobile/`
+### B. Pięć stubów do public_html/api/mobile
 
-Trzy pliki-zaślepki, ścieżki względne, nic do edycji:
-`bootstrap.php`, `session_login.php`, `config.php`.
+Z `public_html-additions/api/mobile/` skopiuj:
 
-## 6. `.htaccess` — DOPISZ (nie zastępuj całego pliku!)
+- `bootstrap.php`
+- `config.php`
+- `session_login.php`
+- `session_change_password.php`
+- `webview_handoff.php`
 
-Zawartość `public_html-additions/htaccess-snippet.txt` dopisz do
-istniejącego `public_html/.htaccess`.
+### C. Handoff WebView
 
-## 7. Konto testowe
+Skopiuj:
+- `public_html-additions/public/mobile_handoff.php`
+  → `public_html/public/mobile_handoff.php`.
+
+### D. .htaccess
+
+**Nie zastępuj całego pliku.**
+
+Dopisz reguły z:
+`public_html-additions/htaccess-snippet.txt`.
+
+Finalnie muszą działać:
+- `/api/v1/mobile/config`
+- `/api/v1/mobile/bootstrap`
+- `/api/v1/mobile/session/login`
+- `/api/v1/mobile/session/change-password`
+- `/api/v1/mobile/webview/handoff`.
+
+## 7. Zastosuj hotfix zastępstw
+
+Pakiet zawiera:
+`scripts/apply_substitution_hotfix.php`.
+
+Skopiuj go do `/home/<user>/apply_substitution_hotfix.php`, czyli obok
+`public_html/`, i uruchom:
 
 ```bash
-# Skopiuj scripts/create_test_account.php do /home/<user>/, potem:
+cd /home/<user>
+php apply_substitution_hotfix.php
+```
+
+Poprawny wynik zaczyna się od:
+
+```
+SUBSTITUTION HOTFIX OK
+```
+
+Skrypt:
+- weryfikuje SHA-256 audytowanego legacy przed jakąkolwiek zmianą,
+- **odmawia nadpisania**, jeżeli produkcyjne pliki różnią się od znanej wersji,
+- tworzy `backup_substitution_hotfix_YYYYMMDD_HHMMSS/`,
+- zapisuje pliki atomowo,
+- weryfikuje końcowe SHA-256,
+- rollbackuje dotknięte pliki przy błędzie,
+- jest idempotentny — drugie uruchomienie zwraca `already applied`.
+
+Hotfix m.in.:
+- wymusza CSRF w finderze i ręcznej zamianie,
+- sprawdza role/rodzica/dziecko po stronie serwera,
+- eliminuje IDOR,
+- blokuje wyścigi przy tworzeniu/akceptacji,
+- dla zwykłych `events` zamienia **konkretne wpisy `schedule`**,
+  nie całe `event_groups`,
+- dla tygodniowych używa `weekday_event_assignments`,
+- wycofuje stare, niespójne endpointy mutacji kodem HTTP 410.
+
+Jeżeli skrypt zgłosi różny hash — **nie wymuszaj podmiany**. Najpierw porównaj
+produkcyjny plik z audytowaną wersją.
+
+## 8. Wymuszona pierwsza zmiana hasła
+
+Mobile nie obchodzi legacy `password_changed`.
+
+Flow:
+1. poprawny login dla konta z `password_changed=0`,
+2. serwer odpowiada HTTP 428 `password_change_required` i nie wydaje
+   pełnego tokenu,
+3. aplikacja pokazuje natywny ekran zmiany hasła,
+4. `/session/change-password` ponownie sprawdza hasło i urządzenie,
+5. zmiana jest transakcyjna,
+6. stare tokeny użytkownika są odwoływane,
+7. wydawany jest świeży token,
+8. WebView handoff także odmawia dostępu przy `password_changed=0`.
+
+## 9. Konto testowe — dopiero w finalnej rundzie acceptance
+
+```bash
 php create_test_account.php
 ```
 
-Wypisuje `username` + losowe hasło **tylko raz, tylko na ekranie** —
-zapisz od razu, nigdy do repo/gita. Tworzy 3 wpisy w grafiku (dwa bliskie,
-jeden celowo daleko w przyszłości, do ręcznej zmiany w panelu WWW w
-kroku 9). Wszystkie 3 oznaczone markerem `[MOBILE_TEST_WITOSA]` w opisie
-— to po nim `cleanup_test_account.php` je later znajdzie, nie po ID.
-Bezpieczne do wielokrotnego uruchomienia (drugi raz odświeża tylko
-hasło).
+Skrypt:
+- tworzy/odświeża `mobile_test_witosa`,
+- ustawia `password_changed=1`,
+- generuje losowe hasło tylko na ekran,
+- dodaje oznaczone wpisy `[MOBILE_TEST_WITOSA]`.
 
-## 8. Smoke test
+Nie zapisuj hasła do repo.
+
+## 10. Smoke test
 
 ```bash
-chmod +x scripts/smoke_test.sh
-./scripts/smoke_test.sh https://parafia-witosa.ministrant.eu mobile_test_witosa
-# Skrypt zapyta o hasło interaktywnie (bez echa) — nie podawaj go jako
-# argument, nie trafi do historii powłoki ani listy procesów.
+chmod +x smoke_test.sh
+./smoke_test.sh https://parafia-witosa.ministrant.eu mobile_test_witosa
 ```
 
-Ten dokładny skrypt uruchomiłem lokalnie — **9/9 PASS**. Oczekuję
-identycznego wyniku na Witosie; jeśli coś się różni, patrz sekcja 11.
+Hasło jest pobierane interaktywnie przez `read -s`, nie przez argument CLI.
 
-## 9. Ręczna weryfikacja: webowy grafik == `/mobile/bootstrap`
+Po podstawowym smoke sprawdź w acceptance dodatkowo:
+- aktywację QR,
+- login,
+- first-password flow,
+- native 7/7,
+- offline + restart,
+- WebView bez drugiego logowania,
+- role 1/2/3/4/5,
+- zakaz handoff do niedozwolonej roli,
+- jednorazowość biletu,
+- zastępstwa: utworzenie/anulowanie/akceptacja/ręczna zamiana,
+- `events ↔ events`, `weekday ↔ weekday` i cross-type,
+- user switch/logout,
+- revoke urządzenia,
+- maintenance,
+- update-required.
 
-1. Obejrzyj w panelu WWW grafik `mobile_test_witosa` (jako Admin, albo
-   zaloguj się nim).
-2. Zanotuj datę/godzinę/opis/źródło wpisów w oknie -7/+90 dni od dziś.
-3. Porównaj z `schedule`+`events` z `/tmp/smoke_bootstrap.json` (zapisany
-   po smoke teście).
-4. Sprawdź: `event_date` (uwaga na strefę czasową, ISO 8601 z offsetem),
-   `source`/`event_source` (`events` = niedziela/święto, `weekday_events`
-   = w tygodniu), `id`/`event_id` (format `"events:123"` — celowe, patrz
-   `EventsRepositoryInterface`), `schedule` zawiera WYŁĄCZNIE wpisy
-   `mobile_test_witosa`.
-5. Zmień wpis #3 (daleka przyszłość) w panelu WWW na datę w oknie -7/+90
-   dni — **zachowaj prefiks `[MOBILE_TEST_WITOSA]` na początku opisu**,
-   jeśli edytujesz tekst (inaczej `cleanup_test_account.php` go nie
-   znajdzie) — uruchom smoke test ponownie, sprawdź czy wpis się pojawił.
-
-## 10. Sprzątanie danych testowych
+## 11. Cleanup
 
 ```bash
-# Skopiuj scripts/cleanup_test_account.php do /home/<user>/, potem:
 php cleanup_test_account.php
 ```
 
-Usuwa WYŁĄCZNIE: 3 oznaczone wydarzenia + ich wpisy `schedule`, wszystkie
-`mobile_user_tokens` konta testowego, samo konto. Nic więcej. Bezpieczne
-do wielokrotnego uruchomienia — drugi raz to no-op.
+Usuwa wyłącznie dane oznaczone przez test oraz konto testowe.
 
-## 11. Czego szukać, jeśli coś zachowuje się inaczej niż lokalnie
+## 12. Rollback
 
-- **Wersja PHP** — `preflight.php` to teraz twardo sprawdza (krok 2), nie
-  musisz zgadywać.
-- **`.htaccess`/mod_rewrite** — jeśli `curl .../api/v1/mobile/config` da
-  404 zamiast 200, sprawdź czy reguła z kroku 6 faktycznie się wykonuje.
-- **Strefa czasowa serwera** — kod explicit ustawia `Europe/Warsaw` przy
-  parsowaniu dat, więc NIE powinno zależeć od domyślnej strefy PHP —
-  jeśli daty są przesunięte, to pierwsze podejrzane miejsce.
-- **Uprawnienia plików** po wgraniu przez FTP/panel Hostido — czasem
-  trzeba ręcznie ustawić 644.
+Jeżeli problem dotyczy MobileAPI:
+- przywróć poprzedni `.htaccess`,
+- usuń/wycofaj nowe stuby,
+- przywróć poprzedni `mobileapi-core/`.
 
-**Wypełnij tę sekcję realnymi obserwacjami po wdrożeniu.**
+Jeżeli problem dotyczy zastępstw:
+- użyj timestampowanego katalogu
+  `backup_substitution_hotfix_*/` utworzonego przez instalator.
 
-## 12. Nowość w tej rundzie: hybrydowy dashboard + WebView
+Nie kasuj tabel/migracji w panice — najpierw odłącz routing i przywróć kod,
+a dopiero potem analizuj dane.
 
-Ta wersja paczki dodaje:
-- `modules_builder.php` + rozszerzony `config.php` — dashboard
-  dynamicznie pokazuje moduły `native`/`webview` sterowane z serwera
-  (pełny opis w `docs/HYBRID-MODULES.md`, dostarczonym osobno)
-- Mechanizm handoff (`migrations/003`, `webview_handoff.php`,
-  `mobile_handoff.php`) — logowanie do WebView bez drugiego hasła
-- Ogłoszenia (P1, native) — wpięte w `bootstrap.php`
+## 13. Co jest celowo poza tym wdrożeniem
 
-Do weryfikacji na realnej Witosie dodatkowo: **kliknięcie „Triduum"/
-innego modułu WebView z dashboardu faktycznie loguje bez pytania o
-hasło** — osobny test od głównego scenariusza logowania z poprzedniej
-rundy, warto dodać do checklisty.
-
-## 13. Nowość: device-control plane (WYMAGA KROKU RĘCZNEGO przed działaniem)
-
-Parafia nie ufa już samemu poprawnemu UUID `installation_id` —
-`session/login` i `webview/handoff` teraz **potwierdzają z
-app.ministrant.eu**, że urządzenie faktycznie istnieje, jest aktywowane,
-nie jest revoked, i należy do tej konkretnej parafii.
-
-**Wymagany krok ręczny przed wdrożeniem (bez tego logowanie NIE
-zadziała w ogóle):**
-1. W panelu admina `app.ministrant.eu` wygeneruj sekret dla tej parafii
-   (kolumna `parishes.mobile_internal_api_secret` — migracja centrali
-   `2026_09_29_000001_...` musi być już uruchomiona po stronie
-   app.ministrant.eu).
-2. Skopiuj `public_html-additions/config/mobile_internal_api_secret.php`
-   do `public_html/config/` i wklej tam prawdziwy sekret zamiast
-   placeholdera (`preflight.php` odmówi kontynuacji, dopóki to zrobisz).
-3. Uruchom `migrations/004_device_authorization_cache.sql`.
-
-Cache autoryzacji (lease 10 minut) — `DeviceAuthorizationService`
-NIE odpytuje centrali przy każdym żądaniu, tylko gdy lokalny cache
-wygasł. Jeśli centrala jest niedostępna: urządzenie z wcześniej znanym
-dobrym stanem nadal działa (offline-first, `stale: true` w logach), a
-zupełnie nowe/nieznane urządzenie dostaje `503 central_unavailable`
-(nigdy nie jest to mylone z `revoked`).
-
-## 14. Czego ta paczka NIE zawiera (celowo)
-
-`session/exchange`, stary `/mobile/sync` (incremental), HOTFIX
-`substitution_history` (osobny temat), moduły poza `events`+`schedule`.
+- publikacja Google Play / App Store,
+- podpis iOS bez Apple Developer,
+- finalne assety brandingu (dojdą po dostarczeniu logo/ikony),
+- acceptance na realnym telefonie — wykonywany dopiero po finalnym buildzie.
