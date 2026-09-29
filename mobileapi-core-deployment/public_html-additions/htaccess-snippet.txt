@@ -8,6 +8,19 @@
 #
 # `mobile_handoff.php` NIE potrzebuje reguły — leży bezpośrednio w
 # public/ i jest wołany wprost (public/mobile_handoff.php?ticket=...).
+# PRODUKCJA: stare narzędzia serwisowe nie mogą być osiągalne przez HTTP.
+# - reset.php: nieautoryzowany destructive reset przez query string
+# - upd.php / fix.php: jednorazowe maintenance tools z hardcoded secret
+# - receiver.php: stary uploader PHP z jednym wspólnym fleet-wide tokenem
+# - install.php: instalator nie powinien być publiczny po wdrożeniu
+#
+# apply_legacy_security_hardening.php dodatkowo fail-closed podmienia
+# obecne pliki reset/upd/fix/receiver. Ta reguła jest defense-in-depth:
+# nawet jeśli ktoś później omyłkowo wgra starą wersję pliku, HTTP nadal
+# dostanie 403. Stary centralny deploy przez receiver.php jest przez to
+# CELOWO wyłączony dla tej parafii; używamy wersjonowanej paczki + SSH/SFTP.
+RewriteRule ^(?:install|reset|upd|fix|receiver)\.php$ - [F,L]
+
 RewriteRule ^api/v1/mobile/bootstrap$ api/mobile/bootstrap.php [L,QSA]
 RewriteRule ^api/v1/mobile/session/login$ api/mobile/session_login.php [L,QSA]
 RewriteRule ^api/v1/mobile/session/change-password$ api/mobile/session_change_password.php [L,QSA]
