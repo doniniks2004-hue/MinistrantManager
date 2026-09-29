@@ -116,7 +116,7 @@ try {
     foreach ($changed as $relative) echo "  hardened: $relative\n";
     exit(0);
 } catch (Throwable $e) {
-    fwrite(STDERR, "Hardening failed: { $e->getMessage() }\nRolling back...\n");
+    fwrite(STDERR, "Hardening failed: " . $e->getMessage() . "\nRolling back...\n");
     foreach (array_reverse($changed) as $relative) {
         $backup = $backupDir . '/' . $relative;
         $target = $publicRoot . '/' . $relative;
