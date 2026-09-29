@@ -92,12 +92,23 @@ class Points extends Table {
   Set<Column> get primaryKey => {id};
 }
 
+@DataClassName('RankingEntry')
 class RankingEntries extends Table {
   // Real shape from LegacyMysqlRankingRepository — a fresh projection
   // computed from `points` on every sync, never a locally-owned source
   // of truth (review round: "Serwer liczy ranking. Telefon przechowuje
   // ostatni wynik jako cache."). Replaces Iteration-1 placeholder
   // personName/totalPoints/position/payloadJson shape.
+  //
+  // Review round fix: explicit @DataClassName rather than trusting
+  // Drift's automatic singularization for this table specifically —
+  // "Entries" (an -ies plural) is a genuinely different, trickier case
+  // than the simple trailing-s strip that already worked correctly for
+  // Events->Event and ScheduleAssignments->ScheduleAssignment elsewhere
+  // in this file, and this is exactly the kind of ambiguity a compile
+  // error at analyze-time (not caught by any local check available in
+  // this sandbox) would surface — better to remove the ambiguity
+  // entirely than assume Drift's heuristic handles it the way I expect.
   TextColumn get id => text()(); // "ranking:{user_id}"
   IntColumn get userId => integer()();
   TextColumn get fullName => text()();
