@@ -242,6 +242,35 @@ void main() {
     await db.close();
   });
 
+  test('mandatory first-login: HTTP 428 password_change_required becomes UserLoginPasswordChangeRequired', () async {
+    final secureStorage = SecureStorageService();
+    final api = ApiClient(secureStorage);
+    final db = AppDatabase.forTesting();
+    fakeStore['installation_id'] = '550e8400-e29b-41d4-a716-446655440000';
+    fakeStore['server_url'] = 'https://parafia-witosa.ministrant.eu';
+
+    final dio = Dio();
+    dio.interceptors.add(InterceptorsWrapper(onRequest: (options, handler) {
+      handler.reject(DioException(
+        requestOptions: options,
+        response: Response(
+          requestOptions: options,
+          statusCode: 428,
+          data: {'error': 'password_change_required', 'message': 'x'},
+        ),
+      ));
+    }));
+
+    final service = _TestUserSessionService(api: api, secureStorage: secureStorage, db: db, fakeLoginDio: dio);
+    final result = await service.login(username: 'adam', password: 'temporary-password');
+
+    expect(result, isA<UserLoginPasswordChangeRequired>());
+    expect(result, isNot(isA<UserLoginInvalidCredentials>()));
+    expect(await secureStorage.hasUserSession, isFalse);
+
+    await db.close();
+  });
+
   test('device-control-plane: a 503 with no device_state body defaults to central_unavailable, never crashes on a malformed response', () async {
     final secureStorage = SecureStorageService();
     final api = ApiClient(secureStorage);
@@ -316,6 +345,10 @@ class _TestUserSessionService extends UserSessionService {
         final body = e.response?.data;
         final deviceState = (body is Map ? body['device_state'] as String? : null) ?? 'central_unavailable';
         return UserLoginDeviceNotAuthorized(deviceState: deviceState);
+      }
+      final body = e.response?.data;
+      if (statusCode == 428 && body is Map && body['error'] == 'password_change_required') {
+        return const UserLoginPasswordChangeRequired();
       }
       if (statusCode == 401 || statusCode == 400) {
         return const UserLoginInvalidCredentials();
