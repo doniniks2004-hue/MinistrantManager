@@ -33,6 +33,10 @@ function webview_module_registry(): array
             'title' => 'Usprawiedliwienia', 'path' => '/public/justifications.php',
             'icon' => 'note', 'order' => 60, 'required_role' => null,
         ],
+        'melodies' => [
+            'title' => 'Melodie', 'path' => '/public/melodie.php',
+            'icon' => 'music', 'order' => 65, 'required_role' => null,
+        ],
         'substitution_finder' => [
             'title' => 'Znajdź zastępstwo', 'path' => '/public/substitution-finder.php',
             'icon' => 'search', 'order' => 45, 'required_role' => null,
@@ -116,9 +120,13 @@ function webview_module_registry(): array
             'title' => 'Kolędy — podgląd tras', 'path' => '/public/kolenda-podglad.php',
             'icon' => 'star', 'order' => 292, 'required_role' => $adminOrPriest, 'section' => 'config',
         ],
+        'kolenda_attendance' => [
+            'title' => 'Kolędy — obecność', 'path' => '/public/kolenda-obecnosc.php',
+            'icon' => 'check', 'order' => 293, 'required_role' => $adminOrPriest, 'section' => 'config',
+        ],
         'wyjazdy_admin' => [
             'title' => 'Wyjazdy — admin', 'path' => '/public/wyjazdy-admin.php',
-            'icon' => 'bus', 'order' => 293, 'required_role' => $adminOrPriest, 'section' => 'config',
+            'icon' => 'bus', 'order' => 294, 'required_role' => $adminOrPriest, 'section' => 'config',
         ],
         'meetings_config' => [
             'title' => 'Zarządzaj zbiórkami', 'path' => '/public/meetings-config.php',
