@@ -14,6 +14,7 @@ LARAVEL_APP="$2"
 
 mkdir -p "$LARAVEL_APP/app/Http/Controllers/Admin" \
          "$LARAVEL_APP/app/Http/Controllers/Api" \
+         "$LARAVEL_APP/app/Http/Controllers/Internal" \
          "$LARAVEL_APP/app/Http/Controllers/Public" \
          "$LARAVEL_APP/app/Http/Middleware" \
          "$LARAVEL_APP/app/Models" \
@@ -21,6 +22,7 @@ mkdir -p "$LARAVEL_APP/app/Http/Controllers/Admin" \
 
 cp -r "$PACKAGE_ROOT/app/Http/Controllers/Admin/." "$LARAVEL_APP/app/Http/Controllers/Admin/"
 cp -r "$PACKAGE_ROOT/app/Http/Controllers/Api/." "$LARAVEL_APP/app/Http/Controllers/Api/"
+cp -r "$PACKAGE_ROOT/app/Http/Controllers/Internal/." "$LARAVEL_APP/app/Http/Controllers/Internal/"
 cp -r "$PACKAGE_ROOT/app/Http/Controllers/Public/." "$LARAVEL_APP/app/Http/Controllers/Public/"
 cp "$PACKAGE_ROOT/app/Http/Controllers/Controller.php" "$LARAVEL_APP/app/Http/Controllers/Controller.php"
 cp -r "$PACKAGE_ROOT/app/Http/Middleware/." "$LARAVEL_APP/app/Http/Middleware/"

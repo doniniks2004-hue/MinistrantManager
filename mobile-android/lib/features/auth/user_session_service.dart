@@ -31,6 +31,23 @@ class UserLoginNetworkError extends UserLoginResult {
   const UserLoginNetworkError();
 }
 
+/// Device-control-plane milestone (review round point 8): the PARISH
+/// confirmed the password was correct, but app.ministrant.eu says this
+/// installation is NOT authorized right now (revoked / parish_disabled /
+/// not_found / parish_mismatch / central_unavailable). Deliberately its
+/// OWN result type — NEVER shown as "zły login/hasło" (the password WAS
+/// right) and NEVER as a generic network problem (revoked/disabled/
+/// mismatch are affirmative answers, not a hiccup) — review round:
+/// "wymuś ponowne sprawdzenie device status przez centralny flow", which
+/// is exactly what [deviceState] lets the caller distinguish:
+/// 'central_unavailable' is retriable (try again shortly); the other
+/// four states mean a human needs to sort this out (contact whoever
+/// manages the parish's devices).
+class UserLoginDeviceNotAuthorized extends UserLoginResult {
+  const UserLoginDeviceNotAuthorized({required this.deviceState});
+  final String deviceState;
+}
+
 /// Session/device management around `/api/v1/mobile/session/login` —
 /// deliberately separate from ActivationService (device-level) and from
 /// SyncEngine (business-data sync). This is specifically "which human is
@@ -92,7 +109,21 @@ class UserSessionService {
 
       return UserLoginSuccess(fullName: fullName);
     } on DioException catch (e) {
-      if (e.response?.statusCode == 401 || e.response?.statusCode == 400) {
+      final statusCode = e.response?.statusCode;
+
+      // Device-control-plane milestone: 403/503 with error code
+      // "device_not_authorized" is NEVER "zły login/hasło" — the
+      // password was correct; app.ministrant.eu just won't authorize
+      // this installation right now. Checked BEFORE the 401/400 case
+      // below since these status codes never overlap with it in this
+      // backend's design (device_not_authorized is only ever 403/503).
+      if (statusCode == 403 || statusCode == 503) {
+        final body = e.response?.data;
+        final deviceState = (body is Map ? body['device_state'] as String? : null) ?? 'central_unavailable';
+        return UserLoginDeviceNotAuthorized(deviceState: deviceState);
+      }
+
+      if (statusCode == 401 || statusCode == 400) {
         return const UserLoginInvalidCredentials();
       }
       return const UserLoginNetworkError();

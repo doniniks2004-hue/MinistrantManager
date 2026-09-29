@@ -57,6 +57,20 @@ class _LoginScreenState extends State<LoginScreen> {
           _errorMessage = 'Nieprawidłowy login lub hasło.';
         });
         break;
+      case UserLoginDeviceNotAuthorized():
+        // Device-control-plane milestone (review round point 8):
+        // deliberately NEVER "zły login/hasło" (password was correct)
+        // and NEVER the generic network-error message below —
+        // 'central_unavailable' is a retriable hiccup, the other four
+        // states mean a human needs to sort this out.
+        final deviceState = (result as UserLoginDeviceNotAuthorized).deviceState;
+        setState(() {
+          _submitting = false;
+          _errorMessage = deviceState == 'central_unavailable'
+              ? 'Nie udało się potwierdzić autoryzacji urządzenia. Spróbuj ponownie za chwilę.'
+              : 'To urządzenie nie jest autoryzowane do korzystania z tej parafii. Skontaktuj się z administratorem.';
+        });
+        break;
       case UserLoginNetworkError():
         setState(() {
           _submitting = false;

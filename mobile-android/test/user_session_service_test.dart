@@ -210,6 +210,61 @@ void main() {
 
     expect(await secureStorage.hasUserSession, isFalse);
   });
+
+  test('device-control-plane: a 403 device_not_authorized response becomes UserLoginDeviceNotAuthorized, never invalid-credentials', () async {
+    final secureStorage = SecureStorageService();
+    final api = ApiClient(secureStorage);
+    final db = AppDatabase.forTesting();
+    fakeStore['installation_id'] = '550e8400-e29b-41d4-a716-446655440000';
+    fakeStore['server_url'] = 'https://parafia-witosa.ministrant.eu';
+
+    final dio = Dio();
+    dio.interceptors.add(InterceptorsWrapper(onRequest: (options, handler) {
+      handler.reject(DioException(
+        requestOptions: options,
+        response: Response(
+          requestOptions: options,
+          statusCode: 403,
+          data: {'error': 'device_not_authorized', 'message': 'x', 'device_state': 'revoked'},
+        ),
+      ));
+    }));
+
+    final service = _TestUserSessionService(api: api, secureStorage: secureStorage, db: db, fakeLoginDio: dio);
+    final result = await service.login(username: 'adam', password: 'correct-password');
+
+    expect(result, isA<UserLoginDeviceNotAuthorized>());
+    expect((result as UserLoginDeviceNotAuthorized).deviceState, 'revoked');
+    // The whole point of this result type: never confused with a wrong
+    // password, since the password here genuinely was correct.
+    expect(result, isNot(isA<UserLoginInvalidCredentials>()));
+
+    await db.close();
+  });
+
+  test('device-control-plane: a 503 with no device_state body defaults to central_unavailable, never crashes on a malformed response', () async {
+    final secureStorage = SecureStorageService();
+    final api = ApiClient(secureStorage);
+    final db = AppDatabase.forTesting();
+    fakeStore['installation_id'] = '550e8400-e29b-41d4-a716-446655440000';
+    fakeStore['server_url'] = 'https://parafia-witosa.ministrant.eu';
+
+    final dio = Dio();
+    dio.interceptors.add(InterceptorsWrapper(onRequest: (options, handler) {
+      handler.reject(DioException(
+        requestOptions: options,
+        response: Response(requestOptions: options, statusCode: 503, data: 'not even json'),
+      ));
+    }));
+
+    final service = _TestUserSessionService(api: api, secureStorage: secureStorage, db: db, fakeLoginDio: dio);
+    final result = await service.login(username: 'adam', password: 'correct-password');
+
+    expect(result, isA<UserLoginDeviceNotAuthorized>());
+    expect((result as UserLoginDeviceNotAuthorized).deviceState, 'central_unavailable');
+
+    await db.close();
+  });
 }
 
 /// Test seam: real UserSessionService.login() builds its own Dio pointed
@@ -255,7 +310,16 @@ class _TestUserSessionService extends UserSessionService {
       api.resetParishClient();
 
       return UserLoginSuccess(fullName: fullName);
-    } on DioException {
+    } on DioException catch (e) {
+      final statusCode = e.response?.statusCode;
+      if (statusCode == 403 || statusCode == 503) {
+        final body = e.response?.data;
+        final deviceState = (body is Map ? body['device_state'] as String? : null) ?? 'central_unavailable';
+        return UserLoginDeviceNotAuthorized(deviceState: deviceState);
+      }
+      if (statusCode == 401 || statusCode == 400) {
+        return const UserLoginInvalidCredentials();
+      }
       return const UserLoginNetworkError();
     }
   }

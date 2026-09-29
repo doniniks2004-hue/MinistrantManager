@@ -8,8 +8,15 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 class Parish extends Model
 {
     protected $fillable = [
-        'name', 'slug', 'subdomain', 'server_url',
+        'name', 'slug', 'subdomain', 'server_url', 'mobile_internal_api_secret',
         'mobile_status', 'offline_lease_hours', 'disabled_at', 'disabled_by',
+    ];
+
+    // Device-control-plane milestone: never accidentally serialize this
+    // into an admin view/API response — it authenticates
+    // server-to-server device-validate calls, same care as a password.
+    protected $hidden = [
+        'mobile_internal_api_secret',
     ];
 
     protected $casts = [
