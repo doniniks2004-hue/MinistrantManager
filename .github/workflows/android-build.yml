@@ -17,6 +17,9 @@ jobs:
     # (secrets ARE allowed there), then branch on `env.*` in `if:`.
     env:
       HAS_ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+      HAS_ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD != '' }}
+      HAS_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS != '' }}
+      HAS_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD != '' }}
     defaults:
       run:
         working-directory: mobile-android
@@ -42,12 +45,23 @@ jobs:
       - run: flutter pub get
       - run: dart run build_runner build --delete-conflicting-outputs
 
+      - name: Validate Android signing secret set
+        run: |
+          configured=0
+          for flag in "$HAS_ANDROID_KEYSTORE" "$HAS_ANDROID_STORE_PASSWORD" "$HAS_ANDROID_KEY_ALIAS" "$HAS_ANDROID_KEY_PASSWORD"; do
+            if [ "$flag" = "true" ]; then configured=$((configured + 1)); fi
+          done
+          if [ "$configured" -ne 0 ] && [ "$configured" -ne 4 ]; then
+            echo "Android release signing is only partially configured. Set all four ANDROID_* secrets or none of them."
+            exit 1
+          fi
+
       # Debug build needs no signing secrets — always runs. Release build
       # (signed app-release.aab) only runs once these three repo secrets
       # exist; until then this step is a no-op rather than a failure, so
       # the workflow stays green for everyone before a keystore exists.
       - name: Decode release keystore (if configured)
-        if: ${{ env.HAS_ANDROID_KEYSTORE == 'true' }}
+        if: ${{ env.HAS_ANDROID_KEYSTORE == 'true' && env.HAS_ANDROID_STORE_PASSWORD == 'true' && env.HAS_ANDROID_KEY_ALIAS == 'true' && env.HAS_ANDROID_KEY_PASSWORD == 'true' }}
         run: |
           echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/release.keystore
           cat > android/key.properties << KEYPROPS
