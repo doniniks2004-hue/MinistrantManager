@@ -89,6 +89,22 @@ dev_dependencies:
   drift_dev: ^2.32.0
   build_runner: ^2.4.9
   flutter_lints: ^4.0.0
+  # Release-readiness milestone: INERT until assets/branding/splash_logo.png
+  # actually exists (see that folder's own README.txt) — `dart run
+  # flutter_native_splash:create` errors out cleanly on a missing file
+  # rather than silently doing nothing, so this is safe to leave
+  # configured ahead of the real asset arriving. ⚠ VERIFY AT
+  # IMPLEMENTATION TIME (same caveat as every other pinned version in
+  # this file) — no pub.dev access from this sandbox to confirm this
+  # exact version against the live registry.
+  flutter_native_splash: ^2.4.1
+
+flutter_native_splash:
+  color: "#F5F5F5"
+  image: assets/branding/splash_logo.png
+  android_12:
+    color: "#F5F5F5"
+    image: assets/branding/splash_logo.png
 
 flutter:
   uses-material-design: true

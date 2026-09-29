@@ -272,16 +272,13 @@ function webview_module_registry(): array
  * DISPLAY-only filter (real enforcement is webview_handoff.php's role
  * check below, and bootstrap.php's own per-user filtering for native data).
  *
- * Review round fix (don't advertise vaporware): ranking/points/
- * substitutions/attendance are deliberately NOT listed as `native` here
- * — those Flutter screens don't exist yet. Add each one back with
- * `type: native` only once its real screen ships; until then this
- * function simply omits them rather than promising a screen that isn't
- * there (the OLD behavior — declaring them native early — meant a build
- * without the screen would 500/crash trying to open them; omitting is
- * the safe interim state, not the "wymaga nowszej wersji" fallback,
- * since that fallback is for a FUTURE server capability an OLDER app
- * doesn't understand yet — the reverse situation).
+ * All 7 P1 native modules (schedule/ranking/points/substitutions/
+ * attendance/announcements/profile) now have real Flutter screens and
+ * are listed as `native` below — see MODULE-MATRIX.md for the full,
+ * per-module DONE/PARTIAL status. A module is only ever added here as
+ * `native` once its screen genuinely ships in the same commit — never
+ * ahead of it (an earlier round briefly advertised these before the
+ * screens existed; see that commit's own note on why that was wrong).
  */
 function build_modules(\mysqli $conn): array
 {
