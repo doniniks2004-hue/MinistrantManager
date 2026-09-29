@@ -57,7 +57,7 @@ jobs:
           fi
 
       # Debug build needs no signing secrets — always runs. Release build
-      # (signed app-release.aab) only runs once these three repo secrets
+      # (signed app-release.aab) only runs once all four repo secrets
       # exist; until then this step is a no-op rather than a failure, so
       # the workflow stays green for everyone before a keystore exists.
       - name: Decode release keystore (if configured)
@@ -75,7 +75,7 @@ jobs:
         run: flutter build apk --debug
 
       - name: Build release APK + AAB (only if keystore secrets are configured)
-        if: ${{ env.HAS_ANDROID_KEYSTORE == 'true' }}
+        if: ${{ env.HAS_ANDROID_KEYSTORE == 'true' && env.HAS_ANDROID_STORE_PASSWORD == 'true' && env.HAS_ANDROID_KEY_ALIAS == 'true' && env.HAS_ANDROID_KEY_PASSWORD == 'true' }}
         run: |
           flutter build apk --release
           flutter build appbundle --release
