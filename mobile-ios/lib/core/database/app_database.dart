@@ -46,7 +46,7 @@ class MyScheduleEntry {
   ParishInfo,
   Events,
   ScheduleAssignments,
-  Attendance,
+  GatheringAttendanceRecords,
   Points,
   RankingEntries,
   Announcements,
@@ -83,7 +83,7 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase.forTestingAtFile(File file) : super(NativeDatabase(file));
 
   @override
-  int get schemaVersion => 4;
+  int get schemaVersion => 5;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -136,9 +136,20 @@ class AppDatabase extends _$AppDatabase {
             await m.deleteTable('substitutions');
             await m.createTable(substitutionRequests);
           }
+          if (from < 5) {
+            // v4 -> v5 (hybrid dashboard milestone, P1 — final piece):
+            // Attendance replaced with GatheringAttendanceRecords (real
+            // gathering_attendance shape) — mass attendance was never
+            // stored in the old placeholder table to begin with (it
+            // lives in ScheduleAssignments.isPresent), so this migration
+            // only concerns the gathering-attendance half. Same
+            // drop+recreate reasoning as every migration before this one.
+            await m.deleteTable('attendance');
+            await m.createTable(gatheringAttendanceRecords);
+          }
           //
           // Template for the NEXT migration:
-          // if (from < 5) {
+          // if (from < 6) {
           //   await m.addColumn(events, events.someNewColumn);
           // }
         },
@@ -206,7 +217,7 @@ class AppDatabase extends _$AppDatabase {
     await transaction(() async {
       await delete(events).go();
       await delete(scheduleAssignments).go();
-      await delete(attendance).go();
+      await delete(gatheringAttendanceRecords).go();
       await delete(points).go();
       await delete(rankingEntries).go();
       await delete(announcements).go();
@@ -286,6 +297,35 @@ class AppDatabase extends _$AppDatabase {
     return query.watch();
   }
 
+  /// "Obecności" (hybrid dashboard milestone, P1 — final piece), half 1
+  /// of 2: mass attendance. Deliberately NOT a separate table — this is
+  /// the SAME `watchMySchedule()` join, just filtered to events already
+  /// in the past (attendance is only meaningful for something that
+  /// already happened) and ordered most-recent-first for a history view.
+  Stream<List<MyScheduleEntry>> watchMassAttendanceHistory() {
+    final query = select(scheduleAssignments).join([
+      innerJoin(events, events.id.equalsExp(scheduleAssignments.eventId)),
+    ])
+      ..where(events.eventDate.isSmallerThanValue(DateTime.now().toUtc()))
+      ..orderBy([OrderingTerm.desc(events.eventDate)]);
+    return query.watch().map(
+          (rows) => rows
+              .map((row) => MyScheduleEntry(
+                    schedule: row.readTable(scheduleAssignments),
+                    event: row.readTable(events),
+                  ))
+              .toList(),
+        );
+  }
+
+  /// "Obecności", half 2 of 2: gathering attendance — genuinely no
+  /// other source in the sync payload (see GatheringAttendanceRecords'
+  /// own docblock).
+  Stream<List<GatheringAttendanceRecord>> watchGatheringAttendance() {
+    final query = select(gatheringAttendanceRecords)..orderBy([(t) => OrderingTerm.desc(t.gatheringDate)]);
+    return query.watch();
+  }
+
   Future<void> wipeAllParishData() async {
     // Called on DEVICE_REVOKED / PARISH_DISABLED / manual reset.
     // Deliberately does NOT touch schemaVersion — only row data. This is
@@ -305,7 +345,7 @@ class AppDatabase extends _$AppDatabase {
       await delete(parishInfo).go();
       await delete(events).go();
       await delete(scheduleAssignments).go();
-      await delete(attendance).go();
+      await delete(gatheringAttendanceRecords).go();
       await delete(points).go();
       await delete(rankingEntries).go();
       await delete(announcements).go();

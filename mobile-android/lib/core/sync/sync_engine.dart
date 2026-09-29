@@ -381,6 +381,14 @@ class SyncEngine {
         }
       }
 
+      // Obecności, half 2 of 2 (half 1 is scheduleAssignments.isPresent,
+      // already handled above — see GatheringAttendanceRecords' own
+      // docblock for why this is a genuinely separate source).
+      await db.delete(db.gatheringAttendanceRecords).go();
+      for (final row in _rows(data['gathering_attendance'])) {
+        await db.into(db.gatheringAttendanceRecords).insertOnConflictUpdate(_mapLegacyGatheringAttendance(row));
+      }
+
       // Review round fix (real bug, found via a direct-call test that
       // bypasses HomeScreen's usual checkDeviceStatus()-first ordering):
       // this used to be a bare `update()..where(id.equals(1))`, which is
@@ -460,6 +468,18 @@ class SyncEngine {
         eventDescription: Value(row['event_description'] as String?),
         isMine: isMine,
         createdAt: DateTime.parse(row['created_at'] as String),
+      );
+
+  GatheringAttendanceRecordsCompanion _mapLegacyGatheringAttendance(Map<String, dynamic> row) =>
+      GatheringAttendanceRecordsCompanion.insert(
+        id: row['id'] as String,
+        rawId: row['raw_id'] as int,
+        gatheringTitle: row['gathering_title'] as String,
+        gatheringDate: DateTime.parse(row['gathering_date'] as String),
+        wasPresent: row['was_present'] as bool,
+        isExcused: row['is_excused'] as bool,
+        pointsAwarded: row['points_awarded'] as int,
+        notes: Value(row['notes'] as String?),
       );
 
 

@@ -186,5 +186,40 @@ void main() {
 
       await db.close();
     });
+
+    test('P1 final: gathering_attendance from bootstrap is applied correctly, distinct from mass attendance', () async {
+      final db = AppDatabase.forTesting();
+      final engine = SyncEngine(db: db, api: ApiClient(SecureStorageService()), secureStorage: SecureStorageService());
+
+      await engine.applySnapshotForTesting({
+        'generated_at': '2026-10-01T08:00:00+02:00',
+        'events': [
+          {'id': 'events:1', 'raw_id': 1, 'source': 'events', 'event_date': '2026-09-20T10:00:00+02:00', 'description': 'Msza zeszła', 'module_id': 1, 'is_cancelled': false},
+        ],
+        'schedule': [
+          {'id': 'schedule:1', 'raw_id': 1, 'event_id': 'events:1', 'event_source': 'events', 'user_id': 9001, 'guest_name': null, 'is_present': true, 'status': 'assigned'},
+        ],
+        'gathering_attendance': [
+          {'id': 'gathering_attendance:1', 'raw_id': 1, 'gathering_title': 'Zbiórka tygodniowa', 'gathering_date': '2026-09-22T07:31:22+02:00', 'was_present': true, 'is_excused': false, 'points_awarded': 2, 'notes': null},
+          {'id': 'gathering_attendance:2', 'raw_id': 2, 'gathering_title': 'Zbiórka specjalna', 'gathering_date': '2026-09-15T07:31:22+02:00', 'was_present': false, 'is_excused': true, 'points_awarded': 0, 'notes': 'Choroba'},
+        ],
+      });
+
+      // Half 1: mass attendance lives in scheduleAssignments, NOT a
+      // separate table — this is the SAME snapshot as any other
+      // schedule sync, just with isPresent now meaningfully populated.
+      final schedule = await db.select(db.scheduleAssignments).get();
+      expect(schedule.single.isPresent, isTrue);
+
+      // Half 2: gathering attendance in its own, genuinely distinct table.
+      final gatherings = await db.select(db.gatheringAttendanceRecords).get();
+      expect(gatherings.length, 2);
+      final excused = gatherings.firstWhere((g) => g.isExcused);
+      expect(excused.wasPresent, isFalse);
+      expect(excused.notes, 'Choroba');
+      expect(excused.gatheringTitle, 'Zbiórka specjalna');
+
+      await db.close();
+    });
   });
 }

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import '../../core/database/app_database.dart';
 import '../../core/secure/secure_storage_service.dart';
 import '../announcements/announcements_screen.dart';
+import '../attendance/attendance_screen.dart';
 import '../points/points_screen.dart';
 import '../profile/profile_screen.dart';
 import '../ranking/ranking_screen.dart';
@@ -141,6 +142,8 @@ class DashboardScreen extends StatelessWidget {
         return RankingScreen(db: db);
       case 'substitutions':
         return SubstitutionsScreen(db: db);
+      case 'attendance':
+        return AttendanceScreen(db: db);
       case 'profile':
         return ProfileScreen(
           db: db,
@@ -150,11 +153,10 @@ class DashboardScreen extends StatelessWidget {
           onLogout: onLogout,
         );
       default:
-        // attendance: not yet implemented natively on this build (two
-        // different legacy data sources need reconciling first — see
-        // MODULE-MATRIX.md) — safe fallback, never a crash. Also the
-        // general safety net for any future `screen` name an older app
-        // build doesn't recognize yet (review round point 23).
+        // Safety net for any `screen` name an older app build doesn't
+        // recognize yet (review round point 23) — every P1 module is
+        // now implemented; this branch exists for FUTURE server
+        // capabilities this exact build predates.
         return null;
     }
   }

@@ -63,13 +63,23 @@ class ScheduleAssignments extends Table {
   Set<Column> get primaryKey => {id};
 }
 
-class Attendance extends Table {
-  TextColumn get id => text()();
-  TextColumn get eventId => text()();
-  TextColumn get personName => text()();
-  TextColumn get status => text()(); // present / absent / excused
-  DateTimeColumn get recordedAt => dateTime()();
-  TextColumn get payloadJson => text()();
+@DataClassName('GatheringAttendanceRecord')
+class GatheringAttendanceRecords extends Table {
+  // "Obecności" (hybrid dashboard milestone, P1 — final piece). This is
+  // PURELY the gathering_attendance half — mass attendance already
+  // lives in ScheduleAssignments.isPresent (synced via `schedule`), so
+  // it is NOT duplicated here (review round: "Nie mieszaj tego w jedną
+  // tabelę po stronie backendu" — the same principle applies
+  // client-side: two distinct sources, never merged into one row shape).
+  // Replaces Iteration-1's placeholder Attendance table entirely.
+  TextColumn get id => text()(); // "gathering_attendance:5"
+  IntColumn get rawId => integer()();
+  TextColumn get gatheringTitle => text()();
+  DateTimeColumn get gatheringDate => dateTime()();
+  BoolColumn get wasPresent => boolean()();
+  BoolColumn get isExcused => boolean()();
+  IntColumn get pointsAwarded => integer()();
+  TextColumn get notes => text().nullable()();
 
   @override
   Set<Column> get primaryKey => {id};
