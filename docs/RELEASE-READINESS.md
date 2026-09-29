@@ -19,6 +19,7 @@ akceptacyjnym na realnym urządzeniu.
 | Wymuszona pierwsza zmiana hasła | ✅ |
 | Legacy substitutions hardening | ✅ instalator w paczce Witosy |
 | Legacy maintenance/admin hardening | ✅ updater/receiver/fix/reset disabled + settings CSRF |
+| Legacy web/session hardening | ✅ same-origin guard + empty.php CSRF + upload hardening |
 | Automatyczny ZIP wdrożeniowy Witosy w CI | ✅ |
 | Android debug build / iOS unsigned build | ✅ |
 
@@ -109,6 +110,7 @@ CI buduje artefakt `witosa-deployment.zip`, zawierający:
 - flow pierwszej zmiany hasła,
 - konfigurację device-control-plane,
 - `scripts/apply_legacy_security_hardening.php`,
+- `scripts/apply_legacy_web_hardening.php`,
 - `scripts/apply_substitution_hotfix.php`,
 - preflight/smoke/cleanup,
 - aktualną instrukcję wdrożenia.
