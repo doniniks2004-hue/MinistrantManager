@@ -10,5 +10,6 @@
 # public/ i jest wołany wprost (public/mobile_handoff.php?ticket=...).
 RewriteRule ^api/v1/mobile/bootstrap$ api/mobile/bootstrap.php [L,QSA]
 RewriteRule ^api/v1/mobile/session/login$ api/mobile/session_login.php [L,QSA]
+RewriteRule ^api/v1/mobile/session/change-password$ api/mobile/session_change_password.php [L,QSA]
 RewriteRule ^api/v1/mobile/config$ api/mobile/config.php [L,QSA]
 RewriteRule ^api/v1/mobile/webview/handoff$ api/mobile/webview_handoff.php [L,QSA]
