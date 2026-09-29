@@ -64,16 +64,31 @@ jobs:
       # (signed app-release.aab) only runs once all four repo secrets
       # exist; until then this step is a no-op rather than a failure, so
       # the workflow stays green for everyone before a keystore exists.
-      - name: Decode release keystore (if configured)
+      - name: Decode and verify release keystore (if configured)
         if: ${{ env.HAS_ANDROID_KEYSTORE == 'true' && env.HAS_ANDROID_STORE_PASSWORD == 'true' && env.HAS_ANDROID_KEY_ALIAS == 'true' && env.HAS_ANDROID_KEY_PASSWORD == 'true' }}
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/release.keystore
+          set -euo pipefail
+          umask 077
+
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/release.keystore
+
           cat > android/key.properties << KEYPROPS
-          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
-          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyPassword=$ANDROID_KEY_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
           storeFile=release.keystore
           KEYPROPS
+
+          test -s android/release.keystore
+          keytool -list \
+            -keystore android/release.keystore \
+            -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+            -alias "$ANDROID_KEY_ALIAS" >/dev/null
 
       - name: Build debug APK (always)
         run: flutter build apk --debug
