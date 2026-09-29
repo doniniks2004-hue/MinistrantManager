@@ -76,28 +76,41 @@ class DashboardScreen extends StatelessWidget {
               text: 'Nie udało się zaktualizować danych. Pokazujemy ostatnią znaną wersję.',
             ),
           Expanded(
-            child: everyday.isEmpty && adminItems.isEmpty
-                ? const Center(child: Text('Brak dostępnych modułów.'))
-                : GridView.builder(
-                    padding: const EdgeInsets.all(16),
-                    gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: 2,
-                      mainAxisSpacing: 12,
-                      crossAxisSpacing: 12,
-                      childAspectRatio: 1.1,
+            child: RefreshIndicator(
+              // UX pass: "Pull-to-refresh: snapshot refresh. Nie blokuj
+              // ekranu spinnerem... Refresh działa w tle. Po commit do
+              // SQLite Drift odświeża ekran." — onSync() is the SAME
+              // background sync HomeScreen already runs on init/resume;
+              // this just gives the user a way to trigger it on demand.
+              onRefresh: onSync,
+              child: everyday.isEmpty && adminItems.isEmpty
+                  ? ListView(
+                      children: const [
+                        SizedBox(height: 120),
+                        Center(child: Text('Brak dostępnych modułów.')),
+                      ],
+                    )
+                  : GridView.builder(
+                      padding: const EdgeInsets.all(16),
+                      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                        crossAxisCount: 2,
+                        mainAxisSpacing: 12,
+                        crossAxisSpacing: 12,
+                        childAspectRatio: 1.1,
+                      ),
+                      itemCount: everyday.length + (adminItems.isEmpty ? 0 : 1),
+                      itemBuilder: (context, i) {
+                        if (i == everyday.length) {
+                          // The one synthetic "Administracja" tile — only
+                          // shown at all if this user's role has ANY
+                          // visible config-section item.
+                          return _AdminEntryTile(onTap: () => _openAdminSection(context, adminItems));
+                        }
+                        final module = everyday[i];
+                        return _ModuleTile(module: module, onTap: () => _openModule(context, module));
+                      },
                     ),
-                    itemCount: everyday.length + (adminItems.isEmpty ? 0 : 1),
-                    itemBuilder: (context, i) {
-                      if (i == everyday.length) {
-                        // The one synthetic "Administracja" tile — only
-                        // shown at all if this user's role has ANY
-                        // visible config-section item.
-                        return _AdminEntryTile(onTap: () => _openAdminSection(context, adminItems));
-                      }
-                      final module = everyday[i];
-                      return _ModuleTile(module: module, onTap: () => _openModule(context, module));
-                    },
-                  ),
+            ),
           ),
         ],
       ),
