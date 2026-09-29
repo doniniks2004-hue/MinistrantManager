@@ -24,6 +24,13 @@ class UserLoginInvalidCredentials extends UserLoginResult {
   const UserLoginInvalidCredentials();
 }
 
+/// The credentials are correct, but this legacy account is still in the
+/// mandatory first-login/reset state (users.password_changed = 0).
+/// No general-purpose mobile_user_token has been issued yet.
+class UserLoginPasswordChangeRequired extends UserLoginResult {
+  const UserLoginPasswordChangeRequired();
+}
+
 /// A transport-level failure (no connectivity, timeout, 5xx) — distinct
 /// from invalid credentials so the UI can say "spróbuj ponownie" instead
 /// of "sprawdź hasło".
@@ -123,7 +130,76 @@ class UserSessionService {
         return UserLoginDeviceNotAuthorized(deviceState: deviceState);
       }
 
+      final body = e.response?.data;
+      if (statusCode == 428 && body is Map && body['error'] == 'password_change_required') {
+        return const UserLoginPasswordChangeRequired();
+      }
+
       if (statusCode == 401 || statusCode == 400) {
+        return const UserLoginInvalidCredentials();
+      }
+      return const UserLoginNetworkError();
+    }
+  }
+
+  /// Completes the server-enforced first-login password change. The
+  /// current password is re-verified by the parish and the device is
+  /// re-validated centrally before a fresh token is minted.
+  Future<UserLoginResult> changeRequiredPassword({
+    required String username,
+    required String currentPassword,
+    required String newPassword,
+  }) async {
+    final installationId = await secureStorage.installationId;
+    final serverUrl = await secureStorage.serverUrl;
+    if (installationId == null || serverUrl == null) {
+      return const UserLoginNetworkError();
+    }
+
+    final loginDio = Dio(BaseOptions(
+      baseUrl: '$serverUrl/api/v1',
+      connectTimeout: const Duration(seconds: 10),
+      receiveTimeout: const Duration(seconds: 15),
+    ));
+
+    try {
+      final resp = await loginDio.post('/mobile/session/change-password', data: {
+        'username': username,
+        'current_password': currentPassword,
+        'new_password': newPassword,
+        'installation_id': installationId,
+      });
+
+      final data = resp.data as Map<String, dynamic>;
+      final token = data['token'] as String;
+      final user = data['user'] as Map<String, dynamic>;
+      final newUserId = user['id'] as int;
+      final fullName = user['full_name'] as String?;
+      final roleId = user['role_id'] as int?;
+
+      final previousUserId = await secureStorage.currentUserId;
+      if (previousUserId != null && previousUserId != newUserId) {
+        await db.wipeUserScopedBusinessData();
+        await _clearWebviewCookies();
+      }
+
+      await secureStorage.setUserSession(
+        token: token,
+        userId: newUserId,
+        fullName: fullName,
+        roleId: roleId,
+      );
+      api.resetParishClient();
+
+      return UserLoginSuccess(fullName: fullName);
+    } on DioException catch (e) {
+      final statusCode = e.response?.statusCode;
+      if (statusCode == 403 || statusCode == 503) {
+        final body = e.response?.data;
+        final deviceState = (body is Map ? body['device_state'] as String? : null) ?? 'central_unavailable';
+        return UserLoginDeviceNotAuthorized(deviceState: deviceState);
+      }
+      if (statusCode == 401 || statusCode == 400 || statusCode == 409) {
         return const UserLoginInvalidCredentials();
       }
       return const UserLoginNetworkError();
