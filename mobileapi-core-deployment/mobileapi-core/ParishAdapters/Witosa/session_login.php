@@ -77,6 +77,14 @@ if ($deviceResult['state'] !== 'active') {
     ]);
 }
 
+if (!($user['password_changed'] ?? false)) {
+    JsonResponse::error(
+        'password_change_required',
+        'Przy pierwszym logowaniu musisz ustawić nowe hasło.',
+        428
+    );
+}
+
 $tokenService = new MobileUserTokenService($conn);
 $token = $tokenService->mint($user['id'], $installationId);
 
