@@ -89,6 +89,10 @@ function webview_module_registry(): array
             'title' => 'Ustawienia', 'path' => '/public/settings.php',
             'icon' => 'settings', 'order' => 270, 'required_role' => $adminOrPriest, 'section' => 'config',
         ],
+        'parish_settings' => [
+            'title' => 'Ustawienia parafii', 'path' => '/public/ustawienia.php',
+            'icon' => 'settings', 'order' => 271, 'required_role' => $adminOrPriest, 'section' => 'config',
+        ],
         'triduum_admin' => [
             'title' => 'Triduum — panel', 'path' => '/public/triduum-admin.php',
             'icon' => 'church', 'order' => 280, 'required_role' => $adminOrPriest, 'section' => 'config',
