@@ -1,43 +1,55 @@
 # mobileapi-core-deployment/
 
-**To jest kopia referencyjna paczki wdrożeniowej dla parafii** (Witosa i
-każdej kolejnej), dodana do repo wyłącznie po to, żeby dało się ją
-przejrzeć/zdiffować na GitHubie — **nie jest wpięta w CI** i nie jest
-kopiowana przez żaden workflow.
+To jest **wersjonowane źródło finalnej paczki wdrożeniowej parafii**.
 
-## Dlaczego to jest osobny folder, nie `mobileapi/`
+GitHub Actions:
+1. sprawdza składnię wszystkich plików PHP w tym katalogu,
+2. uruchamia niezależne testy MobileAPI,
+3. buduje z całej zawartości `witosa-deployment.zip`,
+4. publikuje ZIP jako artefakt workflow `MobileAPI tests`.
 
-Folder `mobileapi/` w tym repo to pozostałość Iteracji 1 (szkielet w
-stylu Laravel) — **nigdy nie był rzeczywistym celem wdrożenia** dla
-prawdziwej parafii i nie jest z nim zsynchronizowany. Realny kod, który
-faktycznie trafia na serwer Witosy (i każdej kolejnej parafii), to
-dokładnie to, co jest w tym folderze — dostarczane jako
-`witosa-deployment.zip` przy okazji odpowiednich rund tej pracy.
+Nie składamy produkcyjnej paczki ręcznie z plików z różnych commitów.
 
-## Co tu jest
+## Zawartość
 
-- `mobileapi-core/` — kod PHP wdrażany POZA `public_html/` (patrz
-  `docs/WITOSA-DEPLOYMENT.md`)
-- `public_html-additions/` — pliki-zaślepki i config do wgrania
-  DO `public_html/`
-- `migrations/` — migracje SQL, w kolejności numerycznej
-- `scripts/` — `preflight.php`, `create_test_account.php`,
-  `cleanup_test_account.php`, `smoke_test.sh`
-- `docs/` — pełna instrukcja wdrożenia, matryca modułów, architektura
-  hybrydowa
+- `mobileapi-core/` — logika PHP instalowana poza `public_html/`,
+- `public_html-additions/` — pięć stubów API, handoff i config template,
+- `migrations/` — migracje 001–005,
+- `scripts/preflight.php`,
+- `scripts/apply_substitution_hotfix.php`,
+- `scripts/create_test_account.php`,
+- `scripts/cleanup_test_account.php`,
+- `scripts/smoke_test.sh`,
+- `docs/` — runbook, matryca modułów i opis architektury.
 
-## Dlaczego nie w CI
+## Dlaczego osobny folder od mobileapi/
 
-Ten kod nigdy nie działa samodzielnie — wymaga prawdziwej instalacji
-legacy PHP danej parafii (bazy danych, `config/database.php`, realnych
-tabel) jako hosta. Weryfikacja odbywa się przez:
-1. Lokalne testy end-to-end w środowisku deweloperskim (opisane w
-   historii commitów tego repo) — prawdziwy MariaDB + PHP + HTTP,
-   syntetyczne dane w kształcie realnego schematu.
-2. Realne wdrożenie na Witosie przez zespół z dostępem do serwera,
-   według `docs/WITOSA-DEPLOYMENT.md`.
+`mobileapi/` zawiera wcześniejszy, framework-free kontrakt/test harness
+z Iteracji 1. Realne wdrożenie plain-PHP do istniejącej parafii jest
+wersjonowane tutaj, ponieważ musi współpracować z jej istniejącym
+`config/database.php`, sesjami i schematem legacy.
 
-Jeśli w przyszłości powstanie sposób na uruchomienie prawdziwego testu
-integracyjnego przeciwko tej paczce w GitHub Actions (np. kontener z
-minimalnym legacy PHP), warto to tu podłączyć — na razie to świadomie
-poza zakresem.
+## Ważne
+
+- prawdziwe sekrety parafii nie trafiają do repo,
+- Android JKS/hasła nie trafiają do repo,
+- paczka zawiera tylko placeholder config dla
+  `MOBILE_INTERNAL_API_SECRET`,
+- hotfix legacy odmawia nadpisania pliku, jeśli SHA-256 produkcji różni się
+  od audytowanego baseline,
+- finalne uruchomienie na Witosie odbywa się zgodnie z
+  `docs/WITOSA-DEPLOYMENT.md`.
+
+## Stan testów
+
+CI pokrywa:
+- syntax PHP,
+- MobileAPI tests,
+- budowę paczki deploymentowej,
+- Flutter analyze/test,
+- Android build,
+- iOS build,
+- backend centralny.
+
+Realny test hostingu, PHP session/WebView, urządzeń i danych produkcyjnych
+jest finalnym acceptance po brandingu — nie zastępujemy go zielonym CI.
