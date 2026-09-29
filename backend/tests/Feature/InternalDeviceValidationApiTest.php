@@ -48,7 +48,8 @@ class InternalDeviceValidationApiTest extends TestCase
 
         $response->assertOk()
             ->assertJsonPath('valid', true)
-            ->assertJsonPath('state', 'active');
+            ->assertJsonPath('state', 'active')
+            ->assertJsonPath('offline_lease_hours', $parish->effectiveOfflineLeaseHours());
     }
 
     public function test_wrong_secret_is_rejected_before_any_device_lookup(): void

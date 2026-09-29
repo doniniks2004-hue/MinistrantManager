@@ -1,0 +1,54 @@
+{
+    "generated_at": "2026-09-28T14:31:09+02:00",
+    "window": {
+        "from": "2026-09-21T00:00:00+02:00",
+        "to": "2026-12-27T23:59:59+01:00"
+    },
+    "user": {
+        "id": 9001,
+        "role_id": 5,
+        "role_name": "Ministrant"
+    },
+    "events": [
+        {
+            "id": "events:5001",
+            "raw_id": 5001,
+            "source": "events",
+            "event_date": "2026-10-04T10:00:00+02:00",
+            "description": "Msza niedzielna A",
+            "module_id": 1,
+            "is_cancelled": false
+        },
+        {
+            "id": "weekday_events:6001",
+            "raw_id": 6001,
+            "source": "weekday_events",
+            "event_date": "2026-10-07T18:00:00+02:00",
+            "description": "Msza w tygodniu",
+            "module_id": null,
+            "is_cancelled": false
+        }
+    ],
+    "schedule": [
+        {
+            "id": "schedule:7001",
+            "raw_id": 7001,
+            "event_id": "events:5001",
+            "event_source": "events",
+            "user_id": 9001,
+            "guest_name": null,
+            "is_present": false,
+            "status": "assigned"
+        },
+        {
+            "id": "weekday_events:6001",
+            "raw_id": 6001,
+            "event_id": "weekday_events:6001",
+            "event_source": "weekday_events",
+            "user_id": 9001,
+            "guest_name": null,
+            "is_present": false,
+            "status": "assigned"
+        }
+    ]
+}

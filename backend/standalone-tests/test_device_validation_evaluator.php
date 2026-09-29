@@ -15,14 +15,17 @@ $active = DeviceValidationEvaluator::evaluate(
     device: ['parish_id' => 42, 'status' => 'active'],
     requestingParishId: 42,
     requestingParishActive: true,
+    offlineLeaseHours: 72,
 );
 assertEquals('active', $active['state'], 'device active, same parish, requesting parish active -> active');
+assertEquals(72, $active['offline_lease_hours'], 'offline_lease_hours is passed through so the parish can cap its own stale-cache fallback against it');
 
 // Device genuinely doesn't exist.
 $notFound = DeviceValidationEvaluator::evaluate(
     device: null,
     requestingParishId: 42,
     requestingParishActive: true,
+    offlineLeaseHours: 72,
 );
 assertEquals('not_found', $notFound['state'], 'no MobileDevice row at all -> not_found');
 
@@ -31,6 +34,7 @@ $revoked = DeviceValidationEvaluator::evaluate(
     device: ['parish_id' => 42, 'status' => 'revoked'],
     requestingParishId: 42,
     requestingParishActive: true,
+    offlineLeaseHours: 72,
 );
 assertEquals('revoked', $revoked['state'], 'device status=revoked, same parish -> revoked');
 
@@ -44,6 +48,7 @@ $mismatch = DeviceValidationEvaluator::evaluate(
     device: ['parish_id' => 99, 'status' => 'active'],
     requestingParishId: 42,
     requestingParishActive: true,
+    offlineLeaseHours: 72,
 );
 assertEquals('parish_mismatch', $mismatch['state'], 'device belongs to parish 99, but parish 42 (authenticated) is asking -> parish_mismatch, NEVER active');
 
@@ -53,6 +58,7 @@ $requesterDisabled = DeviceValidationEvaluator::evaluate(
     device: ['parish_id' => 42, 'status' => 'active'],
     requestingParishId: 42,
     requestingParishActive: false,
+    offlineLeaseHours: 72,
 );
 assertEquals('parish_disabled', $requesterDisabled['state'], 'requesting parish itself disabled -> parish_disabled, even for its own active device');
 
@@ -63,6 +69,7 @@ $disabledAndMismatch = DeviceValidationEvaluator::evaluate(
     device: ['parish_id' => 99, 'status' => 'active'],
     requestingParishId: 42,
     requestingParishActive: false,
+    offlineLeaseHours: 72,
 );
 assertEquals('parish_disabled', $disabledAndMismatch['state'], 'a disabled requesting parish is blocked before any device/parish-match check even runs');
 
@@ -72,6 +79,7 @@ $revokedOwnParish = DeviceValidationEvaluator::evaluate(
     device: ['parish_id' => 7, 'status' => 'revoked'],
     requestingParishId: 7,
     requestingParishActive: true,
+    offlineLeaseHours: 72,
 );
 assertEquals('revoked', $revokedOwnParish['state'], 'revoked device, matching parish, requester active -> revoked (not active)');
 

@@ -63,6 +63,7 @@ class InternalDeviceValidationController extends Controller
             device: $device === null ? null : ['parish_id' => $device->parish_id, 'status' => $device->status],
             requestingParishId: $requestingParish->id,
             requestingParishActive: $requestingParish->isActive(),
+            offlineLeaseHours: $requestingParish->effectiveOfflineLeaseHours(),
         );
 
         return response()->json([
@@ -70,6 +71,7 @@ class InternalDeviceValidationController extends Controller
             'state' => $result['state'],
             'installation_id' => $data['installation_id'],
             'parish_id' => $requestingParish->id,
+            'offline_lease_hours' => $result['offline_lease_hours'],
         ]);
     }
 

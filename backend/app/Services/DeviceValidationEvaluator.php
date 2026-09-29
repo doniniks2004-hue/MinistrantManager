@@ -23,20 +23,29 @@ class DeviceValidationEvaluator
      * @param bool $requestingParishActive whether the CALLING parish
      *   itself is active — a disabled parish shouldn't be able to
      *   validate ANY device, including its own, once disabled.
+     * @param int $offlineLeaseHours the CALLING parish's own
+     *   effectiveOfflineLeaseHours() — review round (follow-up fix):
+     *   returned alongside the state so the parish's own
+     *   DeviceAuthorizationService can cap how long it may keep trusting
+     *   a STALE cached 'active' answer during a central outage, tied to
+     *   the SAME policy that already governs how long the Flutter app
+     *   itself may run offline — never a third, independently-invented
+     *   duration.
      *
-     * @return array{state: string}
+     * @return array{state: string, offline_lease_hours: int}
      */
     public static function evaluate(
         ?array $device,
         int $requestingParishId,
         bool $requestingParishActive,
+        int $offlineLeaseHours,
     ): array {
         if (!$requestingParishActive) {
-            return ['state' => 'parish_disabled'];
+            return ['state' => 'parish_disabled', 'offline_lease_hours' => $offlineLeaseHours];
         }
 
         if ($device === null) {
-            return ['state' => 'not_found'];
+            return ['state' => 'not_found', 'offline_lease_hours' => $offlineLeaseHours];
         }
 
         if ((int) $device['parish_id'] !== $requestingParishId) {
@@ -45,13 +54,13 @@ class DeviceValidationEvaluator
             // done server-side against the authenticated identity (the
             // secret that resolved to $requestingParishId), never
             // against anything the caller merely CLAIMS.
-            return ['state' => 'parish_mismatch'];
+            return ['state' => 'parish_mismatch', 'offline_lease_hours' => $offlineLeaseHours];
         }
 
         if ($device['status'] === 'revoked') {
-            return ['state' => 'revoked'];
+            return ['state' => 'revoked', 'offline_lease_hours' => $offlineLeaseHours];
         }
 
-        return ['state' => 'active'];
+        return ['state' => 'active', 'offline_lease_hours' => $offlineLeaseHours];
     }
 }

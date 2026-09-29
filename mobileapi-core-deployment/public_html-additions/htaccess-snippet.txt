@@ -1,0 +1,14 @@
+# Dodaj do public_html/.htaccess (obok innych reguł routingu API) —
+# wystawia czyste URL-e /api/v1/mobile/* wspierane przez pliki-zaślepki
+# w api/mobile/*.php (każdy z nich woła prawdziwą logikę z
+# mobileapi-core/ParishAdapters/Witosa/, wdrożonej POZA public_html).
+#
+# Snapshot-first, read-only (bez session/exchange — celowo poza
+# zakresem; bez /mobile/sync — stary incremental model, nieużywany).
+#
+# `mobile_handoff.php` NIE potrzebuje reguły — leży bezpośrednio w
+# public/ i jest wołany wprost (public/mobile_handoff.php?ticket=...).
+RewriteRule ^api/v1/mobile/bootstrap$ api/mobile/bootstrap.php [L,QSA]
+RewriteRule ^api/v1/mobile/session/login$ api/mobile/session_login.php [L,QSA]
+RewriteRule ^api/v1/mobile/config$ api/mobile/config.php [L,QSA]
+RewriteRule ^api/v1/mobile/webview/handoff$ api/mobile/webview_handoff.php [L,QSA]
