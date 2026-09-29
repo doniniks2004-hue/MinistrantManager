@@ -241,18 +241,17 @@ function webview_module_registry(): array
             'icon' => 'check', 'order' => 342, 'required_role' => $adminOrPriest, 'section' => 'config',
         ],
 
-        // Brak jawnej ochrony roli w pierwszych liniach pliku, ale
-        // funkcjonalnie sparowane z odpowiednikiem, który JEST
-        // admin-only (manual-meeting.php, senior-managers vide sidebar
-        // "Starszy Ministrant") — konserwatywnie traktowane jako
-        // wymagające roli administracyjnej/starszego, nie ministranta.
+        // Verified against the current Witosa legacy source:
+        // both manual-swap.php and senior-managers.php explicitly allow
+        // only Admin/Ksiądz (roles 1/2). Keep the handoff registry exactly
+        // aligned with the page-level authorization.
         'manual_swap' => [
             'title' => 'Ręczna zamiana', 'path' => '/public/manual-swap.php',
             'icon' => 'swap', 'order' => 343, 'required_role' => $adminOrPriest, 'section' => 'config',
         ],
         'senior_managers' => [
             'title' => 'Starsi ministranci — zarządzanie', 'path' => '/public/senior-managers.php',
-            'icon' => 'users-cog', 'order' => 344, 'required_role' => $adminOrPriestOrSenior, 'section' => 'config',
+            'icon' => 'users-cog', 'order' => 344, 'required_role' => $adminOrPriest, 'section' => 'config',
         ],
 
         // Statyczne strony publiczne — dostępne każdemu zalogowanemu,
