@@ -18,6 +18,7 @@ akceptacyjnym na realnym urządzeniu.
 | Device-control-plane app.ministrant.eu ↔ parafia | ✅ |
 | Wymuszona pierwsza zmiana hasła | ✅ |
 | Legacy substitutions hardening | ✅ instalator w paczce Witosy |
+| Legacy maintenance/admin hardening | ✅ updater/receiver/fix/reset disabled + settings CSRF |
 | Automatyczny ZIP wdrożeniowy Witosy w CI | ✅ |
 | Android debug build / iOS unsigned build | ✅ |
 
@@ -93,6 +94,7 @@ CI buduje artefakt `witosa-deployment.zip`, zawierający:
 - WebView handoff,
 - flow pierwszej zmiany hasła,
 - konfigurację device-control-plane,
+- `scripts/apply_legacy_security_hardening.php`,
 - `scripts/apply_substitution_hotfix.php`,
 - preflight/smoke/cleanup,
 - aktualną instrukcję wdrożenia.
