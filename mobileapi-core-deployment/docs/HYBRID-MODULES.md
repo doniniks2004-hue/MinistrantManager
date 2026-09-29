@@ -11,19 +11,21 @@
          |                       |
     NATIVE SCREEN            WEBVIEW (LegacyModuleScreen)
          |                       |
-    /mobile/bootstrap      handoff ticket -> PHP session
+    /mobile/bootstrap      one-time handoff -> PHP session
          |                       |
       SQLite                ONLINE / legacy PHP
          |
       OFFLINE
 ```
 
-Serwer decyduje, co jest `native` a co `webview` — aplikacja nie ma
-zaszytej listy modułów. Nowy moduł PHP po stronie parafii = wpis w
-`build_modules()` (backend) + wpis w `webview_path_allowlist()`, zero
-nowego APK.
+Serwer steruje listą modułów. Typ `webview` może zostać dodany bez nowego
+APK, o ile korzysta z już obsługiwanych ikon i generycznego WebView.
+Typ `native` można reklamować dopiero wtedy, gdy dana wersja Fluttera
+rzeczywiście ma wskazany `screen`.
 
-## Format deskryptora modułu
+## Format deskryptora
+
+Native:
 
 ```json
 {
@@ -39,6 +41,8 @@ nowego APK.
 }
 ```
 
+WebView:
+
 ```json
 {
   "id": "triduum",
@@ -53,75 +57,112 @@ nowego APK.
 }
 ```
 
-`path` jest ZAWSZE względny do `server_url` aktywnego urządzenia —
-nigdy pełny URL. `required_role: null` = widoczne dla każdego
-zalogowanego; `[1, 2]` = tylko te role_id. To jest filtr WYŚWIETLANIA —
-rzeczywiste wymuszanie uprawnień dzieje się po stronie serwera
-(`webview_handoff.php`'s allowlist, `bootstrap.php`'s własne
-filtrowanie po userze), niezależnie od tego, co klient pokazuje.
+`path` zawsze jest ścieżką względną aktywnej parafii, nigdy pełnym URL.
 
-Wsteczna kompatybilność: `capabilities` (stary kontrakt) nadal działa —
-jeśli `/mobile/config` nie zwróci `modules`, `CapabilitiesDashboardAdapter`
-buduje równoważną listę z `capabilities`, w DOKŁADNIE tym samym kształcie.
+## Jedno źródło prawdy dla WebView
 
-## Flow handoff (bez drugiego logowania)
+`webview_module_registry()` w `modules_builder.php` zawiera jednocześnie:
+- id,
+- title,
+- path,
+- icon,
+- order,
+- required_role,
+- opcjonalny warunek włączenia.
+
+Z tego samego rejestru korzystają:
+1. `build_modules()` — co dashboard pokazuje,
+2. `webview_handoff.php` — do jakiej ścieżki i dla jakiej roli wolno
+   wystawić bilet.
+
+Nie ma osobnego allowlistu, który mógłby się rozjechać z dashboardem.
+
+Aktualnie rejestr ma **54 ścieżki WebView** i wszystkie 54 istnieją w
+zweryfikowanym backupie legacy Witosy.
+
+## Flow handoff
 
 ```
-Dashboard -> klik "Triduum"
-  -> POST /mobile/webview/handoff  (Authorization: Bearer mobile_user_token, X-Installation-Id)
-       body: {"path": "/public/triduum.php"}
-       backend: sprawdza path przeciw allowlist, mintuje jednorazowy bilet (64 znaki hex, TTL 60s)
-  -> WebView otwiera: {server_url}/public/mobile_handoff.php?ticket=...
-       backend: konsumuje bilet ATOMOWO (UPDATE ... WHERE used_at IS NULL) — drugi raz ten sam bilet = odmowa
-       ustawia sesję PHP DOKŁADNIE jak normalny login (session_regenerate_id + te same 5 kluczy sesji)
-       redirect 302 do ścieżki ZAPISANEJ przy mincie (nigdy z query stringa requestu)
-  -> użytkownik widzi Triduum, zalogowany, bez formularza
+Dashboard
+  -> POST /api/v1/mobile/webview/handoff
+     Authorization: Bearer <mobile_user_token>
+     X-Installation-Id: <uuid>
+     body: {"path": "/public/triduum.php"}
+
+backend:
+  - waliduje mobile user token,
+  - ponownie respektuje device-control-plane,
+  - sprawdza path w jednym rejestrze,
+  - sprawdza required_role,
+  - mintuje losowy, jednorazowy bilet TTL 60 s
+
+WebView
+  -> /public/mobile_handoff.php?ticket=...
+  - atomowo konsumuje bilet,
+  - ponownie sprawdza active + password_changed,
+  - tworzy zwykłą sesję PHP,
+  - redirectuje wyłącznie do target_path zapisanego przy mincie
 ```
 
-`mobile_user_token` **nigdy** nie trafia do URL, JS, ani WebView — tylko
-jednorazowy bilet, który autoryzuje dokładnie jedno załadowanie strony.
+`mobile_user_token` nigdy nie trafia do URL/JS/WebView.
 
-Zweryfikowane end-to-end lokalnie: mint → konsumpcja → sesja → redirect
-→ dostęp → **drugi raz ten sam bilet poprawnie odrzucony (403)** →
-próba niedozwolonej ścieżki poprawnie odrzucona (400).
+Bilet jest single-use; drugi consume jest odrzucany.
 
-## Bezpieczeństwo WebView (`LegacyModuleScreen`)
+## Bezpieczeństwo WebView w Flutterze
 
-Jeden generyczny komponent dla WSZYSTKICH modułów legacy:
+`LegacyModuleScreen`:
+- wpuszcza tylko HTTPS,
+- wewnątrz WebView pozwala na host aktywnej parafii,
+- inny host otwiera systemowo,
+- nie przyjmuje dowolnego zewnętrznego URL z backendu,
+- obsługuje historię Back,
+- ma stany loading/error/offline,
+- WebView cookies są czyszczone przy logout i zmianie użytkownika.
 
-- HTTPS wyłącznie — każda inna schema (`file://`, `http://`) blokowana
-  na poziomie `NavigationDelegate`.
-- Host allowlisted do **aktywnej parafii** (`Uri.parse(server_url).host`,
-  odczytywane przy każdym otwarciu — nigdy zaszyte na sztywno).
-- Nawigacja do INNEGO hosta (nawet w ramach linku na stronie) —
-  zablokowana wewnątrz WebView, otwierana w systemowej przeglądarce.
-- Android back nawiguje historię WebView, jeśli możliwe; dopiero potem
-  zamyka ekran (`PopScope` + `controller.canGoBack()`).
-- Stany: loading / ready / error (z przyciskiem ponów) / offline
-  (komunikat „Ten moduł wymaga połączenia z internetem", bez próby
-  pseudo-offline z cache HTML).
+## Role
 
-## Czyszczenie sesji przy logout/zmianie użytkownika
+`required_role` w deskryptorze jest filtrem UX, ale **nie jest jedyną
+ochroną**. Backend handoff ponownie sprawdza rolę niezależnie od klienta.
 
-`UserSessionService.logout()` i `.login()` (przy wykryciu innego
-`user.id` niż poprzednio zapisany) obie wołają
-`WebViewCookieManager().clearCookies()` — cookie sesji PHP nigdy nie
-przechodzi z Adama na Bartka. Wywołanie owinięte w try/catch (best
-effort) — brak platformy WebView (np. test jednostkowy) nie blokuje
-właściwego czyszczenia SQLite, które jest tym, co faktycznie chroni
-dane.
+Zweryfikowane przykłady:
+- Ministrant → zwykły moduł: dozwolone,
+- Ministrant → `users.php`: 403,
+- nieznana ścieżka: 400,
+- `senior-managers.php`: tylko Admin/Ksiądz, zgodnie z realnym legacy.
 
-## Jak dodać nowy moduł legacy BEZ nowego APK
+## Moduły natywne
 
-1. Dodaj ścieżkę do `webview_path_allowlist()` w `modules_builder.php`.
-2. Dodaj wpis do `build_modules()` (id, title, path, ikona, rola).
-3. Gotowe — dashboard pokaże go przy następnym `/mobile/config`, klik
-   otworzy go przez już istniejący handoff + `LegacyModuleScreen`.
+Aktualnie gotowe 7/7:
+- Mój grafik,
+- Ranking,
+- Punkty,
+- Zastępstwa (odczyt; zapis w zabezpieczonym WebView),
+- Obecności,
+- Ogłoszenia,
+- Profil.
 
-Zero zmian po stronie Fluttera, zero nowego builda.
+UI native czyta dane z SQLite. Sync sieciowy zapisuje snapshot do bazy
+lokalnej; ekran nie renderuje danych biznesowych bezpośrednio z odpowiedzi
+HTTP.
 
-## Co zostało do migracji native w przyszłości
+## Jak dodać nowy moduł WebView
 
-Patrz `MODULE-MATRIX.md` — sekcja „Native, ale nie zrobione w tej
-rundzie" (Punkty, Ranking, Zastępstwa-read, Obecności-read) oraz lista
-~25 znalezionych plików PHP jeszcze niewystawionych na dashboard.
+1. Zweryfikuj realny plik PHP i jego page-level authorization.
+2. Dodaj jedną definicję do `webview_module_registry()`.
+3. Ustaw `required_role` zgodnie z realną ochroną strony.
+4. Jeżeli potrzebna jest nowa nazwa ikony, dodaj mapowanie w Android/iOS.
+5. CI + finalnie acceptance.
+
+Nie potrzeba osobnego allowlistu ani nowego `LegacyModuleScreen`.
+
+## Jak dodać nowy moduł native
+
+Native wymaga:
+1. kontraktu backend,
+2. repozytorium/snapshot,
+3. tabel/migracji Drift,
+4. sync mapping,
+5. rzeczywistego Flutter screen,
+6. dopiero wtedy deskryptora `type=native`.
+
+Backend nie może reklamować ekranu native przed jego implementacją.
