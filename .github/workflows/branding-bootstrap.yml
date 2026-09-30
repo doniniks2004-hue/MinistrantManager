@@ -1,0 +1,64 @@
+name: Bootstrap branding
+
+on:
+  push:
+    branches: [branding-bootstrap]
+
+permissions:
+  contents: write
+
+jobs:
+  branding:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: branding-bootstrap
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install image tooling
+        run: python -m pip install --disable-pip-version-check pillow
+
+      - name: Generate branding assets
+        run: python scripts/bootstrap_branding.py
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.3'
+          channel: stable
+
+      - name: Generate Android splash resources
+        working-directory: mobile-android
+        run: |
+          flutter pub get
+          dart run flutter_native_splash:create
+
+      - name: Generate iOS splash resources
+        working-directory: mobile-ios
+        run: |
+          flutter pub get
+          dart run flutter_native_splash:create
+
+      - name: Verify generated assets
+        run: |
+          test -s mobile-android/assets/branding/logo.png
+          test -s mobile-android/assets/branding/app_icon.png
+          test -s mobile-android/assets/branding/splash_logo.png
+          test -s mobile-android/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+          test -s mobile-ios/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-1024x1024@1x.png
+          test -s mobile-ios/assets/branding/splash_logo.png
+
+      - name: Commit generated branding and remove bootstrap payload
+        run: |
+          rm -rf .branding-work branding-bootstrap
+          rm -f scripts/bootstrap_branding.py .github/workflows/branding-bootstrap.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "Apply final Ministrant System branding"
+          git push origin HEAD:branding-bootstrap
