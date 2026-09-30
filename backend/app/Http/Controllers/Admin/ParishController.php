@@ -55,14 +55,29 @@ class ParishController extends Controller
         $data = $request->validate([
             'name' => ['required', 'string', 'max:255'],
             'slug' => ['required', 'string', 'max:100', 'alpha_dash', 'unique:parishes,slug'],
-            'subdomain' => ['required', 'string', 'max:255', 'unique:parishes,subdomain'],
+            'subdomain' => ['required', 'string', 'max:255'],
+        ]);
+
+        $subdomain = $this->normalizeParishHost($data['subdomain']);
+
+        $request->validate([
+            'subdomain' => [
+                function (string $attribute, mixed $value, \Closure $fail) use ($subdomain) {
+                    if (!preg_match('/^(?:[a-z0-9-]+\.)+ministrant\.eu$/', $subdomain)) {
+                        $fail('Podaj host parafii bez protokołu, np. szarlej.ministrant.eu.');
+                    }
+                    if (Parish::where('subdomain', $subdomain)->exists()) {
+                        $fail('Taka subdomena już istnieje.');
+                    }
+                },
+            ],
         ]);
 
         $parish = Parish::create([
             'name' => $data['name'],
             'slug' => $data['slug'],
-            'subdomain' => $data['subdomain'],
-            'server_url' => "https://{$data['subdomain']}",
+            'subdomain' => $subdomain,
+            'server_url' => "https://{$subdomain}",
             'mobile_status' => 'active',
             'mobile_internal_api_secret' => bin2hex(random_bytes(32)),
         ]);
@@ -70,6 +85,14 @@ class ParishController extends Controller
         AuditLogger::log('parish.created', 'Parish', $parish->id, ['slug' => $parish->slug]);
 
         return redirect()->route('admin.parishes.show', $parish)->with('status', 'Parafia została dodana.');
+    }
+
+    private function normalizeParishHost(string $value): string
+    {
+        $value = trim(strtolower($value));
+        $value = preg_replace('#^https?://#', '', $value) ?? $value;
+        $value = preg_replace('#^www\.#', '', $value) ?? $value;
+        return rtrim($value, '/');
     }
 
     public function show(Parish $parish)
