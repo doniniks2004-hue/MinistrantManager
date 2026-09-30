@@ -14,6 +14,29 @@
     </div>
 @endif
 
+@if (session('generated_mobile_secret'))
+    <div class="card" style="border:2px solid #1c2b4a;">
+        <h3>Sekret MobileAPI — zapisz teraz</h3>
+        <p style="color:#666;font-size:13px;">Ten sekret uwierzytelnia serwer tej parafii wobec app.ministrant.eu. Jest pokazany tylko w tej odpowiedzi.</p>
+        <code style="display:block;word-break:break-all;padding:12px;background:#f3f4f6;border-radius:8px;font-size:14px;">{{ session('generated_mobile_secret') }}</code>
+    </div>
+@endif
+
+<div class="card">
+    <h3>Sekret serwerowy MobileAPI</h3>
+    <p style="color:#666;font-size:13px;">
+        Każda parafia ma własny sekret do komunikacji serwer-serwer z app.ministrant.eu.
+        Wygenerowanie nowego sekretu natychmiast unieważnia poprzedni.
+    </p>
+    <form method="POST" action="{{ route('admin.parishes.mobile-secret.rotate', $parish) }}"
+          onsubmit="return confirm('Wygenerować nowy sekret? Poprzedni przestanie działać natychmiast.');">
+        @csrf
+        <button class="btn" type="submit">
+            {{ $parish->mobile_internal_api_secret ? 'Wygeneruj nowy sekret' : 'Wygeneruj sekret' }}
+        </button>
+    </form>
+</div>
+
 <div class="card">
     <h3>Offline lease tej parafii</h3>
     <p style="color:#666;font-size:13px;">
