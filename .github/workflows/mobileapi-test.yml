@@ -39,15 +39,15 @@ jobs:
         working-directory: .
         run: find mobileapi-core-deployment -name "*.php" -print0 | xargs -0 -n1 php -l
 
-      - name: Build Witosa deployment ZIP
+      - name: Build universal parish installer ZIP
         working-directory: .
         run: |
-          rm -f witosa-deployment.zip
+          rm -f universal-parish-installer.zip
           cd mobileapi-core-deployment
-          zip -rq ../witosa-deployment.zip .
+          zip -rq ../universal-parish-installer.zip .
 
       - uses: actions/upload-artifact@v4
         with:
-          name: witosa-deployment
-          path: witosa-deployment.zip
+          name: universal-parish-installer
+          path: universal-parish-installer.zip
           if-no-files-found: error
