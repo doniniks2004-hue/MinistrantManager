@@ -1,57 +1,84 @@
-# mobileapi-core-deployment/
+# Universal Parish Installer
 
-To jest **wersjonowane źródło finalnej paczki wdrożeniowej parafii**.
+Ten katalog jest źródłem **jednego instalatora dla wszystkich parafii**.
+Nie tworzymy osobnego ZIP-a dla każdej parafii.
 
-GitHub Actions:
-1. sprawdza składnię wszystkich plików PHP w tym katalogu,
-2. uruchamia niezależne testy MobileAPI,
-3. buduje z całej zawartości `witosa-deployment.zip`,
-4. publikuje ZIP jako artefakt workflow `MobileAPI tests`.
+GitHub Actions buduje artefakt:
 
-Nie składamy produkcyjnej paczki ręcznie z plików z różnych commitów.
+`universal-parish-installer.zip`
 
-## Zawartość
+## Model skalowania
 
-- `mobileapi-core/` — logika PHP instalowana poza `public_html/`,
-- `public_html-additions/` — pięć stubów API, handoff i config template,
-- `migrations/` — migracje 001–005,
-- `scripts/preflight.php`,
-- `scripts/apply_legacy_security_hardening.php`,
-- `scripts/apply_legacy_web_hardening.php`,
-- `scripts/apply_substitution_hotfix.php`,
-- `scripts/create_test_account.php`,
-- `scripts/cleanup_test_account.php`,
-- `scripts/smoke_test.sh`,
-- `docs/` — runbook, matryca modułów i opis architektury.
+Instalator składa się z:
+- wspólnego silnika `install.php`,
+- wspólnego MobileAPI,
+- profili zgodności w `profiles/`,
+- adapterów legacy w `mobileapi-core/ParishAdapters/`,
+- wspólnych migracji, hardeningu, smoke testów i rollbacku.
 
-## Dlaczego osobny folder od mobileapi/
+Parafia nie ma własnego ZIP-a. Jeżeli dwie parafie używają tego samego
+wariantu legacy, korzystają z tego samego profilu/adaptera.
 
-`mobileapi/` zawiera wcześniejszy, framework-free kontrakt/test harness
-z Iteracji 1. Realne wdrożenie plain-PHP do istniejącej parafii jest
-wersjonowane tutaj, ponieważ musi współpracować z jej istniejącym
-`config/database.php`, sesjami i schematem legacy.
+Pierwszym profilem jest:
+- `Witosa` — audytowany wariant obecnego legacy Ministrant Manager.
 
-## Ważne
+Kolejne warianty dodaje się jako nowy profil/adaptor do TEJ SAMEJ paczki.
 
-- prawdziwe sekrety parafii nie trafiają do repo,
-- Android JKS/hasła nie trafiają do repo,
-- paczka zawiera tylko placeholder config dla
-  `MOBILE_INTERNAL_API_SECRET`,
-- wszystkie instalatory legacy odmawiają nadpisania pliku, jeśli SHA-256 produkcji
-  różni się od audytowanego baseline,
-- finalne uruchomienie na Witosie odbywa się zgodnie z
-  `docs/WITOSA-DEPLOYMENT.md`.
+## Instalacja
 
-## Stan testów
+1. Rozpakuj ZIP do katalogu obok `public_html`, np.
+   `/home/user/mm-installer/`.
+2. Najpierw:
+   ```bash
+   php install.php --dry-run --target=/home/user
+   ```
+3. Jeśli profil został rozpoznany:
+   ```bash
+   php install.php --target=/home/user
+   ```
+4. Instalator poprosi w trybie ukrytym o indywidualny
+   `MOBILE_INTERNAL_API_SECRET` tej parafii.
 
-CI pokrywa:
-- syntax PHP,
-- MobileAPI tests,
-- budowę paczki deploymentowej,
-- Flutter analyze/test,
-- Android build,
-- iOS build,
-- backend centralny.
+Instalator:
+- wykrywa zgodny profil,
+- dla nieznanej instalacji kończy pracę bez zmian,
+- robi backup plików/routingu,
+- instaluje wspólny MobileAPI,
+- zapisuje aktywny adapter,
+- wykonuje preflight,
+- wykonuje migracje 001–005,
+- instaluje metadane adaptera,
+- uruchamia hardening przypisany do profilu,
+- zapisuje manifest rollbacku.
 
-Realny test hostingu, PHP session/WebView, urządzeń i danych produkcyjnych
-jest finalnym acceptance po brandingu — nie zastępujemy go zielonym CI.
+## Rollback
+
+Po poprawnym wdrożeniu instalator wypisuje gotowe polecenie:
+
+```bash
+php rollback.php --backup=/home/user/mm-installer-backups/YYYYMMDD_HHMMSS
+```
+
+Rollback przywraca kod/routing. Migracje bazy są celowo addytywne i nie są
+kasowane automatycznie.
+
+## Bezpieczeństwo
+
+- instalator działa wyłącznie przez CLI,
+- nieznany profil = STOP,
+- brak/niepoprawny sekret = STOP,
+- profile nie obchodzą kontroli SHA-256 wewnątrz hardenerów,
+- sekrety parafii nie trafiają do repo ani ZIP-a,
+- adapter wybierany jest przez plik poza webrootem,
+- publiczne stuby są identyczne dla wszystkich parafii.
+
+## Dodawanie nowego wariantu parafii
+
+Nie kopiuj całej paczki. Dodaj:
+1. `profiles/<wariant>.php` z fingerprintem kompatybilności,
+2. adapter w `mobileapi-core/ParishAdapters/<Wariant>/`,
+3. ewentualne hardenery wersji,
+4. test profilu.
+
+Po merge CI ponownie buduje **ten sam**
+`universal-parish-installer.zip`.
