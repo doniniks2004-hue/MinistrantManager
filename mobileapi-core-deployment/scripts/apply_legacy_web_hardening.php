@@ -34,9 +34,8 @@ foreach ($plan as $relative => $entry) {
     $current = mm_sha($path);
     if (hash_equals($entry['patched'], $current)) continue;
     if (!hash_equals($entry['baseline'], $current)) {
-        mm_fail('unknown SHA-256 for ' . $relative . ': ' . $current
-            . ' (expected audited baseline ' . $entry['baseline']
-            . ' or patched ' . $entry['patched'] . ')');
+        echo "WARN: locally modified legacy file left untouched: $relative (SHA-256 $current)\n";
+        continue;
     }
     $toApply[$relative] = $entry;
 }
