@@ -9,8 +9,12 @@
     <div class="card" style="border:2px solid #1c2b4a;">
         <h3>Nowy kod aktywacyjny</h3>
         <p>Kod: <strong style="font-size:22px;letter-spacing:2px;">{{ $gc['display_code'] }}</strong></p>
-        <div>{!! $gc['qr_svg'] !!}</div>
-        <p style="color:#666;font-size:12px;">{{ $gc['qr_url'] }}</p>
+        @if (!empty($gc['qr_svg']))
+            <div>{!! $gc['qr_svg'] !!}</div>
+        @elseif (!empty($gc['qr_error']))
+            <p style="color:#a65f00;font-size:13px;">{{ $gc['qr_error'] }}</p>
+        @endif
+        <p style="color:#666;font-size:12px;word-break:break-all;">{{ $gc['qr_url'] }}</p>
     </div>
 @endif
 
