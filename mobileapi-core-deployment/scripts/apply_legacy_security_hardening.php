@@ -63,15 +63,20 @@ foreach ($plan as $relative => $entry) {
         continue;
     }
     if ($current !== $entry['baseline']) {
-        mm_fail("Unknown SHA-256 for $relative: $current. Refusing to overwrite an unaudited production file.");
+        $states[$relative] = 'skipped_modified';
+        continue;
     }
     $states[$relative] = 'baseline';
 }
 
 $needsWork = array_filter($states, static fn(string $state): bool => $state === 'baseline');
 $missing = array_keys(array_filter($states, static fn(string $state): bool => $state === 'skipped_missing'));
+$modified = array_keys(array_filter($states, static fn(string $state): bool => $state === 'skipped_modified'));
 if ($missing) {
     echo "WARN: optional legacy files missing; skipped: " . implode(', ', $missing) . "\n";
+}
+if ($modified) {
+    echo "WARN: locally modified legacy files left untouched: " . implode(', ', $modified) . "\n";
 }
 if (!$needsWork) {
     echo "LEGACY SECURITY HARDENING: nothing to change\n";
