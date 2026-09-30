@@ -15,6 +15,19 @@ function argValue(array $argv, string $name): ?string {
     return null;
 }
 function hasArg(array $argv, string $name): bool { return in_array("--$name", $argv, true); }
+function removeTree(string $path): void {
+    if (is_file($path) || is_link($path)) { @unlink($path); return; }
+    if (!is_dir($path)) return;
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::CHILD_FIRST
+    );
+    foreach ($it as $item) {
+        if ($item->isDir()) @rmdir($item->getPathname());
+        else @unlink($item->getPathname());
+    }
+    @rmdir($path);
+}
 function copyTree(string $src, string $dst): void {
     if (is_file($src)) {
         if (!is_dir(dirname($dst)) && !mkdir(dirname($dst), 0750, true) && !is_dir(dirname($dst))) {
@@ -165,8 +178,45 @@ foreach ($protect as $rel) {
 }
 out("Backup: $backupRoot");
 
-copyTree($packageRoot . '/mobileapi-core', $targetRoot . '/mobileapi-core');
-file_put_contents($targetRoot . '/mobileapi-core/active-profile.php', "<?php\nreturn " . var_export($profile['adapter_dir'], true) . ";\n");
+$GLOBALS['mm_install_complete'] = false;
+register_shutdown_function(static function () use ($targetRoot, $backupRoot, $backupItems, $createdItems): void {
+    if (($GLOBALS['mm_install_complete'] ?? false) === true) return;
+    fwrite(STDERR, "\nINSTALL FAILED — restoring file snapshot automatically...\n");
+    foreach (array_reverse($createdItems) as $rel) removeTree($targetRoot . '/' . $rel);
+    foreach ($backupItems as $rel) {
+        $src = $backupRoot . '/files/' . $rel;
+        $dst = $targetRoot . '/' . $rel;
+        removeTree($dst);
+        copyTree($src, $dst);
+    }
+    fwrite(STDERR, "FILE ROLLBACK OK. Additive DB migrations, if already applied, were intentionally left in place.\n");
+});
+
+// Run profile hardening BEFORE MobileAPI migrations. If the parish has
+// drifted from the audited baseline, the hardener fails closed here and
+// the snapshot above restores any touched file before DB changes begin.
+foreach ($profile['hardeners'] ?? [] as $script) {
+    $src = $packageRoot . '/scripts/' . $script;
+    $dst = $targetRoot . '/' . $script;
+    copy($src, $dst);
+    runPhp($dst);
+}
+
+// Stage the new core first, then swap the directory. Existing public
+// endpoints never observe a half-copied MobileAPI tree.
+$stagedCore = $targetRoot . '/mobileapi-core.__new__';
+removeTree($stagedCore);
+copyTree($packageRoot . '/mobileapi-core', $stagedCore);
+file_put_contents($stagedCore . '/active-profile.php', "<?php\nreturn " . var_export($profile['adapter_dir'], true) . ";\n");
+$oldCore = $targetRoot . '/mobileapi-core.__old__';
+removeTree($oldCore);
+if (is_dir($targetRoot . '/mobileapi-core') && !rename($targetRoot . '/mobileapi-core', $oldCore)) {
+    fail('Cannot stage existing mobileapi-core for atomic swap.');
+}
+if (!rename($stagedCore, $targetRoot . '/mobileapi-core')) {
+    if (is_dir($oldCore)) @rename($oldCore, $targetRoot . '/mobileapi-core');
+    fail('Cannot activate staged mobileapi-core.');
+}
 
 copyTree($packageRoot . '/public_html-additions/api/mobile', $publicRoot . '/api/mobile');
 copyTree($packageRoot . '/public_html-additions/public/mobile_handoff.php', $publicRoot . '/public/mobile_handoff.php');
@@ -194,13 +244,6 @@ foreach (glob($packageRoot . '/migrations/*.sql') ?: [] as $migration) {
 $metaInstaller = $targetRoot . '/mobileapi-core/' . $profile['install_meta'];
 runPhp($metaInstaller);
 
-foreach ($profile['hardeners'] ?? [] as $script) {
-    $src = $packageRoot . '/scripts/' . $script;
-    $dst = $targetRoot . '/' . $script;
-    copy($src, $dst);
-    runPhp($dst);
-}
-
 $manifest = [
     'installer_version' => 1,
     'installed_at' => date(DATE_ATOM),
@@ -210,6 +253,10 @@ $manifest = [
     'created_items' => $createdItems,
 ];
 file_put_contents($backupRoot . '/manifest.json', json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+
+// The old core is no longer needed after every installation step passed.
+removeTree($oldCore);
+$GLOBALS['mm_install_complete'] = true;
 
 out();
 out('INSTALL OK');
