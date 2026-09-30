@@ -36,7 +36,10 @@ foreach ($plan as $relative => $def) {
     $current = shaOrNull($path);
     if ($current === $def['patched']) { $states[$relative] = 'already_patched'; continue; }
     if ($def['baseline'] === null) {
-        if ($current !== null) fail("{$relative}: unexpected existing file; refusing to overwrite it");
+        if ($current !== null) {
+            $states[$relative] = 'skipped_modified';
+            continue;
+        }
         $states[$relative] = 'new'; continue;
     }
     if ($current === null) {
