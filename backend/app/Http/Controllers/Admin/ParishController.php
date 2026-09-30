@@ -64,6 +64,7 @@ class ParishController extends Controller
             'subdomain' => $data['subdomain'],
             'server_url' => "https://{$data['subdomain']}",
             'mobile_status' => 'active',
+            'mobile_internal_api_secret' => bin2hex(random_bytes(32)),
         ]);
 
         AuditLogger::log('parish.created', 'Parish', $parish->id, ['slug' => $parish->slug]);
@@ -101,6 +102,19 @@ class ParishController extends Controller
         return back()->with('status', $data['offline_lease_hours']
             ? "Offline lease dla {$parish->name} ustawiony na {$data['offline_lease_hours']}h."
             : "Offline lease dla {$parish->name} dziedziczy teraz wartość globalną.");
+    }
+
+    public function rotateMobileSecret(Request $request, Parish $parish)
+    {
+        $secret = bin2hex(random_bytes(32));
+        $parish->update(['mobile_internal_api_secret' => $secret]);
+
+        AuditLogger::log('parish.mobile_secret_rotated', 'Parish', $parish->id, [
+            'parish' => $parish->slug,
+        ]);
+
+        return back()->with('generated_mobile_secret', $secret)
+            ->with('status', 'Wygenerowano nowy sekret MobileAPI. Zapisz go teraz — będzie pokazany tylko raz.');
     }
 
     public function generateCode(Request $request, Parish $parish)
