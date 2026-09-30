@@ -3,8 +3,8 @@
     "relation": ["delegate_permission/common.handle_all_urls"],
     "target": {
       "namespace": "android_app",
-      "package_name": "__ANDROID_PACKAGE_NAME__",
-      "sha256_cert_fingerprints": ["__ANDROID_SHA256_FINGERPRINT__"]
+      "package_name": "eu.ministrant.manager",
+      "sha256_cert_fingerprints": ["7B:A4:5D:C9:80:41:DA:E0:BC:96:B2:7B:E1:EB:E2:3F:D5:26:B6:6B:A2:CD:C3:BF:B4:74:C4:68:2E:E7:16:28"]
     }
   }
 ]

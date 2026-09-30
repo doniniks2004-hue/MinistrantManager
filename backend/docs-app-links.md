@@ -1,18 +1,17 @@
 # App Links / Universal Links — spec §35, decision #9
 
-Both files are PLACEHOLDERS (spec decision #9: "Na razie użyjcie
-placeholderów konfiguracyjnych. Nie wpisujcie wymyślonych danych jako
-finalnych."). Neither works until the four real values below replace the
-`__PLACEHOLDER__` tokens:
+Android jest już skonfigurowany finalnymi danymi release:
 
-- `public/.well-known/assetlinks.json` — replace `__ANDROID_PACKAGE_NAME__`
-  (currently `eu.ministrant.manager`, see mobile app README "applicationId")
-  and `__ANDROID_SHA256_FINGERPRINT__` with the SHA-256 fingerprint of the
-  REAL release signing keystore (`keytool -list -v -keystore
-  release.keystore` after that keystore exists — spec decision #9/#10).
-- `public/.well-known/apple-app-site-association` — replace
-  `__APPLE_TEAM_ID__` and `__APPLE_BUNDLE_ID__` once an Apple Developer
-  account and App ID exist.
+- `public/.well-known/assetlinks.json` zawiera package
+  `eu.ministrant.manager` oraz SHA-256 finalnego certyfikatu Android:
+  `7B:A4:5D:C9:80:41:DA:E0:BC:96:B2:7B:E1:EB:E2:3F:D5:26:B6:6B:A2:CD:C3:BF:B4:74:C4:68:2E:E7:16:28`.
+
+iOS pozostaje zależny od Apple Developer:
+
+- `public/.well-known/apple-app-site-association` nadal zawiera
+  `__APPLE_TEAM_ID__` i `__APPLE_BUNDLE_ID__`; Bundle ID jest znany
+  (`eu.ministrant.manager`), ale Team ID musi pochodzić z realnego konta
+  Apple Developer.
 
 Both files MUST be served with `Content-Type: application/json` (Laravel
 serves static files from `public/` as-is; `apple-app-site-association` has
