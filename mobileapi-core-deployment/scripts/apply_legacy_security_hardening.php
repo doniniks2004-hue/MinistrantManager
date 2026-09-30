@@ -71,8 +71,12 @@ foreach ($plan as $relative => $entry) {
 
 $needsWork = array_filter($states, static fn(string $state): bool => $state === 'baseline');
 $missing = array_keys(array_filter($states, static fn(string $state): bool => $state === 'skipped_missing'));
+$modified = array_keys(array_filter($states, static fn(string $state): bool => $state === 'skipped_modified'));
 if ($missing) {
     echo "WARN: optional legacy files missing; skipped: " . implode(', ', $missing) . "\n";
+}
+if ($modified) {
+    echo "WARN: locally modified legacy files left untouched: " . implode(', ', $modified) . "\n";
 }
 if (!$needsWork) {
     echo "LEGACY SECURITY HARDENING: nothing to change\n";
