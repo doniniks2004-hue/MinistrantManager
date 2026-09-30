@@ -18,26 +18,12 @@ npm/PyPI/crates.io/GitHub/Ubuntu archives). Przed pierwszym
 `drift`/`sqlite3`/`hooks.user_defines`, `app_links`, `mobile_scanner`) nadal istnieją i
 czy nie ma nowszych patchy bezpieczeństwa.
 
-## Czego NIE ma w tym archiwum i dlaczego
+## Projekty natywne
 
-Nie dołączono binarnego `gradle-wrapper.jar` ani wygenerowanego projektu
-Xcode (`Runner.xcodeproj/project.pbxproj`) — to pliki generowane
-automatycznie przez `flutter create`, nie pisane ręcznie (jeśli Wasze
-środowisko developerskie ma Flutter SDK, wygenerowanie ich jest
-natychmiastowe i deterministyczne — nie ma sensu ręcznie je odtwarzać).
-
-**Przed pierwszym build (Android LUB iOS — CI robi to automatycznie, patrz
-`.github/workflows/`):**
-
-```bash
-flutter create --org eu.ministrant --project-name ministrant_manager .
-```
-
-Odpowiedz "n" na nadpisanie: `android/app/build.gradle`,
-`android/app/src/main/AndroidManifest.xml`, `ios/Runner/Info.plist`,
-`ios/Runner/Runner.entitlements`, `ios/Podfile` — te already zawierają
-konfigurację specyficzną dla tego projektu (App Links/Universal Links,
-uprawnienia kamery, itd.).
+Pełne projekty Android i iOS są commitowane w repo razem z konfiguracją
+Gradle/Xcode, manifestami, App Links/Universal Links i uprawnieniami.
+Nie uruchamiaj `flutter create` nad tym repo przed buildem — CI buduje
+dokładnie źródła znajdujące się w Git.
 
 ## Instalacja
 
@@ -68,10 +54,10 @@ flutter build ipa --export-options-plist=ios/ExportOptions.plist
 - `.github/workflows/android-build.yml` — zawsze buduje debug APK; buduje podpisany release APK/AAB TYLKO gdy sekrety `ANDROID_KEYSTORE_BASE64`/`ANDROID_KEYSTORE_PASSWORD`/`ANDROID_KEY_PASSWORD`/`ANDROID_KEY_ALIAS` są ustawione w repo
 - `.github/workflows/ios-build.yml` — zawsze buduje unsigned build na symulator (macOS runner); buduje podpisany IPA TYLKO gdy sekrety `APPLE_CERTIFICATE_BASE64`/`APPLE_CERTIFICATE_PASSWORD`/`APPLE_PROVISIONING_PROFILE_BASE64`/`APPLE_TEAM_ID` są ustawione
 
-**Żaden z tych workflow'ów nie został uruchomiony w tym środowisku** — nie ma tu
-Actions runnera. Napisane poprawnie wg dokumentacji `subosito/flutter-action`,
-ale pierwszy prawdziwy przebieg po wypchnięciu do GitHub jest tym, co
-faktycznie to zweryfikuje.
+Workflowy są uruchamiane w GitHub Actions i zostały potwierdzone na
+aktualnym `main`: Backend, MobileAPI, Flutter analyze/test, Android build
+oraz iOS build przechodzą. Dla publikacyjnych buildów podpisanych nadal
+obowiązują sekrety opisane w `docs/RELEASE-READINESS.md`.
 
 ## Struktura
 
