@@ -3,6 +3,19 @@ declare(strict_types=1);
 
 if (PHP_SAPI !== 'cli') { http_response_code(403); exit("CLI only.\n"); }
 function fail(string $s): never { fwrite(STDERR, "ERROR: $s\n"); exit(1); }
+function removeTree(string $path): void {
+    if (is_file($path) || is_link($path)) { @unlink($path); return; }
+    if (!is_dir($path)) return;
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::CHILD_FIRST
+    );
+    foreach ($it as $item) {
+        if ($item->isDir()) @rmdir($item->getPathname());
+        else @unlink($item->getPathname());
+    }
+    @rmdir($path);
+}
 function copyTree(string $src, string $dst): void {
     if (is_file($src)) {
         if (!is_dir(dirname($dst))) mkdir(dirname($dst), 0750, true);
@@ -27,8 +40,7 @@ if (!is_array($manifest) || empty($manifest['target_root'])) fail('Invalid manif
 $target = rtrim($manifest['target_root'], '/');
 
 foreach (array_reverse($manifest['created_items'] ?? []) as $rel) {
-    $path = $target . '/' . $rel;
-    if (is_file($path) || is_link($path)) @unlink($path);
+    removeTree($target . '/' . $rel);
 }
 foreach ($manifest['backup_items'] ?? [] as $rel) {
     $src = $backup . '/files/' . $rel;
