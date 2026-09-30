@@ -54,10 +54,14 @@ foreach ($plan as $relative => $def) {
 }
 
 $missing = array_keys(array_filter($states, fn(string $s): bool => $s === 'skipped_missing'));
+$modified = array_keys(array_filter($states, fn(string $s): bool => $s === 'skipped_modified'));
 if ($missing) {
     echo "WARN: optional substitution files missing; skipped: " . implode(', ', $missing) . "\n";
 }
-$pending = array_filter($states, fn(string $s): bool => !in_array($s, ['already_patched', 'skipped_missing'], true));
+if ($modified) {
+    echo "WARN: locally modified substitution files left untouched: " . implode(', ', $modified) . "\n";
+}
+$pending = array_filter($states, fn(string $s): bool => !in_array($s, ['already_patched', 'skipped_missing', 'skipped_modified'], true));
 if ($pending === []) { echo "SUBSTITUTION HOTFIX OK: nothing to change.\n"; exit(0); }
 
 $backupRoot = __DIR__ . '/backup_substitution_hotfix_' . date('Ymd_His');
