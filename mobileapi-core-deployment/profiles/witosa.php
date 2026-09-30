@@ -5,9 +5,11 @@ return [
     'key' => 'Witosa',
     'label' => 'Legacy Ministrant Manager / Witosa-compatible',
     'adapter_dir' => 'Witosa',
+    // Only files required by MobileAPI itself belong here. Legacy UI
+    // files such as public/settings.php are intentionally NOT required:
+    // some parishes use trimmed/custom builds.
     'required_files' => [
         'config/database.php',
-        'public/settings.php',
     ],
     'required_tables' => [
         'users',
@@ -37,7 +39,10 @@ return [
         'api/accept_substitution.php',
         'public/substitution-security.php',
     ],
-    'hardeners' => [
+    // Legacy hardening is advisory/optional and must never block
+    // installation of the isolated MobileAPI layer.
+    'hardeners' => [],
+    'optional_hardeners' => [
         'apply_legacy_security_hardening.php',
         'apply_legacy_web_hardening.php',
         'apply_substitution_hotfix.php',
