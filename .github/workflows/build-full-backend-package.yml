@@ -35,7 +35,7 @@ jobs:
 
       - name: Install backend packages
         working-directory: laravel-app
-        run: composer require pragmarx/google2fa bacon/bacon-qr-code --no-interaction --no-dev --optimize-autoloader
+        run: composer require pragmarx/google2fa bacon/bacon-qr-code --no-interaction --update-no-dev --optimize-autoloader
 
       - name: Clean build-only files
         run: |
