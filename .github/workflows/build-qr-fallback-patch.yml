@@ -1,0 +1,21 @@
+name: Build QR fallback patch
+on:
+  push:
+    branches: [qr-render-fallback]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package patch
+        run: |
+          mkdir -p patch/laravel/app/Http/Controllers/Admin
+          mkdir -p patch/laravel/resources/views/admin/parishes
+          cp backend/app/Http/Controllers/Admin/ParishController.php patch/laravel/app/Http/Controllers/Admin/
+          cp backend/resources/views/admin/parishes/show.blade.php patch/laravel/resources/views/admin/parishes/
+          cd patch
+          zip -rq ../HOSTIDO-PATCH-ACTIVATION-QR-FALLBACK.zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hostido-qr-fallback-patch
+          path: HOSTIDO-PATCH-ACTIVATION-QR-FALLBACK.zip
