@@ -39,6 +39,10 @@ jobs:
         working-directory: .
         run: find mobileapi-core-deployment -name "*.php" -print0 | xargs -0 -n1 php -l
 
+      - name: Test universal installer structure
+        working-directory: .
+        run: php mobileapi-core-deployment/tests/installer_structure_test.php
+
       - name: Build universal parish installer ZIP
         working-directory: .
         run: |
