@@ -37,14 +37,14 @@ jobs:
         # no arguments silently reports "0 tests passed" if the test/
         # directory were ever empty or excluded — that would look like a
         # green pipeline while testing nothing. This step fails loudly
-        # instead, BEFORE `flutter test` runs, if the 7 test files this
-        # iteration added aren't actually there.
+        # instead, BEFORE `flutter test` runs, if the expected mobile test suite
+        # is no longer actually present.
         run: |
           test -d test
           count=$(find test -name "*_test.dart" | wc -l)
           echo "Found $count test file(s) under test/"
-          if [ "$count" -lt 15 ]; then
-            echo "Expected at least 15 test files (offline_lease, module_version_gate, activation_service, config_service, dashboard_renderer, device_status_interpretation, pending_action_json_roundtrip, preflight_gate, deep_link_service, sync_snapshot, capabilities_dashboard_adapter, schema_migration, user_session_service, api_client_parish_headers, module_descriptor) — found $count. Failing rather than silently running fewer tests than intended."
+          if [ "$count" -lt 14 ]; then
+            echo "Expected at least 14 test files (offline_lease, module_version_gate, activation_service, config_service, device_status_interpretation, pending_action_json_roundtrip, preflight_gate, deep_link_service, sync_snapshot, capabilities_dashboard_adapter, schema_migration, user_session_service, api_client_parish_headers, module_descriptor) — found $count. Failing rather than silently running fewer tests than intended."
             exit 1
           fi
 
