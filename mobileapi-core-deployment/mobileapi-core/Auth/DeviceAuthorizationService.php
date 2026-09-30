@@ -128,25 +128,59 @@ class DeviceAuthorizationService
      */
     private function callCentral(string $installationId): ?array
     {
-        $ch = curl_init($this->centralBaseUrl . '/api/internal/mobile/device/validate');
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => json_encode(['installation_id' => $installationId]),
-            CURLOPT_HTTPHEADER => [
-                'Content-Type: application/json',
-                'Authorization: Bearer ' . $this->parishSecret,
-            ],
-            CURLOPT_TIMEOUT => self::HTTP_TIMEOUT_SECONDS,
-            CURLOPT_CONNECTTIMEOUT => self::HTTP_TIMEOUT_SECONDS,
-        ]);
+        $url = rtrim($this->centralBaseUrl, '/') . '/api/internal/mobile/device/validate';
+        $payload = json_encode(['installation_id' => $installationId], JSON_UNESCAPED_SLASHES);
 
-        $body = curl_exec($ch);
-        $statusCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $curlError = curl_errno($ch);
-        curl_close($ch);
+        $body = false;
+        $statusCode = 0;
 
-        if ($curlError !== 0 || $statusCode !== 200 || $body === false) {
+        // Prefer cURL when available. Shared-hosting PHP profiles do not
+        // always ship ext-curl, so its absence must NOT turn parish login
+        // into HTTP 500.
+        if (function_exists('curl_init')) {
+            $ch = curl_init($url);
+            if ($ch !== false) {
+                curl_setopt_array($ch, [
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_POST => true,
+                    CURLOPT_POSTFIELDS => $payload,
+                    CURLOPT_HTTPHEADER => [
+                        'Content-Type: application/json',
+                        'Authorization: Bearer ' . $this->parishSecret,
+                    ],
+                    CURLOPT_TIMEOUT => self::HTTP_TIMEOUT_SECONDS,
+                    CURLOPT_CONNECTTIMEOUT => self::HTTP_TIMEOUT_SECONDS,
+                ]);
+
+                $body = curl_exec($ch);
+                $statusCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                curl_close($ch);
+            }
+        } elseif ((bool) ini_get('allow_url_fopen')) {
+            $context = stream_context_create([
+                'http' => [
+                    'method' => 'POST',
+                    'header' => "Content-Type: application/json\r\n"
+                        . "Authorization: Bearer {$this->parishSecret}\r\n",
+                    'content' => $payload,
+                    'timeout' => self::HTTP_TIMEOUT_SECONDS,
+                    'ignore_errors' => true,
+                ],
+                'ssl' => [
+                    'verify_peer' => true,
+                    'verify_peer_name' => true,
+                ],
+            ]);
+
+            $body = @file_get_contents($url, false, $context);
+            foreach (($http_response_header ?? []) as $header) {
+                if (preg_match('/^HTTP\/\S+\s+(\d{3})/', $header, $m)) {
+                    $statusCode = (int) $m[1];
+                }
+            }
+        }
+
+        if ($body === false || $statusCode !== 200) {
             return null;
         }
 
