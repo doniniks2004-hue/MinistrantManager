@@ -163,14 +163,28 @@ class ParishController extends Controller
         // Was flagged in review: only the raw URL was shown before, no
         // actual scannable image. Rendered server-side as inline SVG so no
         // extra JS/client library is needed in the panel.
-        $renderer = new ImageRenderer(new RendererStyle(240), new SvgImageBackEnd());
-        $qrSvg = (new Writer($renderer))->writeString($qrUrl);
+        $qrSvg = null;
+        $qrError = null;
+        try {
+            $renderer = new ImageRenderer(new RendererStyle(240), new SvgImageBackEnd());
+            $qrSvg = (new Writer($renderer))->writeString($qrUrl);
+        } catch (\Throwable $e) {
+            // Some shared-hosting PHP builds miss one of the extensions
+            // used by the SVG backend. Activation code generation must not
+            // fail just because the convenience QR cannot be rendered.
+            $qrError = 'Nie udało się wyrenderować QR na serwerze. Użyj kodu lub linku aktywacyjnego.';
+            \Illuminate\Support\Facades\Log::warning('activation.qr_render_failed', [
+                'parish_id' => $parish->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
 
         return redirect()->route('admin.parishes.show', $parish)
             ->with('generated_code', [
                 'display_code' => $code->display_code,
                 'qr_url' => $qrUrl,
                 'qr_svg' => $qrSvg,
+                'qr_error' => $qrError,
             ]);
     }
 
