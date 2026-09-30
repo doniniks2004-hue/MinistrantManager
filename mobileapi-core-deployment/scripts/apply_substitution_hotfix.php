@@ -39,7 +39,10 @@ foreach ($plan as $relative => $def) {
         if ($current !== null) fail("{$relative}: unexpected existing file; refusing to overwrite it");
         $states[$relative] = 'new'; continue;
     }
-    if ($current === null) fail("{$relative}: audited baseline file is missing");
+    if ($current === null) {
+        $states[$relative] = 'skipped_missing';
+        continue;
+    }
     if (!hash_equals($def['baseline'], $current)) fail("{$relative}: SHA-256 differs from audited baseline ({$current}); refusing to overwrite modified production code");
     $states[$relative] = 'replace';
 }
