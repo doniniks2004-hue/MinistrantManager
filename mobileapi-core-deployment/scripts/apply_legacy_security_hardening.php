@@ -54,7 +54,8 @@ $states = [];
 foreach ($plan as $relative => $entry) {
     $path = $publicRoot . '/' . $relative;
     if (!is_file($path)) {
-        mm_fail("Expected legacy file is missing: $relative");
+        $states[$relative] = 'skipped_missing';
+        continue;
     }
     $current = hash_file('sha256', $path);
     if ($current === $entry['patched']) {
