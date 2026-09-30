@@ -230,7 +230,12 @@ $snippet = file_get_contents($packageRoot . '/public_html-additions/htaccess-sni
 $currentHt = is_file($htaccess) ? (file_get_contents($htaccess) ?: '') : '';
 $marker = '# BEGIN MINISTRANT MANAGER MOBILEAPI';
 if (!str_contains($currentHt, $marker)) {
-    file_put_contents($htaccess, rtrim($currentHt) . "\n\n$marker\n" . trim((string)$snippet) . "\n# END MINISTRANT MANAGER MOBILEAPI\n");
+    // MobileAPI routes MUST be evaluated before any legacy catch-all/front
+    // controller rules already present in the parish .htaccess. Appending
+    // them at the end lets an earlier [L] rule swallow /api/v1/mobile/*
+    // and can surface as an unrelated 500 from the legacy router.
+    $mobileBlock = $marker . "\n" . trim((string)$snippet) . "\n# END MINISTRANT MANAGER MOBILEAPI\n\n";
+    file_put_contents($htaccess, $mobileBlock . ltrim($currentHt));
 }
 
 copy($packageRoot . '/scripts/preflight.php', $targetRoot . '/preflight.php');
