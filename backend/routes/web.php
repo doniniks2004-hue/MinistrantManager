@@ -51,6 +51,7 @@ Route::prefix('admin')->name('admin.')->group(function () {
         Route::post('/parishes', [ParishController::class, 'store'])->name('parishes.store');
         Route::get('/parishes/{parish}', [ParishController::class, 'show'])->name('parishes.show');
         Route::post('/parishes/{parish}/offline-lease', [ParishController::class, 'updateOfflineLease'])->name('parishes.offline-lease');
+        Route::post('/parishes/{parish}/mobile-secret', [ParishController::class, 'rotateMobileSecret'])->name('parishes.mobile-secret.rotate');
         Route::post('/parishes/{parish}/codes', [ParishController::class, 'generateCode'])->name('parishes.codes.generate');
         Route::post('/parishes/{parish}/codes/{code}/revoke', [ParishController::class, 'revokeCode'])->name('parishes.codes.revoke');
         Route::post('/parishes/{parish}/disable', [ParishController::class, 'disable'])->name('parishes.disable');
