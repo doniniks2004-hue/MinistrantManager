@@ -1,2 +1,6 @@
 <?php
-require __DIR__ . '/../../../mobileapi-core/ParishAdapters/Witosa/session_change_password.php';
+// Stable universal stub. The installer selects the active parish adapter
+// in mobileapi-core/active-profile.php; this public file never changes
+// between parishes or supported legacy versions.
+define('MOBILEAPI_ENDPOINT', 'session_change_password.php');
+require __DIR__ . '/../../../mobileapi-core/ParishAdapters/dispatch.php';
