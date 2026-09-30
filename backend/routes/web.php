@@ -10,6 +10,12 @@ use App\Http\Controllers\Admin\SettingsController;
 use App\Http\Controllers\Public\ActivationLandingController;
 use Illuminate\Support\Facades\Route;
 
+// Laravel's default Authenticate middleware redirects unauthenticated web
+// requests to a route named "login". This app's real login lives at
+// admin.login, so expose a tiny compatibility alias instead of letting
+// unauthenticated /admin requests throw RouteNotFoundException.
+Route::get('/login', fn () => redirect()->route('admin.login'))->name('login');
+
 // Public (no auth) on purpose: this is what a QR scanned with a normal
 // camera app opens in a browser. See ActivationLandingController docblock.
 Route::get('/activate/{token}', [ActivationLandingController::class, 'show'])->name('activate.landing');
