@@ -86,7 +86,7 @@ lib/
   features/
     activation/      — skan QR + kod ręczny + deep link, ekran potwierdzenia
     config/          — ConfigService (fetch+cache client-config globalny ORAZ dashboard config per-parafia)
-    dashboard/       — DashboardRenderer (server-driven UI, bezpieczny fallback dla nieznanych komponentów, blokada po min_app_version)
+    dashboard/       — DashboardScreen (server-driven moduły, native/WebView, role i bezpieczny fallback)
     home/            — ekran główny: baner OFFLINE, tryb konserwacji, wymuszona aktualizacja z linkiem do sklepu, dashboard
     revocation/       — obsługa DEVICE_REVOKED / PARISH_DISABLED (czyszczenie danych)
 ```
@@ -100,20 +100,19 @@ w `pubspec.yaml` — patrz `docs/ENCRYPTION.md`) i klucz `PRAGMA key = '...'` po
 losowo (`Random.secure()`, 256-bit), zapisany WYŁĄCZNIE w Keystore/Keychain.
 Baza nie otwiera się bez tego klucza.
 
-## Co zostało celowo zostawione jako punkt integracji (Iteracja 2)
+## Stan integracji modułów
 
-- Prawdziwe ekrany biznesowe (grafik, obecności, punktacja, ranking,
-  ogłoszenia, zastępstwa) renderują się dziś jako kafelki
-  `DashboardRenderer` z ikoną+tytułem z configu — nawigacja do
-  rzeczywistego ekranu każdego modułu (`onTap` w `_ModuleTile`) czeka na
-  prawdziwe dane z Iteracji 2.
-- Mapowanie JSON z `/mobile/bootstrap` i `/mobile/sync` na tabele Drift w
-  `SyncEngine` zakłada konkretny kształt pól (`row['person_name']` itp.) —
-  to musi zostać dostrojone do RZECZYWISTEGO kształtu, jaki zwróci
-  `MinistrantManager-MobileAPI` po podłączeniu prawdziwych repozytoriów.
-- `ConfigController` (w pakiecie MobileAPI) dziś zwraca pusty,
-  poprawny-strukturalnie config — realny per-parafia CMS configu to
-  Iteracja 2/3.
+- Siedem modułów P1 ma natywne ekrany: Mój grafik, Ogłoszenia, Punkty,
+  Ranking, Zastępstwa, Obecności i Profil.
+- `DashboardScreen` nawiguje do ekranów natywnych albo do bezpiecznego
+  WebView zgodnie z konfiguracją serwera; role są filtrowane w UI i
+  niezależnie egzekwowane po stronie serwera.
+- `SyncEngine` zapisuje snapshot i zmiany do Drift/SQLite, a ekrany
+  biznesowe czytają dane lokalnie, dlatego pozostają użyteczne offline
+  w ramach ważnego offline lease.
+- Lista modułów jest server-driven i może zmieniać dostępność/native vs
+  WebView bez wydawania nowej aplikacji, o ile bieżąca wersja klienta
+  obsługuje wskazany ekran/kontrakt.
 
 ## Test obowiązkowy przed oddaniem (spec §37–§45) — status
 
