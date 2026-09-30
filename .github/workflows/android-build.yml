@@ -47,6 +47,8 @@ jobs:
       # hand-verified, not regenerated before every build. CI now only
       # builds what's actually in the repo.
       - run: flutter pub get
+      - name: Generate branded splash screens
+        run: dart run flutter_native_splash:create
       - run: dart run build_runner build --delete-conflicting-outputs
 
       - name: Validate Android signing secret set
