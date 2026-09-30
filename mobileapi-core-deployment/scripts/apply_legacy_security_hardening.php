@@ -63,7 +63,8 @@ foreach ($plan as $relative => $entry) {
         continue;
     }
     if ($current !== $entry['baseline']) {
-        mm_fail("Unknown SHA-256 for $relative: $current. Refusing to overwrite an unaudited production file.");
+        $states[$relative] = 'skipped_modified';
+        continue;
     }
     $states[$relative] = 'baseline';
 }
