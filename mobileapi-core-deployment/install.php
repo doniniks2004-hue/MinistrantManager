@@ -150,6 +150,10 @@ $protect = [
     'public_html/config/mobile_internal_api_secret.php',
     'public_html/.htaccess',
 ];
+foreach ($profile['legacy_backup_files'] ?? [] as $legacyRel) {
+    $protect[] = 'public_html/' . ltrim($legacyRel, '/');
+}
+$protect = array_values(array_unique($protect));
 foreach ($protect as $rel) {
     $src = $targetRoot . '/' . $rel;
     if (file_exists($src)) {
