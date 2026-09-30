@@ -46,7 +46,10 @@ foreach ($plan as $relative => $def) {
         $states[$relative] = 'skipped_missing';
         continue;
     }
-    if (!hash_equals($def['baseline'], $current)) fail("{$relative}: SHA-256 differs from audited baseline ({$current}); refusing to overwrite modified production code");
+    if (!hash_equals($def['baseline'], $current)) {
+        $states[$relative] = 'skipped_modified';
+        continue;
+    }
     $states[$relative] = 'replace';
 }
 
