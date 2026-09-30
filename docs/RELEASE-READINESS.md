@@ -1,6 +1,6 @@
 # RELEASE-READINESS.md
 
-Stan po finalnym domknięciu funkcjonalnym przed brandingiem i testem
+Stan po finalnym domknięciu funkcjonalnym i brandingu, przed testem
 akceptacyjnym na realnym urządzeniu.
 
 ## Gotowe w kodzie
@@ -21,6 +21,7 @@ akceptacyjnym na realnym urządzeniu.
 | Legacy maintenance/admin hardening | ✅ updater/receiver/fix/reset disabled + settings CSRF |
 | Legacy web/session hardening | ✅ same-origin guard + empty.php CSRF + upload hardening |
 | Automatyczny ZIP wdrożeniowy Witosy w CI | ✅ |
+| Branding Android/iOS + splash | ✅ |
 | Android debug build / iOS unsigned build | ✅ |
 
 ## Branding — GOTOWY
@@ -128,14 +129,13 @@ Hotfix zamian jest fail-closed:
 
 ## Co oznacza „gotowe”
 
-**Funkcjonalnie:** po przejściu aktualnego CI i dodaniu brandingu kod jest
-zamknięty do finalnej rundy acceptance/hardening.
+**Funkcjonalnie:** po przejściu aktualnego CI kod i branding są
+zamknięte do finalnej rundy acceptance/hardening.
 
 **Do publikacji sklepów:** dodatkowo wymagane są:
-1. branding,
-2. ustawienie 4 sekretów Androida,
-3. Apple Developer + signing dla iOS,
-4. finalny test realnego urządzenia/Witosy,
-5. upload do Google Play Console / App Store Connect.
+1. ustawienie 4 sekretów Androida,
+2. Apple Developer + signing dla iOS,
+3. finalny test realnego urządzenia/Witosy,
+4. upload do Google Play Console / App Store Connect.
 
 Publikacja do sklepów jest celowo dopiero po pełnym teście akceptacyjnym.
