@@ -47,8 +47,12 @@ foreach ($plan as $relative => $def) {
     $states[$relative] = 'replace';
 }
 
-$pending = array_filter($states, fn(string $s): bool => $s !== 'already_patched');
-if ($pending === []) { echo "SUBSTITUTION HOTFIX OK: already applied.\n"; exit(0); }
+$missing = array_keys(array_filter($states, fn(string $s): bool => $s === 'skipped_missing'));
+if ($missing) {
+    echo "WARN: optional substitution files missing; skipped: " . implode(', ', $missing) . "\n";
+}
+$pending = array_filter($states, fn(string $s): bool => !in_array($s, ['already_patched', 'skipped_missing'], true));
+if ($pending === []) { echo "SUBSTITUTION HOTFIX OK: nothing to change.\n"; exit(0); }
 
 $backupRoot = __DIR__ . '/backup_substitution_hotfix_' . date('Ymd_His');
 if (!mkdir($backupRoot, 0700, true) && !is_dir($backupRoot)) fail('cannot create backup directory');
