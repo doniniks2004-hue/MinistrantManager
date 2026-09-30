@@ -220,6 +220,9 @@ if (!rename($stagedCore, $targetRoot . '/mobileapi-core')) {
 
 copyTree($packageRoot . '/public_html-additions/api/mobile', $publicRoot . '/api/mobile');
 copyTree($packageRoot . '/public_html-additions/public/mobile_handoff.php', $publicRoot . '/public/mobile_handoff.php');
+foreach (glob($packageRoot . '/public_html-additions/mm-mobile-*.php') ?: [] as $proxy) {
+    copy($proxy, $publicRoot . '/' . basename($proxy));
+}
 
 $secretPhp = "<?php\ndefine('MOBILE_CENTRAL_BASE_URL', 'https://app.ministrant.eu');\ndefine('MOBILE_INTERNAL_API_SECRET', " . var_export($secret, true) . ");\n";
 if (file_put_contents($secretPath, $secretPhp) === false) fail('Cannot write parish secret config.');
