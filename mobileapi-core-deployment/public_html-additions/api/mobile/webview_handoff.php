@@ -1,8 +1,6 @@
 <?php
-// public_html/api/mobile/webview_handoff.php
-// Wymaga, żeby folder mobileapi-core/ leżał JEDEN POZIOM NAD public_html/
-// (dokładnie tak samo jak .env już dziś leży poza public_html) — czyli:
-//   /home/<user>/mobileapi-core/...
-//   /home/<user>/public_html/...   <- tu jesteśmy (w api/mobile/)
-// Ścieżka względna — nic tu nie trzeba edytować per-serwer.
-require __DIR__ . '/../../../mobileapi-core/ParishAdapters/Witosa/webview_handoff.php';
+// Stable universal stub. The installer selects the active parish adapter
+// in mobileapi-core/active-profile.php; this public file never changes
+// between parishes or supported legacy versions.
+define('MOBILEAPI_ENDPOINT', 'webview_handoff.php');
+require __DIR__ . '/../../../mobileapi-core/ParishAdapters/dispatch.php';
