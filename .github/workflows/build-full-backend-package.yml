@@ -1,0 +1,51 @@
+name: Build full Hostido backend package
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: package
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, pdo_mysql, sqlite3, zip
+          coverage: none
+
+      - name: Scaffold Laravel 11
+        run: composer create-project laravel/laravel laravel-app "^11.0" --no-interaction --no-install --no-scripts
+
+      - name: Allow install despite advisory policy in current Laravel 11 lock resolution
+        working-directory: laravel-app
+        run: composer config policy.advisories.block false
+
+      - name: Install Laravel dependencies
+        working-directory: laravel-app
+        run: composer install --no-interaction --prefer-dist --no-dev --optimize-autoloader
+
+      - name: Overlay Ministrant Manager backend
+        run: bash package/backend/ci/overlay-package.sh package/backend laravel-app
+
+      - name: Install backend packages
+        working-directory: laravel-app
+        run: composer require pragmarx/google2fa bacon/bacon-qr-code --no-interaction --no-dev --optimize-autoloader
+
+      - name: Clean build-only files
+        run: |
+          rm -rf laravel-app/.git laravel-app/tests laravel-app/.github
+          rm -f laravel-app/.env laravel-app/database/database.sqlite
+          find laravel-app -name '.DS_Store' -delete
+
+      - name: Archive full application
+        run: tar -czf full-laravel-backend.tar.gz -C laravel-app .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: full-laravel-backend
+          path: full-laravel-backend.tar.gz
+          if-no-files-found: error
