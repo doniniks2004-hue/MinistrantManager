@@ -23,21 +23,20 @@ akceptacyjnym na realnym urządzeniu.
 | Automatyczny ZIP wdrożeniowy Witosy w CI | ✅ |
 | Android debug build / iOS unsigned build | ✅ |
 
-## Branding — jedyny brakujący element UI
+## Branding — GOTOWY
 
-Czekamy na prawdziwe materiały marki:
-- logo Ministrant Manager (preferowane SVG lub duży PNG z przezroczystym tłem),
-- kwadratowy symbol/app icon (preferowane SVG/PNG 1024×1024 lub większy).
+Materiały marki zostały dodane:
+- pełne logo Ministrant Manager,
+- symbol/app icon.
 
-Z tych dwóch źródeł generujemy:
-- `logo.png`,
-- `app_icon.png`,
-- `splash_logo.png`,
+W repo są:
+- `assets/branding/logo.png`,
+- `assets/branding/app_icon.png`,
+- `assets/branding/splash_logo.png`,
 - komplet mipmap Android,
-- komplet AppIcon iOS,
-- finalny splash przez `flutter_native_splash`.
+- komplet AppIcon iOS.
 
-Do tego czasu w aplikacji nadal może być domyślna ikona Fluttera.
+Workflowy Android/iOS uruchamiają `flutter_native_splash:create` przed buildem, więc finalny splash jest generowany z aktualnego logo.
 
 ## Android release signing — klucz GOTOWY
 
