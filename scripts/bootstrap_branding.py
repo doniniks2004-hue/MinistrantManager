@@ -6,11 +6,11 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 PAYLOAD = ROOT / "branding-bootstrap"
 
-def decode_parts(group: str, target: Path) -> None:
-    parts = sorted((PAYLOAD / group).glob("*.part"))
-    if not parts:
-        raise RuntimeError(f"Missing branding payload for {group}")
-    raw = base64.b64decode("".join(p.read_text().strip() for p in parts), validate=True)
+def decode_files(paths: list[Path], target: Path) -> None:
+    if not paths or not all(p.exists() for p in paths):
+        raise RuntimeError(f"Missing branding payload for {target.name}")
+    text = "".join(p.read_text().strip() for p in paths)
+    raw = base64.b64decode(text, validate=True)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(raw)
 
@@ -18,8 +18,16 @@ work = ROOT / ".branding-work"
 work.mkdir(exist_ok=True)
 icon_src = work / "app_icon.png"
 logo_src = work / "logo.png"
-decode_parts("icon", icon_src)
-decode_parts("logo", logo_src)
+
+# Exact icon payload. It is intentionally assembled from small verified chunks.
+decode_files([
+    PAYLOAD / "icon2" / "00.part",
+    PAYLOAD / "icon2" / "01.part",
+    PAYLOAD / "icon" / "01.part",
+    PAYLOAD / "icon2" / "04.part",
+    PAYLOAD / "icon2" / "05.part",
+], icon_src)
+decode_files(sorted((PAYLOAD / "logo").glob("*.part")), logo_src)
 
 icon = Image.open(icon_src).convert("RGBA")
 logo = Image.open(logo_src).convert("RGBA")
