@@ -1,6 +1,8 @@
 name: Build full Hostido backend package
 
 on:
+  push:
+    branches: [full-backend-package]
   workflow_dispatch:
 
 jobs:
