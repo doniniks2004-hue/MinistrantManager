@@ -88,24 +88,41 @@ final class LegacyPasswordAuthenticator
     private function isRateLimited(string $ip, string $username): bool
     {
         if (!$this->loginAttemptsTableExists()) {
-            return false; // same graceful degradation as auth.php: table optional
+            return false;
         }
 
-        // Review round fix: was `COUNT(*)` over ALL attempts, successful
-        // ones included — several legitimate logins from one office/parish
-        // Wi-Fi IP could rate-limit the next real login for 15 minutes.
-        // Only FAILED attempts count toward the limit now.
         $timeLimit = date('Y-m-d H:i:s', strtotime('-' . self::DECAY_MINUTES . ' minutes'));
-        $stmt = $this->conn->prepare(
-            'SELECT COUNT(*) AS attempts FROM login_attempts
-             WHERE (ip_address = ? OR username = ?) AND was_successful = 0 AND attempt_time > ?'
-        );
+
+        // Legacy parishes are not all on the exact same login_attempts
+        // schema. In particular, older installs may have the table but
+        // no was_successful column. Mobile login must never turn that
+        // harmless schema difference into HTTP 500.
+        if ($this->loginAttemptsHasColumn('was_successful')) {
+            $stmt = @$this->conn->prepare(
+                'SELECT COUNT(*) AS attempts FROM login_attempts
+                 WHERE (ip_address = ? OR username = ?) AND was_successful = 0 AND attempt_time > ?'
+            );
+        } else {
+            $stmt = @$this->conn->prepare(
+                'SELECT COUNT(*) AS attempts FROM login_attempts
+                 WHERE (ip_address = ? OR username = ?) AND attempt_time > ?'
+            );
+        }
+
+        if (!$stmt) {
+            return false;
+        }
+
         $stmt->bind_param('sss', $ip, $username, $timeLimit);
-        $stmt->execute();
-        $attempts = (int) $stmt->get_result()->fetch_assoc()['attempts'];
+        if (!$stmt->execute()) {
+            $stmt->close();
+            return false;
+        }
+
+        $row = $stmt->get_result()->fetch_assoc();
         $stmt->close();
 
-        return $attempts >= self::MAX_FAILED_ATTEMPTS;
+        return (int) ($row['attempts'] ?? 0) >= self::MAX_FAILED_ATTEMPTS;
     }
 
     private function recordAttempt(string $ip, string $username, bool $wasSuccessful): void
@@ -114,13 +131,29 @@ final class LegacyPasswordAuthenticator
             return;
         }
 
-        $successFlag = $wasSuccessful ? 1 : 0;
-        $stmt = $this->conn->prepare(
-            'INSERT INTO login_attempts (ip_address, username, attempt_time, was_successful) VALUES (?, ?, NOW(), ?)'
-        );
-        $stmt->bind_param('ssi', $ip, $username, $successFlag);
-        @$stmt->execute();
-        $stmt->close();
+        if ($this->loginAttemptsHasColumn('was_successful')) {
+            $successFlag = $wasSuccessful ? 1 : 0;
+            $stmt = @$this->conn->prepare(
+                'INSERT INTO login_attempts (ip_address, username, attempt_time, was_successful) VALUES (?, ?, NOW(), ?)'
+            );
+            if ($stmt) {
+                $stmt->bind_param('ssi', $ip, $username, $successFlag);
+                @$stmt->execute();
+                $stmt->close();
+            }
+        } else {
+            // Old schema: preserve the existing columns and do not fail
+            // the actual authentication because the optional audit column
+            // is absent.
+            $stmt = @$this->conn->prepare(
+                'INSERT INTO login_attempts (ip_address, username, attempt_time) VALUES (?, ?, NOW())'
+            );
+            if ($stmt) {
+                $stmt->bind_param('ss', $ip, $username);
+                @$stmt->execute();
+                $stmt->close();
+            }
+        }
 
         if ($wasSuccessful) {
             // Review round addition: a successful login resets this
@@ -135,6 +168,13 @@ final class LegacyPasswordAuthenticator
 
             @$this->conn->query("DELETE FROM login_attempts WHERE attempt_time < DATE_SUB(NOW(), INTERVAL 1 DAY)");
         }
+    }
+
+    private function loginAttemptsHasColumn(string $column): bool
+    {
+        $column = $this->conn->real_escape_string($column);
+        $result = @$this->conn->query("SHOW COLUMNS FROM login_attempts LIKE '$column'");
+        return $result !== false && $result->num_rows > 0;
     }
 
     private function loginAttemptsTableExists(): bool
