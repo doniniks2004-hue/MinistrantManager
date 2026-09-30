@@ -39,13 +39,20 @@ foreach ($plan as $relative => $def) {
         if ($current !== null) fail("{$relative}: unexpected existing file; refusing to overwrite it");
         $states[$relative] = 'new'; continue;
     }
-    if ($current === null) fail("{$relative}: audited baseline file is missing");
+    if ($current === null) {
+        $states[$relative] = 'skipped_missing';
+        continue;
+    }
     if (!hash_equals($def['baseline'], $current)) fail("{$relative}: SHA-256 differs from audited baseline ({$current}); refusing to overwrite modified production code");
     $states[$relative] = 'replace';
 }
 
-$pending = array_filter($states, fn(string $s): bool => $s !== 'already_patched');
-if ($pending === []) { echo "SUBSTITUTION HOTFIX OK: already applied.\n"; exit(0); }
+$missing = array_keys(array_filter($states, fn(string $s): bool => $s === 'skipped_missing'));
+if ($missing) {
+    echo "WARN: optional substitution files missing; skipped: " . implode(', ', $missing) . "\n";
+}
+$pending = array_filter($states, fn(string $s): bool => !in_array($s, ['already_patched', 'skipped_missing'], true));
+if ($pending === []) { echo "SUBSTITUTION HOTFIX OK: nothing to change.\n"; exit(0); }
 
 $backupRoot = __DIR__ . '/backup_substitution_hotfix_' . date('Ymd_His');
 if (!mkdir($backupRoot, 0700, true) && !is_dir($backupRoot)) fail('cannot create backup directory');

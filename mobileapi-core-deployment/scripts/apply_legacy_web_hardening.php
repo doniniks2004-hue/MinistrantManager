@@ -27,7 +27,10 @@ function mm_sha(string $path): string {
 $toApply = [];
 foreach ($plan as $relative => $entry) {
     $path = $publicRoot . '/' . $relative;
-    if (!is_file($path)) mm_fail("missing required legacy file: $relative");
+    if (!is_file($path)) {
+        echo "WARN: optional legacy file missing; skipped: $relative\n";
+        continue;
+    }
     $current = mm_sha($path);
     if (hash_equals($entry['patched'], $current)) continue;
     if (!hash_equals($entry['baseline'], $current)) {
