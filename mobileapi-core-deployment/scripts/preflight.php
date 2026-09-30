@@ -57,6 +57,17 @@ if (!defined('PASSWORD_ARGON2ID')) {
     }
 }
 
+// 4. HTTP client for central device authorization.
+// ext-curl is preferred, but shared-hosting PHP may omit it. In that case
+// the MobileAPI uses the PHP stream fallback, which requires allow_url_fopen.
+if (function_exists('curl_init')) {
+    echo "OK    cURL dostępny dla centralnej autoryzacji urządzenia\n";
+} elseif ((bool) ini_get('allow_url_fopen')) {
+    echo "WARN  ext-curl brak — MobileAPI użyje fallbacku PHP streams\n";
+} else {
+    $errors[] = 'Brak ext-curl oraz allow_url_fopen — parafia nie może wykonać centralnej autoryzacji urządzenia.';
+}
+
 // 4. Kształt mobile_user_tokens, JEŚLI już istnieje.
 $result = $conn->query("SHOW TABLES LIKE 'mobile_user_tokens'");
 if ($result && $result->num_rows > 0) {
