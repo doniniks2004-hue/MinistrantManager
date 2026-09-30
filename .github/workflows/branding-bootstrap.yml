@@ -58,6 +58,8 @@ jobs:
           rm -f scripts/bootstrap_branding.py .github/workflows/branding-bootstrap.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          sed -i 's/[[:space:]]*$//' mobile-android/android/app/src/main/res/values-v31/styles.xml
+          sed -i 's/[[:space:]]*$//' mobile-android/android/app/src/main/res/values-night-v31/styles.xml
           git add -A
           git diff --cached --check
           git commit -m "Apply final Ministrant System branding"
