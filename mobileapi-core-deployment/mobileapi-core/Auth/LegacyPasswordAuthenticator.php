@@ -63,9 +63,27 @@ final class LegacyPasswordAuthenticator
         );
         $stmt->bind_param('s', $username);
         $stmt->execute();
-        $result = $stmt->get_result();
-        $user = $result->fetch_assoc();
+        $id = null;
+        $hash = null;
+        $roleId = null;
+        $fullName = null;
+        $passwordChanged = null;
+        $isActive = null;
+
+        // Avoid mysqli_stmt::get_result(), which depends on mysqlnd and is
+        // not guaranteed on shared-hosting PHP builds.
+        $stmt->bind_result($id, $hash, $roleId, $fullName, $passwordChanged, $isActive);
+        $hasUser = $stmt->fetch();
         $stmt->close();
+
+        $user = $hasUser ? [
+            'id' => $id,
+            'password' => $hash,
+            'role_id' => $roleId,
+            'full_name' => $fullName,
+            'password_changed' => $passwordChanged,
+            'is_active' => $isActive,
+        ] : null;
 
         $hash = $user['password'] ?? $dummyHash;
         $isValid = password_verify($password, $hash);
