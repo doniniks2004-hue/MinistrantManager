@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
@@ -45,8 +46,11 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
         onPageFinished: (url) {
           if (mounted) setState(() => _state = _DashboardLoadState.ready);
           // Capture only the actual dashboard, never a child PHP page.
-          if (widget.isOnline && (url?.contains('/public/dashboard.php') ?? false)) {
-            Future<void>.delayed(const Duration(milliseconds: 700), _captureRenderedSnapshot);
+          if (widget.isOnline) {
+            unawaited(_prefetchPageResources());
+            if (url.contains('/public/dashboard.php')) {
+              Future<void>.delayed(const Duration(milliseconds: 700), _captureRenderedSnapshot);
+            }
           }
         },
         onWebResourceError: (error) {
@@ -77,6 +81,51 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
   }
 
   String? _allowedHost;
+
+  Future<void> _prefetchPageResources() async {
+    try {
+      // Ask the WebView engine to download every same-origin resource
+      // referenced by the currently rendered PHP page. This runs after
+      // first paint and is deliberately fire-and-forget, so opening the
+      // dashboard is never delayed by the offline cache warm-up.
+      const script = r'''
+        (async () => {
+          const urls = new Set();
+          const add = (value) => {
+            if (!value) return;
+            try {
+              const u = new URL(value, location.href);
+              if (u.protocol === 'https:' && u.host === location.host) urls.add(u.href);
+            } catch (_) {}
+          };
+          document.querySelectorAll(
+            'link[href],script[src],img[src],source[src],video[src],audio[src],iframe[src],object[data],input[src]'
+          ).forEach((el) => {
+            add(el.href || el.src || el.data);
+            if (el.srcset) el.srcset.split(',').forEach((x) => add(x.trim().split(/\s+/)[0]));
+          });
+          performance.getEntriesByType('resource').forEach((e) => add(e.name));
+          for (const sheet of Array.from(document.styleSheets)) {
+            try {
+              for (const rule of Array.from(sheet.cssRules)) {
+                const text = rule.cssText || '';
+                for (const match of text.matchAll(/url\\((?:'|")?([^'")]+)(?:'|")?\\)/g)) add(match[1]);
+              }
+            } catch (_) {}
+          }
+
+          const jobs = Array.from(urls).map((url) =>
+            fetch(url, {cache: 'reload', credentials: 'include'}).catch(() => null)
+          );
+          await Promise.allSettled(jobs);
+          return urls.size;
+        })()
+      ''';
+      await _controller.runJavaScriptReturningResult(script);
+    } catch (_) {
+      // Cache warm-up is best-effort and must never break the live page.
+    }
+  }
 
   Future<void> _captureRenderedSnapshot() async {
     try {
