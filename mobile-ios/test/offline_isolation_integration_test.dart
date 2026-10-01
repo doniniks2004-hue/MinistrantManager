@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ministrant_manager/core/database/app_database.dart';
 import 'package:ministrant_manager/core/network/api_client.dart';
+import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
 import 'package:ministrant_manager/core/offline/snapshot_store.dart';
 import 'package:ministrant_manager/core/secure/secure_storage_service.dart';
 import 'package:ministrant_manager/features/auth/user_session_service.dart';
@@ -101,7 +102,7 @@ void main() {
 
   setUp(() async {
     tempRoot = await Directory.systemTemp.createTemp('offline_isolation_test_');
-    snapshotStore = SnapshotStore(rootOverride: tempRoot);
+    snapshotStore = SnapshotStore(encryptor: SnapshotEncryptor(hexKey: 'f' * 64), rootOverride: tempRoot);
   });
 
   tearDown(() async {

@@ -159,4 +159,47 @@ class SecureStorageService {
   /// `getOrCreateDbEncryptionKey()` call (on next activation) generates a
   /// genuinely NEW key, never reuses this one.
   Future<void> deleteDbEncryptionKey() => _storage.delete(key: _kDbEncryptionKey);
+
+  static const _kSnapshotEncryptionKey = 'snapshot_encryption_key';
+
+  /// Offline-architecture milestone, P8.2: the key SnapshotEncryptor uses
+  /// for every offline PHP-page snapshot file — review round: "snapshot
+  /// może zawierać realny panel użytkownika", the same severity class as
+  /// the SQLite database handled by `getOrCreateDbEncryptionKey()` just
+  /// above, whose exact generation approach (32 random bytes via
+  /// `Random.secure()`, hex-encoded) this mirrors precisely rather than
+  /// inventing a second way to do the same thing. Generated once, on
+  /// first use, and never rotated automatically — losing this key means
+  /// every existing snapshot becomes permanently unreadable (which is
+  /// exactly the point: it should be, to anyone without it) and the app
+  /// simply falls back to treating every page as having no cached
+  /// snapshot (SnapshotStore/LocalSnapshotServer never crash on a
+  /// decryption failure — see their own docs).
+  ///
+  /// Deliberately a SEPARATE key from the database's own — a leak of one
+  /// should never automatically compromise the other, and each follows
+  /// its own, independent lifecycle below.
+  Future<String> getOrCreateSnapshotEncryptionKey() async {
+    final existing = await _storage.read(key: _kSnapshotEncryptionKey);
+    if (existing != null) return existing;
+
+    final random = Random.secure();
+    final bytes = List<int>.generate(32, (_) => random.nextInt(256));
+    final key = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+    await _storage.write(key: _kSnapshotEncryptionKey, value: key);
+    return key;
+  }
+
+  /// Review round P8.2 — crypto-erase on revoke: "REVOKE -> clear
+  /// snapshots -> crypto-erase key", called by RevocationHandler
+  /// alongside `deleteDbEncryptionKey()`. Once this returns, even a
+  /// leftover/backed-up copy of a snapshot file that somehow survived
+  /// SnapshotStore.clearForParish()'s deletion is permanently
+  /// unreadable — the key existed only in this app's own secure storage
+  /// entry, now gone. The next `getOrCreateSnapshotEncryptionKey()` call
+  /// (whenever this device is next activated, for whatever parish)
+  /// generates a genuinely NEW key, never reuses this one — matching
+  /// `deleteDbEncryptionKey()`'s own exact reasoning.
+  Future<void> deleteSnapshotEncryptionKey() => _storage.delete(key: _kSnapshotEncryptionKey);
 }

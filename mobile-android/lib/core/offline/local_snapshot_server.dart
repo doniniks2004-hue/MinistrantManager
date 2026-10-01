@@ -1,6 +1,8 @@
 import 'dart:io';
 import 'package:path/path.dart' as p;
 
+import 'snapshot_encryptor.dart';
+
 /// Offline-architecture milestone, P2. A local-only, read-only static
 /// file HTTP server that the app's WebView loads snapshot pages from
 /// when offline — see the project's own architecture decision:
@@ -40,6 +42,17 @@ import 'package:path/path.dart' as p;
 /// point; this class only controls what the filesystem underneath can
 /// ever answer with.
 class LocalSnapshotServer {
+  LocalSnapshotServer({required this.encryptor});
+
+  /// Offline-architecture milestone, P8.2: every file under
+  /// [rootDirectory] is SnapshotStore-encrypted — this MUST be
+  /// constructed with the exact same key (via SecureStorageService's
+  /// `getOrCreateSnapshotEncryptionKey()`) that SnapshotStore itself
+  /// used to write those files, or every request here will simply fail
+  /// to decrypt (caught by the existing catch-all below, same as any
+  /// other unexpected per-request error — never a crash, just a 500).
+  final SnapshotEncryptor encryptor;
+
   HttpServer? _server;
   Directory? rootDirectory;
 
@@ -99,10 +112,23 @@ class LocalSnapshotServer {
         return;
       }
 
-      final length = await file.length();
+      // Offline-architecture milestone, P8.2: every file under `root` is
+      // SnapshotStore-encrypted (see that class's own `encryptor` field)
+      // — decrypted here, in memory, before a single byte reaches the
+      // WebView. This is why this server reads the WHOLE file up front
+      // rather than streaming it straight from disk the way the P2
+      // version did: there is no way to decrypt an AEAD-sealed payload
+      // incrementally without having all of it (the authentication tag
+      // covers the complete ciphertext). Snapshot pages are HTML/CSS/JS/
+      // images for a legacy admin panel, not multi-gigabyte media, so
+      // buffering one complete file in memory per request is an
+      // acceptable, deliberate trade-off for this specific content.
+      final encryptedBytes = await file.readAsBytes();
+      final decryptedBytes = encryptor.decryptBytes(encryptedBytes);
+
       response.statusCode = HttpStatus.ok;
       response.headers.contentType = _contentTypeFor(file.path);
-      response.headers.contentLength = length;
+      response.headers.contentLength = decryptedBytes.length;
       // Review round: this is a point-in-time snapshot the app manages
       // itself — nothing upstream of this server (the WebView, any
       // platform HTTP cache) should ever serve a stale copy of a page
@@ -114,7 +140,7 @@ class LocalSnapshotServer {
         return;
       }
 
-      await response.addStream(file.openRead());
+      response.add(decryptedBytes);
       await response.close();
     } catch (_) {
       // Never let one bad request (a half-closed socket, a file that

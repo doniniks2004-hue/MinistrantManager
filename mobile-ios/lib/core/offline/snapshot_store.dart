@@ -5,6 +5,7 @@ import 'dart:math';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import 'snapshot_encryptor.dart';
 import 'snapshot_manifest.dart';
 
 /// Offline-architecture milestone, P3. On-disk storage for per-page PHP
@@ -38,9 +39,19 @@ import 'snapshot_manifest.dart';
 class SnapshotStore {
   Directory? _rootOverride;
 
+  /// Offline-architecture milestone, P8.2: review round — "snapshot może
+  /// zawierać realny panel użytkownika", the same severity class as the
+  /// SQLite database. EVERY file this class writes (snapshot.html, each
+  /// asset, manifest.json) is encrypted with this BEFORE it ever touches
+  /// disk, and decrypted again on every read — there is no code path in
+  /// this class that writes or reads plaintext content, by construction
+  /// (required, not optional, specifically so "forgetting" to encrypt
+  /// isn't a possible mistake a future change here could make).
+  final SnapshotEncryptor encryptor;
+
   /// Tests pass a temp directory here instead of the real platform
   /// application-support directory.
-  SnapshotStore({Directory? rootOverride}) : _rootOverride = rootOverride;
+  SnapshotStore({required this.encryptor, Directory? rootOverride}) : _rootOverride = rootOverride;
 
   Future<Directory> _cacheRoot() async {
     final override = _rootOverride;
@@ -84,10 +95,18 @@ class SnapshotStore {
     final file = File(p.join(pageDirectory.path, 'manifest.json'));
     if (!await file.exists()) return null;
     try {
-      final raw = await file.readAsString();
-      final decoded = jsonDecode(raw) as Map<String, dynamic>;
+      final encryptedBytes = await file.readAsBytes();
+      final decryptedBytes = encryptor.decryptBytes(encryptedBytes);
+      final decoded = jsonDecode(utf8.decode(decryptedBytes)) as Map<String, dynamic>;
       return SnapshotManifest.tryFromJson(decoded);
     } catch (_) {
+      // Covers a corrupt/partial manifest (pre-existing reasoning) AND,
+      // new in P8.2, a manifest that fails to DECRYPT at all — e.g. the
+      // encryption key was lost/rotated (review round: losing the key
+      // makes every existing snapshot permanently unreadable, which is
+      // the intended crypto-erase behavior) or the file was tampered
+      // with. Either way: read as "no snapshot here", never crash the
+      // caller.
       return null;
     }
   }
@@ -146,12 +165,14 @@ class SnapshotStore {
 
     await tempDir.create(recursive: true);
     try {
-      await File(p.join(tempDir.path, 'snapshot.html')).writeAsString(html);
+      // Offline-architecture milestone, P8.2: encrypted BEFORE the bytes
+      // ever touch disk — see `encryptor`'s own docblock on this class.
+      await File(p.join(tempDir.path, 'snapshot.html')).writeAsBytes(encryptor.encryptBytes(utf8.encode(html)));
 
       for (final entry in assets.entries) {
         final assetFile = File(p.join(tempDir.path, 'assets', entry.key));
         await assetFile.parent.create(recursive: true);
-        await assetFile.writeAsBytes(entry.value);
+        await assetFile.writeAsBytes(encryptor.encryptBytes(entry.value));
       }
 
       final manifest = SnapshotManifest(
@@ -165,7 +186,11 @@ class SnapshotStore {
       // of the atomic rename below, so that even someone inspecting the
       // temp directory mid-write (which no reader of the REAL path ever
       // can) would see the manifest only once everything else is down.
-      await File(p.join(tempDir.path, 'manifest.json')).writeAsString(jsonEncode(manifest.toJson()));
+      // Encrypted exactly like every other file in this directory — the
+      // manifest's own `path` field is itself real user-navigation data,
+      // not something to leave as the one plaintext file here.
+      final manifestBytes = utf8.encode(jsonEncode(manifest.toJson()));
+      await File(p.join(tempDir.path, 'manifest.json')).writeAsBytes(encryptor.encryptBytes(manifestBytes));
 
       if (await realDir.exists()) {
         final trashDir = Directory(p.join(parentDir.path, '$pageSegment.trash-${_randomSuffix()}'));

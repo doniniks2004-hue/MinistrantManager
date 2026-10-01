@@ -7,7 +7,14 @@ import 'package:ministrant_manager/core/offline/local_snapshot_server.dart';
 import 'package:ministrant_manager/core/offline/offline_page_coordinator.dart';
 import 'package:ministrant_manager/core/offline/page_resource_downloader.dart';
 import 'package:ministrant_manager/core/offline/snapshot_capture_service.dart';
+import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
 import 'package:ministrant_manager/core/offline/snapshot_store.dart';
+
+/// Offline-architecture milestone, P8.2: SnapshotStore/LocalSnapshotServer
+/// now require a SnapshotEncryptor. A fixed, valid 64-character hex test
+/// key, built programmatically (P8.1's own lesson about hand-counted
+/// hex literals).
+final _testEncryptor = SnapshotEncryptor(hexKey: 'c' * 64);
 
 void main() {
   group('ConnectivityProbe', () {
@@ -69,8 +76,8 @@ void main() {
 
     setUp(() async {
       tempRoot = await Directory.systemTemp.createTemp('offline_page_coordinator_test_');
-      store = SnapshotStore(rootOverride: tempRoot);
-      localServer = LocalSnapshotServer();
+      store = SnapshotStore(encryptor: _testEncryptor, rootOverride: tempRoot);
+      localServer = LocalSnapshotServer(encryptor: _testEncryptor);
       captureService = SnapshotCaptureService(downloader: PageResourceDownloader(), store: store);
     });
 
@@ -185,7 +192,9 @@ void main() {
 
       final dir = await store.getPageDirectoryIfReady(parishId: 'witosa', userId: '9001', pagePath: '/public/dashboard.php');
       expect(dir, isNotNull, reason: 'captureInBackground must eventually write a real snapshot even though nothing was awaited at the call site');
-      expect(await File('${dir!.path}/snapshot.html').readAsString(), contains('Freshly rendered'));
+      final encryptedHtml = await File('${dir!.path}/snapshot.html').readAsBytes();
+      final decryptedHtml = utf8.decode(_testEncryptor.decryptBytes(encryptedHtml));
+      expect(decryptedHtml, contains('Freshly rendered'));
     });
   });
 }

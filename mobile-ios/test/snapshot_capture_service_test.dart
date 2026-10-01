@@ -5,7 +5,19 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ministrant_manager/core/offline/local_snapshot_server.dart';
 import 'package:ministrant_manager/core/offline/page_resource_downloader.dart';
 import 'package:ministrant_manager/core/offline/snapshot_capture_service.dart';
+import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
 import 'package:ministrant_manager/core/offline/snapshot_store.dart';
+
+/// Offline-architecture milestone, P8.2: SnapshotStore/LocalSnapshotServer
+/// now require a SnapshotEncryptor. A fixed, valid 64-character hex test
+/// key, built programmatically (P8.1's own lesson about hand-counted
+/// hex literals).
+final _testEncryptor = SnapshotEncryptor(hexKey: 'd' * 64);
+
+Future<String> _readDecryptedString(String path) async {
+  final encryptedBytes = await File(path).readAsBytes();
+  return utf8.decode(_testEncryptor.decryptBytes(encryptedBytes));
+}
 
 /// Offline-architecture milestone, P5. Review round: "dopiero po P5
 /// będziemy mieli pierwszy kompletny łańcuch offline, a nie tylko
@@ -49,7 +61,7 @@ void main() {
     });
 
     tempRoot = await Directory.systemTemp.createTemp('snapshot_capture_service_test_');
-    store = SnapshotStore(rootOverride: tempRoot);
+    store = SnapshotStore(encryptor: _testEncryptor, rootOverride: tempRoot);
     service = SnapshotCaptureService(downloader: PageResourceDownloader(), store: store);
   });
 
@@ -84,9 +96,9 @@ void main() {
       expect(manifest.resources, containsAll(['assets/assets/style.css', 'assets/assets/logo.png']));
 
       final dir = await store.getPageDirectoryIfReady(parishId: 'witosa', userId: '9001', pagePath: '/public/dashboard.php');
-      expect(await File('${dir!.path}/snapshot.html').readAsString(), contains('Dashboard v1'));
-      expect(await File('${dir.path}/assets/assets/style.css').readAsString(), 'body { color: blue; }');
-      expect(await File('${dir.path}/assets/assets/logo.png').readAsString(), 'PNGDATA');
+      expect(await _readDecryptedString('${dir!.path}/snapshot.html'), contains('Dashboard v1'));
+      expect(await _readDecryptedString('${dir.path}/assets/assets/style.css'), 'body { color: blue; }');
+      expect(await _readDecryptedString('${dir.path}/assets/assets/logo.png'), 'PNGDATA');
     });
 
     test(
@@ -107,7 +119,7 @@ void main() {
         );
         expect(pageDir, isNotNull);
 
-        final localServer = LocalSnapshotServer();
+        final localServer = LocalSnapshotServer(encryptor: _testEncryptor);
         final port = await localServer.start();
         localServer.rootDirectory = pageDir;
 
@@ -148,7 +160,7 @@ void main() {
       );
 
       final dir = await store.getPageDirectoryIfReady(parishId: 'witosa', userId: '9001', pagePath: '/public/dashboard.php');
-      expect(await File('${dir!.path}/snapshot.html').readAsString(), contains('Dashboard v2'));
+      expect(await _readDecryptedString('${dir!.path}/snapshot.html'), contains('Dashboard v2'));
       expect(
         await File('${dir.path}/assets/assets/style.css').exists(),
         isFalse,

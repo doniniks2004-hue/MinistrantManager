@@ -1,7 +1,27 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
 import 'package:ministrant_manager/core/offline/snapshot_store.dart';
+
+/// Offline-architecture milestone, P8.2: SnapshotStore now requires a
+/// SnapshotEncryptor — every file it writes is encrypted. A fixed,
+/// valid 64-character hex test key, built programmatically rather than
+/// as a hand-counted literal (P8.1's own lesson: a hand-typed long hex
+/// literal is a real, recurring risk of an off-by-a-couple-characters
+/// mistake in this sandbox).
+final _testEncryptor = SnapshotEncryptor(hexKey: 'a' * 64);
+
+/// This file's tests assert against the exact PLAINTEXT content a real
+/// caller would see — reading the raw (now-encrypted) bytes directly
+/// and decrypting them here is what proves encryption is actually
+/// transparent to a correctly-configured reader, not just "a method got
+/// called somewhere".
+Future<String> _readDecryptedString(String path) async {
+  final encryptedBytes = await File(path).readAsBytes();
+  return utf8.decode(_testEncryptor.decryptBytes(encryptedBytes));
+}
 
 void main() {
   late Directory tempRoot;
@@ -9,7 +29,7 @@ void main() {
 
   setUp(() async {
     tempRoot = await Directory.systemTemp.createTemp('snapshot_store_test_');
-    store = SnapshotStore(rootOverride: tempRoot);
+    store = SnapshotStore(encryptor: _testEncryptor, rootOverride: tempRoot);
   });
 
   tearDown(() async {
@@ -49,8 +69,8 @@ void main() {
         pagePath: '/public/dashboard.php',
       );
       expect(dir, isNotNull);
-      expect(await File('${dir!.path}/snapshot.html').readAsString(), '<html><body>Dashboard</body></html>');
-      expect(await File('${dir.path}/assets/css/style.css').readAsString(), 'body{color:red}');
+      expect(await _readDecryptedString('${dir!.path}/snapshot.html'), '<html><body>Dashboard</body></html>');
+      expect(await _readDecryptedString('${dir.path}/assets/css/style.css'), 'body{color:red}');
 
       final manifest = await store.readManifestFor(parishId: 'witosa', userId: '9001', pagePath: '/public/dashboard.php');
       expect(manifest, isNotNull);
@@ -85,8 +105,8 @@ void main() {
           userId: '9001',
           pagePath: '/public/dashboard.php',
         );
-        expect(await File('${dir!.path}/snapshot.html').readAsString(), '<html>v2</html>');
-        expect(await File('${dir.path}/assets/css/style.css').readAsString(), 'y');
+        expect(await _readDecryptedString('${dir!.path}/snapshot.html'), '<html>v2</html>');
+        expect(await _readDecryptedString('${dir.path}/assets/css/style.css'), 'y');
         expect(
           await File('${dir.path}/assets/css/old-only.css').exists(),
           isFalse,
@@ -202,8 +222,8 @@ void main() {
       final scheduleDir =
           await store.getPageDirectoryIfReady(parishId: 'witosa', userId: '9001', pagePath: '/public/schedule.php');
 
-      expect(await File('${dashboardDir!.path}/snapshot.html').readAsString(), '<html>Dashboard</html>');
-      expect(await File('${scheduleDir!.path}/snapshot.html').readAsString(), '<html>Schedule</html>');
+      expect(await _readDecryptedString('${dashboardDir!.path}/snapshot.html'), '<html>Dashboard</html>');
+      expect(await _readDecryptedString('${scheduleDir!.path}/snapshot.html'), '<html>Schedule</html>');
       expect(dashboardDir.path, isNot(scheduleDir.path));
     });
 
