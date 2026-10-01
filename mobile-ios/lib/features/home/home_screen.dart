@@ -338,6 +338,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       lastSyncAt: _lastSyncAt,
       onSync: _bootstrapThenSync,
       onLogout: _onLogout,
+      revocationHandler: widget.revocationHandler,
+      // Offline-architecture milestone, P9: a manual "Zmień parafię"
+      // completing is, deliberately, handled by the EXACT SAME callback
+      // as a server-reported revocation — both end with the app back at
+      // the activation screen with fresh services, and there is only
+      // ever one correct way to do that rebuild (see main.dart's own
+      // _onRevoked docblock).
+      onParishReset: widget.onRevoked,
     );
   }
 }

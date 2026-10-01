@@ -6,6 +6,7 @@ import '../attendance/attendance_screen.dart';
 import '../points/points_screen.dart';
 import '../profile/profile_screen.dart';
 import '../ranking/ranking_screen.dart';
+import '../revocation/revocation_handler.dart';
 import '../schedule/my_schedule_screen.dart';
 import '../substitutions/substitutions_screen.dart';
 import '../webview/legacy_module_screen.dart';
@@ -32,6 +33,8 @@ class DashboardScreen extends StatelessWidget {
     required this.lastSyncAt,
     required this.onSync,
     required this.onLogout,
+    required this.revocationHandler,
+    required this.onParishReset,
   });
 
   final List<ModuleDescriptor> modules;
@@ -45,6 +48,13 @@ class DashboardScreen extends StatelessWidget {
   final DateTime? lastSyncAt;
   final Future<void> Function() onSync;
   final VoidCallback onLogout;
+
+  /// Offline-architecture milestone, P9 — threaded through to
+  /// ProfileScreen's own "Urządzenie / Parafia" entry point (device/
+  /// parish scope, not an account action — see DeviceSettingsScreen's
+  /// own docblock).
+  final RevocationHandler revocationHandler;
+  final VoidCallback onParishReset;
 
   @override
   Widget build(BuildContext context) {
@@ -177,6 +187,8 @@ class DashboardScreen extends StatelessWidget {
           appVersion: appVersion,
           onSync: onSync,
           onLogout: onLogout,
+          revocationHandler: revocationHandler,
+          onParishReset: onParishReset,
         );
       default:
         // Safety net for any `screen` name an older app build doesn't

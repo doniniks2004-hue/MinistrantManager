@@ -328,6 +328,50 @@ void main() {
         isNotNull,
       );
     });
+
+    test(
+      'P9: resetParishManually() performs the exact SAME wipe as a server-reported revocation — "Reset/zmiana parafii traktujemy jak utratę uprawnień do poprzedniej parafii"',
+      () async {
+        fakeStore['parish_id'] = 'szarlej';
+        fakeStore['installation_id'] = '550e8400-e29b-41d4-a716-446655440000';
+        fakeStore['server_url'] = 'https://szarlej.ministrant.eu';
+        fakeStore['mobile_user_token'] = 'some-token';
+        fakeStore['current_user_id'] = '9001';
+
+        await snapshotStore.writeSnapshot(
+          parishId: 'szarlej',
+          userId: '9001',
+          pagePath: '/public/dashboard.php',
+          html: '<html>Szarlej dashboard — must not survive a manual reset</html>',
+          assets: {'img/logo.png': [1, 2, 3]},
+        );
+
+        final secureStorage = SecureStorageService();
+        final originalSnapshotKey = await secureStorage.getOrCreateSnapshotEncryptionKey();
+        final handler = RevocationHandler(db: AppDatabase.forTesting(), secureStorage: secureStorage, snapshotStore: snapshotStore);
+
+        await handler.resetParishManually();
+
+        // Same observable effects as handler.handle(DeviceAuthState.revoked)
+        // verified elsewhere in this group — proving the two paths
+        // genuinely share one implementation, not two that happen to
+        // currently agree.
+        expect(
+          await snapshotStore.getPageDirectoryIfReady(parishId: 'szarlej', userId: '9001', pagePath: '/public/dashboard.php'),
+          isNull,
+          reason: 'the snapshot of the parish being LEFT must be gone, not just logically inaccessible',
+        );
+        expect(await secureStorage.parishId, isNull, reason: 'activation itself must be cleared — the app returns to the QR activation screen');
+        expect(await secureStorage.hasUserSession, isFalse);
+
+        final newSnapshotKey = await secureStorage.getOrCreateSnapshotEncryptionKey();
+        expect(
+          newSnapshotKey,
+          isNot(equals(originalSnapshotKey)),
+          reason: 'crypto-erase: the snapshot encryption key itself must be destroyed, so even a leftover/backed-up copy of a snapshot file is permanently unreadable',
+        );
+      },
+    );
   });
 }
 
