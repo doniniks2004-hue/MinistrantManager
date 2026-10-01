@@ -229,13 +229,25 @@ $htaccess = $publicRoot . '/.htaccess';
 $snippet = file_get_contents($packageRoot . '/public_html-additions/htaccess-snippet.txt');
 $currentHt = is_file($htaccess) ? (file_get_contents($htaccess) ?: '') : '';
 $marker = '# BEGIN MINISTRANT MANAGER MOBILEAPI';
-if (!str_contains($currentHt, $marker)) {
-    // MobileAPI routes MUST be evaluated before any legacy catch-all/front
-    // controller rules already present in the parish .htaccess. Appending
-    // them at the end lets an earlier [L] rule swallow /api/v1/mobile/*
-    // and can surface as an unrelated 500 from the legacy router.
-    $mobileBlock = $marker . "\n" . trim((string)$snippet) . "\n# END MINISTRANT MANAGER MOBILEAPI\n\n";
-    file_put_contents($htaccess, $mobileBlock . ltrim($currentHt));
+$endMarker = '# END MINISTRANT MANAGER MOBILEAPI';
+
+// Canonicalize the MobileAPI block on every install/update. Legacy parish
+// builds may already contain an older/duplicate block; leaving it in place
+// is unsafe because an earlier legacy API catch-all can swallow /api/v1/mobile/*.
+$blockPattern = '/# BEGIN MINISTRANT MANAGER MOBILEAPI.*?# END MINISTRANT MANAGER MOBILEAPI\s*/s';
+$currentHt = preg_replace($blockPattern, '', $currentHt) ?? $currentHt;
+$mobileBlock = $marker . "\n" . trim((string)$snippet) . "\n" . $endMarker . "\n\n";
+file_put_contents($htaccess, $mobileBlock . ltrim($currentHt));
+
+// Root-level proxies deliberately bypass the legacy ^api/(.*) router.
+foreach ([
+    'mm-mobile-bootstrap.php',
+    'mm-mobile-config.php',
+    'mm-mobile-session-login.php',
+    'mm-mobile-session-change-password.php',
+    'mm-mobile-webview-handoff.php',
+] as $proxy) {
+    copy($packageRoot . '/public_html-additions/' . $proxy, $publicRoot . '/' . $proxy);
 }
 
 copy($packageRoot . '/scripts/preflight.php', $targetRoot . '/preflight.php');
