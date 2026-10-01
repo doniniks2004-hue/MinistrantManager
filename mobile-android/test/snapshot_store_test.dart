@@ -13,7 +13,14 @@ void main() {
   });
 
   tearDown(() async {
-    await tempRoot.delete(recursive: true);
+    // Review round fix (real bug, caught by CI): the clearAll() test
+    // deletes tempRoot itself (it IS the overridden cache root), so by
+    // the time tearDown runs for that test the directory is already
+    // gone — only ignore THAT specific, expected case, never swallow
+    // any other failure here.
+    if (await tempRoot.exists()) {
+      await tempRoot.delete(recursive: true);
+    }
   });
 
   group('SnapshotStore', () {
