@@ -104,7 +104,22 @@ void main() {
     await tester.tap(find.text('Zmień parafię'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('ZMIEŃ PARAFIĘ'));
-    await tester.pumpAndSettle();
+    // Review round fix (real finding, not the earlier database issue --
+    // Dominik's own second-round diagnosis): pumpAndSettle() here would
+    // never return. On a SUCCESSFUL reset, _resetting is deliberately
+    // left true (see DeviceSettingsScreen's own comment: "no further
+    // setState on this widget after this point" -- in the real app,
+    // onParishReset() triggers main.dart to rebuild the whole app down
+    // to the activation screen, UNMOUNTING this widget and its spinner
+    // along with it). This isolated widget test never does that
+    // rebuild, so the indeterminate CircularProgressIndicator the
+    // ListTile shows while _resetting is true keeps animating forever
+    // with nothing to unmount it -- settling never happens, by design,
+    // not by bug. A bounded pump is enough to let the dialog's own
+    // close transition finish and the already-resolved
+    // resetParishManually()/onParishReset() chain's callbacks run.
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
 
     expect(handler.callCount, 1);
     expect(resetCalled, isTrue);
