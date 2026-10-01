@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import '../../core/database/app_database.dart';
 import '../../core/secure/secure_storage_service.dart';
+import '../device_settings/device_settings_screen.dart';
+import '../revocation/revocation_handler.dart';
 
 /// "Moje konto" (hybrid dashboard milestone, review round point 24).
 /// Minimum: name, parish, connection status, last sync, app version,
@@ -14,6 +16,8 @@ class ProfileScreen extends StatefulWidget {
     required this.appVersion,
     required this.onSync,
     required this.onLogout,
+    required this.revocationHandler,
+    required this.onParishReset,
   });
 
   final AppDatabase db;
@@ -21,6 +25,12 @@ class ProfileScreen extends StatefulWidget {
   final String appVersion;
   final Future<void> Function() onSync;
   final VoidCallback onLogout;
+
+  /// Offline-architecture milestone, P9 — device/parish-level, not an
+  /// account action (see DeviceSettingsScreen's own docblock for why
+  /// it's a separate screen reached FROM here rather than living here).
+  final RevocationHandler revocationHandler;
+  final VoidCallback onParishReset;
 
   @override
   State<ProfileScreen> createState() => _ProfileScreenState();
@@ -98,6 +108,27 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 onPressed: _confirmLogout,
                 icon: const Icon(Icons.logout),
                 label: const Text('WYLOGUJ'),
+              ),
+              // Review round P9: a visually separate section — this is
+              // device/parish scope, not an account action, even though
+              // Profile is where a user happens to reach it from (no
+              // broader "Ustawienia" app shell exists yet to hang it off
+              // of instead).
+              const Divider(height: 48),
+              ListTile(
+                leading: const Icon(Icons.phone_android),
+                title: const Text('Urządzenie / Parafia'),
+                subtitle: const Text('Zmień parafię, zarządzaj aktywacją tego urządzenia'),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => DeviceSettingsScreen(
+                      revocationHandler: widget.revocationHandler,
+                      parishSlug: data.parishSlug,
+                      onParishReset: widget.onParishReset,
+                    ),
+                  ),
+                ),
               ),
             ],
           );

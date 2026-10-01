@@ -20,8 +20,11 @@ import '../../core/sync/sync_engine.dart';
 /// longer exists) before the app can be used again. See
 /// main.dart's `_rebuildDatabaseAfterRevocation`.
 ///
-/// This is the ONLY place that permanently deletes local data outside of
-/// a user-initiated "reset activation" — never call this speculatively.
+/// This is the ONLY place that permanently deletes local data — either
+/// reactively via [handle] (a server-reported revoked/disabled state) or
+/// deliberately via [resetParishManually] (review round P9: a user
+/// choosing "Zmień parafię" in settings). Never call either
+/// speculatively; both end with the app back at the activation screen.
 class RevocationHandler {
   RevocationHandler({required this.db, required this.secureStorage, required this.snapshotStore});
 
@@ -45,7 +48,30 @@ class RevocationHandler {
     if (state != DeviceAuthState.revoked && state != DeviceAuthState.parishDisabled) {
       return;
     }
+    await _wipeAndDeactivate();
+  }
 
+  /// Offline-architecture milestone, P9. Review round decision: "Reset/
+  /// zmiana parafii traktujemy jak utratę uprawnień do poprzedniej
+  /// parafii" — a user choosing "Zmień parafię" is, security-wise,
+  /// exactly the same event as the server saying this device is
+  /// revoked: either way, this installation no longer has any business
+  /// holding onto the current parish's data. Calling the SAME private
+  /// sequence [handle] uses (rather than a second, independently
+  /// written copy of it) is what actually guarantees the two paths can
+  /// never drift apart — a future change to the wipe sequence only ever
+  /// needs to happen in one place.
+  ///
+  /// Deliberately a separate PUBLIC method from [handle] rather than
+  /// just exposing a way to call `handle(DeviceAuthState.revoked)` from
+  /// the UI — a manual reset is a genuinely different TRIGGER (a user's
+  /// own choice in a settings screen, with its own confirmation dialog)
+  /// from a server-reported device state, and giving it its own name
+  /// keeps that distinction clear at every call site, including in
+  /// tests.
+  Future<void> resetParishManually() => _wipeAndDeactivate();
+
+  Future<void> _wipeAndDeactivate() async {
     // Read parishId BEFORE clearActivation() below wipes it — same
     // "can't clear something keyed by a value you've already thrown
     // away" ordering concern as everywhere else parishId/userId feeds a
