@@ -58,6 +58,22 @@ dependencies:
   # dependency resolution, same as flutter_native_splash earlier.
   html: ^0.15.4
 
+  # Offline-architecture milestone, P8: AES-GCM encryption at rest for
+  # the offline PHP-page snapshot cache — Dominik's own framing: "może
+  # zawierać realny panel użytkownika", the same severity class as the
+  # SQLite database, which already gets this treatment via
+  # SQLite3MultipleCiphers (a native SQLCipher-style build, not a
+  # general-purpose Dart library — nothing already in this project's
+  # dependencies does arbitrary byte encryption). Chosen for its
+  # explicit, byte-oriented encryptBytes/decryptBytes API (no detour
+  # through String encoding for binary asset content like images/
+  # fonts) and long-standing use across the Flutter ecosystem. VERIFY
+  # AT IMPLEMENTATION TIME (same caveat as every other pinned version
+  # in this file) — no pub.dev access from this sandbox to confirm this
+  # exact version against the live registry; real CI is what confirms
+  # dependency resolution, same as html/flutter_native_splash earlier.
+  encrypt: ^5.0.3
+
   # QR scanning (activation flow)
   mobile_scanner: ^5.1.1
 
