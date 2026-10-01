@@ -181,10 +181,16 @@ final class LegacyPasswordAuthenticator
             // mistyped password before they got it right, say) no longer
             // count toward the limit at all, matching "po prawidłowym
             // logowaniu wyczyść wcześniejsze błędne próby tego użytkownika".
-            $stmt = $this->conn->prepare('DELETE FROM login_attempts WHERE username = ? AND was_successful = 0');
-            $stmt->bind_param('s', $username);
-            @$stmt->execute();
-            $stmt->close();
+            if ($this->loginAttemptsHasColumn('was_successful')) {
+                $stmt = @$this->conn->prepare('DELETE FROM login_attempts WHERE username = ? AND was_successful = 0');
+            } else {
+                $stmt = @$this->conn->prepare('DELETE FROM login_attempts WHERE username = ?');
+            }
+            if ($stmt) {
+                $stmt->bind_param('s', $username);
+                @$stmt->execute();
+                $stmt->close();
+            }
 
             @$this->conn->query("DELETE FROM login_attempts WHERE attempt_time < DATE_SUB(NOW(), INTERVAL 1 DAY)");
         }
