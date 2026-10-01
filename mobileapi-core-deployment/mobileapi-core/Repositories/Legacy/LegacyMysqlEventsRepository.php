@@ -84,8 +84,18 @@ final class LegacyMysqlEventsRepository implements EventsRepositoryInterface
         );
         $stmt->bind_param('ss', $fromStr, $toStr);
         $stmt->execute();
-        $result = $stmt->get_result();
-        while ($row = $result->fetch_assoc()) {
+        $id = null;
+        $eventDate = null;
+        $isCancelled = null;
+        $description = null;
+        $stmt->bind_result($id, $eventDate, $isCancelled, $description);
+        while ($stmt->fetch()) {
+            $row = [
+                'id' => $id,
+                'event_date' => $eventDate,
+                'is_cancelled' => $isCancelled,
+                'description' => $description,
+            ];
             $rows[] = [
                 'id' => 'weekday_events:' . $row['id'],
                 'raw_id' => (int) $row['id'],
