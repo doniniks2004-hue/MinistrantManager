@@ -129,24 +129,88 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
 
   Future<void> _captureRenderedSnapshot() async {
     try {
-      // Freeze the currently rendered PHP surface into one HTML document.
-      // Stylesheet rules are inlined so the offline copy does not depend on
-      // a network request for the PHP site's CSS. Images remain on their
-      // original URLs and can still be served from the WebView resource cache.
+      // Build a genuinely self-contained HTML snapshot. CSS rules are
+      // inlined and same-origin images/fonts referenced by src/srcset/CSS
+      // url() are converted to data: URLs. Offline therefore does not rely
+      // on WebView's HTTP cache or on a live PHP server.
       const script = r'''
-        (() => {
+        (async () => {
           const root = document.documentElement.cloneNode(true);
+          const toDataUrl = async (value) => {
+            try {
+              const u = new URL(value, location.href);
+              if (u.protocol !== 'https:' || u.host !== location.host) return value;
+              const response = await fetch(u.href, {credentials:'include', cache:'reload'});
+              if (!response.ok) return value;
+              const blob = await response.blob();
+              return await new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result);
+                reader.onerror = () => resolve(value);
+                reader.readAsDataURL(blob);
+              });
+            } catch (_) { return value; }
+          };
+
           const styles = [];
           for (const sheet of Array.from(document.styleSheets)) {
             try {
               for (const rule of Array.from(sheet.cssRules)) styles.push(rule.cssText);
             } catch (_) {}
           }
-          root.querySelectorAll('link[rel="stylesheet"]').forEach(el => el.remove());
-          const head = root.querySelector('head') || root;
+
           const style = document.createElement('style');
-          style.textContent = styles.join("\n");
-          head.appendChild(style);
+          let css = styles.join("\n");
+          const cssUrls = [...css.matchAll(/url\\((?:'|")?([^'")]+)(?:'|")?\\)/g)].map(m => m[1]);
+          for (const value of [...new Set(cssUrls)]) {
+            const data = await toDataUrl(value);
+            css = css.split(value).join(data);
+          }
+          style.textContent = css;
+
+          const links = Array.from(root.querySelectorAll('link[rel="stylesheet"]'));
+          for (const link of links) link.remove();
+          (root.querySelector('head') || root).appendChild(style);
+
+          const resourceAttrs = [
+            ['img[src]','src'], ['source[src]','src'], ['video[src]','src'],
+            ['audio[src]','src'], ['iframe[src]','src'], ['input[src]','src'],
+            ['object[data]','data']
+          ];
+          for (const [selector, attr] of resourceAttrs) {
+            for (const el of Array.from(root.querySelectorAll(selector))) {
+              const value = el.getAttribute(attr);
+              if (value) el.setAttribute(attr, await toDataUrl(value));
+            }
+          }
+          for (const script of Array.from(root.querySelectorAll('script[src]'))) {
+            const value = script.getAttribute('src');
+            if (!value) continue;
+            try {
+              const u = new URL(value, location.href);
+              if (u.protocol === 'https:' && u.host === location.host) {
+                const response = await fetch(u.href, {credentials:'include', cache:'reload'});
+                if (response.ok) {
+                  script.removeAttribute('src');
+                  script.textContent = await response.text();
+                }
+              }
+            } catch (_) {}
+          }
+
+          for (const el of Array.from(root.querySelectorAll('[srcset]'))) {
+            const value = el.getAttribute('srcset');
+            if (!value) continue;
+            const parts = value.split(',');
+            const replaced = [];
+            for (const part of parts) {
+              const bits = part.trim().split(/\\s+/);
+              bits[0] = await toDataUrl(bits[0]);
+              replaced.push(bits.join(' '));
+            }
+            el.setAttribute('srcset', replaced.join(', '));
+          }
+
           return root.outerHTML;
         })()
       ''';
@@ -159,8 +223,7 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
         await widget.db.saveWebDashboardSnapshot(html);
       }
     } catch (_) {
-      // Snapshotting is best-effort. A successful online PHP page must
-      // never fail because its offline cache could not be captured.
+      // Snapshotting is best-effort. Live online rendering is never blocked.
     }
   }
 
