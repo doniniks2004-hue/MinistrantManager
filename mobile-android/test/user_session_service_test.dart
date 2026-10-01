@@ -1,11 +1,23 @@
+import 'dart:io';
+
 import 'package:dio/dio.dart';
 import 'package:drift/drift.dart' show Value;
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ministrant_manager/core/database/app_database.dart';
 import 'package:ministrant_manager/core/network/api_client.dart';
+import 'package:ministrant_manager/core/offline/snapshot_store.dart';
 import 'package:ministrant_manager/core/secure/secure_storage_service.dart';
 import 'package:ministrant_manager/features/auth/user_session_service.dart';
+
+/// Offline-architecture milestone, P7: UserSessionService now requires a
+/// SnapshotStore (see that class's own docblock on why — logout/user-
+/// switch must clear the offline page cache too). These tests are about
+/// login/user-switch SQLite-wipe logic specifically, already covered in
+/// detail; offline_isolation_integration_test.dart is where the
+/// SnapshotStore wiring itself is actually verified. A throwaway
+/// temp-dir-backed store here just satisfies the constructor.
+SnapshotStore _throwawaySnapshotStore() => SnapshotStore(rootOverride: Directory.systemTemp.createTempSync('user_session_service_test_'));
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -93,7 +105,7 @@ void main() {
       ));
     }));
 
-    return _TestUserSessionService(api: api, secureStorage: secureStorage, db: db, fakeLoginDio: dio);
+    return _TestUserSessionService(api: api, secureStorage: secureStorage, db: db, snapshotStore: _throwawaySnapshotStore(), fakeLoginDio: dio);
   }
 
   test('logging in as a DIFFERENT user than previously stored wipes user-scoped business data', () async {
@@ -124,6 +136,7 @@ void main() {
       api: service.api,
       secureStorage: service.secureStorage,
       db: db,
+      snapshotStore: _throwawaySnapshotStore(),
       fakeLoginDio: serviceForSecondUser.fakeLoginDio,
     );
 
@@ -183,6 +196,7 @@ void main() {
       api: service.api,
       secureStorage: service.secureStorage,
       db: db,
+      snapshotStore: _throwawaySnapshotStore(),
       fakeLoginDio: buildServiceReturningUser(9002).fakeLoginDio,
     );
     await secondLoginService.login(username: 'bartek', password: 'whatever');
@@ -230,7 +244,7 @@ void main() {
       ));
     }));
 
-    final service = _TestUserSessionService(api: api, secureStorage: secureStorage, db: db, fakeLoginDio: dio);
+    final service = _TestUserSessionService(api: api, secureStorage: secureStorage, db: db, snapshotStore: _throwawaySnapshotStore(), fakeLoginDio: dio);
     final result = await service.login(username: 'adam', password: 'correct-password');
 
     expect(result, isA<UserLoginDeviceNotAuthorized>());
@@ -261,7 +275,7 @@ void main() {
       ));
     }));
 
-    final service = _TestUserSessionService(api: api, secureStorage: secureStorage, db: db, fakeLoginDio: dio);
+    final service = _TestUserSessionService(api: api, secureStorage: secureStorage, db: db, snapshotStore: _throwawaySnapshotStore(), fakeLoginDio: dio);
     final result = await service.login(username: 'adam', password: 'temporary-password');
 
     expect(result, isA<UserLoginPasswordChangeRequired>());
@@ -286,7 +300,7 @@ void main() {
       ));
     }));
 
-    final service = _TestUserSessionService(api: api, secureStorage: secureStorage, db: db, fakeLoginDio: dio);
+    final service = _TestUserSessionService(api: api, secureStorage: secureStorage, db: db, snapshotStore: _throwawaySnapshotStore(), fakeLoginDio: dio);
     final result = await service.login(username: 'adam', password: 'correct-password');
 
     expect(result, isA<UserLoginDeviceNotAuthorized>());
@@ -307,6 +321,7 @@ class _TestUserSessionService extends UserSessionService {
     required super.api,
     required super.secureStorage,
     required super.db,
+    required super.snapshotStore,
     required this.fakeLoginDio,
   });
 

@@ -2,6 +2,7 @@ import 'package:dio/dio.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import '../../core/database/app_database.dart';
 import '../../core/network/api_client.dart';
+import '../../core/offline/snapshot_store.dart';
 import '../../core/secure/secure_storage_service.dart';
 
 /// Outcome of a login attempt — deliberately a closed set the UI switches
@@ -61,11 +62,20 @@ class UserLoginDeviceNotAuthorized extends UserLoginResult {
 /// signed in on this already-activated device" (milestone "Mój grafik",
 /// review round).
 class UserSessionService {
-  UserSessionService({required this.api, required this.secureStorage, required this.db});
+  UserSessionService({required this.api, required this.secureStorage, required this.db, required this.snapshotStore});
 
   final ApiClient api;
   final SecureStorageService secureStorage;
   final AppDatabase db;
+
+  /// Offline-architecture milestone, P7: the SAME security boundary as
+  /// db.wipeUserScopedBusinessData() and WebViewCookieManager's cookie
+  /// clear just below, for the offline PHP-page snapshot cache
+  /// specifically. "Review round, point 3" (this file's own existing
+  /// comment on the SQLite wipe) applies identically here — a snapshot
+  /// is exactly the kind of "previous user's cached ... etc." data that
+  /// comment already describes, just stored as files instead of rows.
+  final SnapshotStore snapshotStore;
 
   Future<UserLoginResult> login({required String username, required String password}) async {
     final installationId = await secureStorage.installationId;
@@ -107,6 +117,7 @@ class UserSessionService {
       if (previousUserId != null && previousUserId != newUserId) {
         await db.wipeUserScopedBusinessData();
         await _clearWebviewCookies();
+        await _clearSnapshotsForUser(previousUserId);
       }
 
       await secureStorage.setUserSession(token: token, userId: newUserId, fullName: fullName, roleId: roleId);
@@ -181,6 +192,7 @@ class UserSessionService {
       if (previousUserId != null && previousUserId != newUserId) {
         await db.wipeUserScopedBusinessData();
         await _clearWebviewCookies();
+        await _clearSnapshotsForUser(previousUserId);
       }
 
       await secureStorage.setUserSession(
@@ -212,10 +224,40 @@ class UserSessionService {
   /// global config, so the app returns straight to the LOGIN screen, never
   /// back to QR activation.
   Future<void> logout() async {
+    // Offline-architecture milestone, P7: read the user_id BEFORE
+    // clearUserSession() wipes it — same ordering concern as every other
+    // "what to clear" question here (can't clear something keyed by a
+    // value you've already thrown away).
+    final userId = await secureStorage.currentUserId;
+
     await secureStorage.clearUserSession();
     api.resetParishClient();
     await db.wipeUserScopedBusinessData();
     await _clearWebviewCookies();
+    if (userId != null) {
+      await _clearSnapshotsForUser(userId);
+    }
+  }
+
+  /// Offline-architecture milestone, P7: review round — "logout ->
+  /// clearForUser" and "zmiana użytkownika -> brak starego snapshotu".
+  /// Shared by logout() and both user-switch blocks above (login() and
+  /// changePassword() can each result in a different human signing in
+  /// than whoever was signed in before). Wrapped defensively, same
+  /// reasoning as _clearWebviewCookies() just below: a filesystem issue
+  /// clearing the offline cache must never abort logout/login itself —
+  /// the device-level checks and the user-scoped SQLite wipe (already
+  /// completed by the time this runs) are what actually matter for
+  /// correctness; this is defense in depth on top of those, not a
+  /// precondition for them succeeding.
+  Future<void> _clearSnapshotsForUser(int userId) async {
+    try {
+      final parishId = await secureStorage.parishId;
+      if (parishId == null) return;
+      await snapshotStore.clearForUser(parishId: parishId, userId: userId.toString());
+    } catch (_) {
+      // Best-effort — see this method's own docblock.
+    }
   }
 
   /// Review round point 19: "Bartek po Adamie nie może odziedziczyć ...

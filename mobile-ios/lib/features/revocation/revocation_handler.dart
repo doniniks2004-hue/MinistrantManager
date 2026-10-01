@@ -1,4 +1,5 @@
 import '../../core/database/app_database.dart';
+import '../../core/offline/snapshot_store.dart';
 import '../../core/secure/secure_storage_service.dart';
 import '../../core/sync/sync_engine.dart';
 
@@ -22,14 +23,44 @@ import '../../core/sync/sync_engine.dart';
 /// This is the ONLY place that permanently deletes local data outside of
 /// a user-initiated "reset activation" — never call this speculatively.
 class RevocationHandler {
-  RevocationHandler({required this.db, required this.secureStorage});
+  RevocationHandler({required this.db, required this.secureStorage, required this.snapshotStore});
 
   final AppDatabase db;
   final SecureStorageService secureStorage;
 
+  /// Offline-architecture milestone, P7: review round — "revoke ->
+  /// clearForParish". Without this, a revoked/disabled parish's cached
+  /// offline PHP pages would simply keep working forever on this device
+  /// — a genuine way to bypass the revocation entirely, since
+  /// OfflinePageCoordinator's offline branch has no idea a parish was
+  /// ever revoked; it only knows "can I reach the server" and "is there
+  /// a snapshot". The snapshot files themselves are, unlike the SQLite
+  /// database handled below, NOT separately encrypted at rest today —
+  /// a real question worth raising with Dominik, not something to
+  /// silently decide in this round, which is scoped to clearing/
+  /// isolation specifically.
+  final SnapshotStore snapshotStore;
+
   Future<void> handle(DeviceAuthState state) async {
     if (state != DeviceAuthState.revoked && state != DeviceAuthState.parishDisabled) {
       return;
+    }
+
+    // Read parishId BEFORE clearActivation() below wipes it — same
+    // "can't clear something keyed by a value you've already thrown
+    // away" ordering concern as everywhere else parishId/userId feeds a
+    // SnapshotStore call. Done first, before anything else in this
+    // sequence, and wrapped defensively: a filesystem issue clearing the
+    // (unencrypted, lower-stakes) offline page cache must never abort
+    // the crypto-erase sequence below, which is what actually matters
+    // most for a revoked device.
+    try {
+      final parishId = await secureStorage.parishId;
+      if (parishId != null) {
+        await snapshotStore.clearForParish(parishId: parishId);
+      }
+    } catch (_) {
+      // Best-effort — see this field's own docblock.
     }
 
     // Order matters: rows first (needs a live connection), then the file
