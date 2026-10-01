@@ -137,10 +137,12 @@ final class LegacyPasswordAuthenticator
             return false;
         }
 
-        $row = $stmt->get_result()->fetch_assoc();
+        $attempts = 0;
+        $stmt->bind_result($attempts);
+        $hasRow = $stmt->fetch();
         $stmt->close();
 
-        return (int) ($row['attempts'] ?? 0) >= self::MAX_FAILED_ATTEMPTS;
+        return $hasRow && (int) $attempts >= self::MAX_FAILED_ATTEMPTS;
     }
 
     private function recordAttempt(string $ip, string $username, bool $wasSuccessful): void
