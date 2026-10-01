@@ -46,6 +46,18 @@ dependencies:
   # Networking
   dio: ^5.4.3
 
+  # Offline-architecture milestone, P4: robust DOM parsing for resource
+  # discovery (CSS/JS/img/font references) in captured legacy PHP pages.
+  # dart-lang org package, long-stable — chosen over regex-based HTML
+  # scraping given this has to work correctly against two meaningfully
+  # different real legacy codebases (Szarlej ~550 lines, Stare
+  # Panewniki ~1800 lines), not just one controlled fixture. ⚠ VERIFY AT
+  # IMPLEMENTATION TIME (same caveat as every other pinned version in
+  # this file) — no pub.dev access from this sandbox to confirm this
+  # exact version against the live registry; real CI is what confirms
+  # dependency resolution, same as flutter_native_splash earlier.
+  html: ^0.15.4
+
   # QR scanning (activation flow)
   mobile_scanner: ^5.1.1
 
