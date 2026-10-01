@@ -83,8 +83,14 @@ final class LegacyMysqlScheduleRepository implements ScheduleRepositoryInterface
         );
         $stmt->bind_param('ss', $fromStr, $toStr);
         $stmt->execute();
-        $result = $stmt->get_result();
-        while ($row = $result->fetch_assoc()) {
+        $id = null;
+        $userId = null;
+        $stmt->bind_result($id, $userId);
+        while ($stmt->fetch()) {
+            $row = [
+                'id' => $id,
+                'user_id' => $userId,
+            ];
             $rows[] = [
                 // This assignment IS the weekday_events row — its own
                 // canonical id and its event_id are the same value,
