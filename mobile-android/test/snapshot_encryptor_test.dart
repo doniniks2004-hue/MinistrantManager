@@ -73,7 +73,14 @@ void main() {
     });
 
     test('decrypting with the WRONG key throws rather than returning garbage', () {
-      const otherKey = 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
+      // Per Dominik's exact diagnosis: the previous hand-typed literal
+      // was 62 characters, not the required 64 -- the constructor
+      // correctly rejected it before this test ever reached the actual
+      // thing it meant to check (decrypting with a DIFFERENT but
+      // VALID-length key). Built programmatically here instead of as a
+      // hand-counted literal, specifically so this exact mistake can't
+      // happen again.
+      final otherKey = 'f' * 64;
       final encryptor = SnapshotEncryptor(hexKey: testKey);
       final wrongKeyEncryptor = SnapshotEncryptor(hexKey: otherKey);
 
