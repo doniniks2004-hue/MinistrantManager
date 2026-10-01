@@ -55,6 +55,7 @@ class MyScheduleEntry {
   SyncMetadata,
   DashboardConfigCache,
   ClientConfigCache,
+  WebDashboardSnapshotCache,
 ])
 class AppDatabase extends _$AppDatabase {
   /// [encryptionKey] MUST come from
@@ -83,7 +84,7 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase.forTestingAtFile(File file) : super(NativeDatabase(file));
 
   @override
-  int get schemaVersion => 5;
+  int get schemaVersion => 6;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -147,6 +148,10 @@ class AppDatabase extends _$AppDatabase {
             await m.deleteTable('attendance');
             await m.createTable(gatheringAttendanceRecords);
           }
+          if (from < 6) {
+            // v5 -> v6: local rendered PHP dashboard snapshot. Pure UI cache.
+            await m.createTable(webDashboardSnapshotCache);
+          }
           //
           // Template for the NEXT migration:
           // if (from < 6) {
@@ -200,6 +205,23 @@ class AppDatabase extends _$AppDatabase {
   Future<ClientConfigCacheData?> getClientConfig() =>
       (select(clientConfigCache)..where((t) => t.id.equals(1))).getSingleOrNull();
 
+  Future<void> saveWebDashboardSnapshot(String html) async {
+    await into(webDashboardSnapshotCache).insertOnConflictUpdate(
+      WebDashboardSnapshotCacheCompanion.insert(
+        id: const Value(1),
+        html: html,
+        capturedAt: DateTime.now().toUtc(),
+      ),
+    );
+  }
+
+  Future<WebDashboardSnapshotCacheData?> getWebDashboardSnapshot() =>
+      (select(webDashboardSnapshotCache)..where((t) => t.id.equals(1))).getSingleOrNull();
+
+  Future<void> clearWebDashboardSnapshot() async {
+    await delete(webDashboardSnapshotCache).go();
+  }
+
   /// Review round (milestone "Mój grafik", point 3): called whenever a
   /// DIFFERENT user signs in on this device than whoever was signed in
   /// before, and on explicit logout — BEFORE the app shows any content to
@@ -223,6 +245,7 @@ class AppDatabase extends _$AppDatabase {
       await delete(announcements).go();
       await delete(substitutionRequests).go();
       await delete(pendingActions).go();
+      await delete(webDashboardSnapshotCache).go();
 
       // Review round fix: `lastSyncAt` describes the USER's snapshot
       // ("when was the data now-being-wiped last fetched") — it must be
