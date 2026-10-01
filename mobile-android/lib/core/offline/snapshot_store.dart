@@ -171,7 +171,15 @@ class SnapshotStore {
         final trashDir = Directory(p.join(parentDir.path, '$pageSegment.trash-${_randomSuffix()}'));
         await realDir.rename(trashDir.path);
         await tempDir.rename(realDir.path);
-        await trashDir.delete(recursive: true).catchError((_) {});
+        try {
+          await trashDir.delete(recursive: true);
+        } catch (_) {
+          // Best-effort cleanup only — see this method's own docblock,
+          // step 4: the trashed old copy is already fully unreferenced
+          // by this point, so failing to remove it never affects
+          // correctness, only leaves an orphaned directory for a future
+          // cache-eviction pass to find.
+        }
       } else {
         await tempDir.rename(realDir.path);
       }
@@ -179,7 +187,13 @@ class SnapshotStore {
       // The real snapshot (if any) was never touched until the rename
       // above, which either fully succeeded or wasn't reached — the
       // only cleanup needed on any failure is the temp directory itself.
-      await tempDir.delete(recursive: true).catchError((_) {});
+      try {
+        await tempDir.delete(recursive: true);
+      } catch (_) {
+        // Best-effort cleanup — the real snapshot was never touched
+        // (see the outer catch's own comment), so a failure to remove
+        // the abandoned temp directory here never affects correctness.
+      }
       rethrow;
     }
   }
