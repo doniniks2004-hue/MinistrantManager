@@ -177,6 +177,20 @@ class PageResourceDownloader {
   Future<String> _rewriteCssUrls(String cssText, Uri baseUrl, {bool recurseIntoImports = false}) async {
     var result = cssText;
 
+    // Review round fix (real bug, caught by CI): the ORIGINAL site's own
+    // paths very commonly start with "/assets/" too (it's about the
+    // most common static-resource folder name there is) — a plain
+    // `rawUrl.startsWith('/assets/')` guard to skip "already rewritten
+    // by the @import pass above" also incorrectly skipped perfectly
+    // legitimate, never-before-touched references that simply happened
+    // to share that prefix (exactly what the fixture's inline <style>
+    // block does: `url('/assets/img/inline-bg.png')`). Tracks the EXACT
+    // replacement strings this method itself just inserted instead of
+    // guessing from a prefix — only a url() whose raw target is
+    // byte-for-byte one of THESE is skipped, never anything merely
+    // similar-looking.
+    final alreadyRewrittenByImportPass = <String>{};
+
     final importMatches = _cssImportPattern.allMatches(cssText).toList();
     for (final match in importMatches.reversed) {
       final rawUrl = _stripQuotes(match.group(1)!.trim());
@@ -187,6 +201,7 @@ class PageResourceDownloader {
       if (recurseIntoImports) {
         await _processCssAsset(key, resolved);
       }
+      alreadyRewrittenByImportPass.add('/assets/$key');
       result = result.replaceRange(match.start, match.end, '@import url(/assets/$key)');
     }
 
@@ -195,7 +210,7 @@ class PageResourceDownloader {
       var rawUrl = match.group(1)!.trim();
       rawUrl = _stripQuotes(rawUrl);
       if (rawUrl.startsWith('data:')) continue; // already self-contained, nothing to fetch
-      if (rawUrl.startsWith('/assets/')) continue; // already rewritten by the @import pass above — never re-process
+      if (alreadyRewrittenByImportPass.contains(rawUrl)) continue;
       final resolved = _resolve(baseUrl, rawUrl);
       if (resolved == null) continue;
       final key = await _fetchAndStore(resolved);
