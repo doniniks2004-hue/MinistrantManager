@@ -59,6 +59,17 @@ class RevocationHandler {
       if (parishId != null) {
         await snapshotStore.clearForParish(parishId: parishId);
       }
+      // Offline-architecture milestone, P8.2 — "REVOKE -> clear
+      // snapshots -> crypto-erase key", the SAME defense-in-depth
+      // reasoning as deleteDbEncryptionKey() just below: even a
+      // leftover/backed-up copy of a snapshot file that somehow
+      // survived clearForParish()'s deletion is permanently unreadable
+      // once the key itself is gone. The key is per-DEVICE, not
+      // per-parish (a device is only ever activated for one parish at a
+      // time), so destroying it on any revocation is always correct —
+      // whatever parish this device is activated for NEXT gets a
+      // genuinely fresh key on first snapshot write.
+      await secureStorage.deleteSnapshotEncryptionKey();
     } catch (_) {
       // Best-effort — see this field's own docblock.
     }

@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ministrant_manager/core/database/app_database.dart';
 import 'package:ministrant_manager/core/network/api_client.dart';
+import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
 import 'package:ministrant_manager/core/offline/snapshot_store.dart';
 import 'package:ministrant_manager/core/secure/secure_storage_service.dart';
 import 'package:ministrant_manager/features/auth/user_session_service.dart';
@@ -17,7 +18,10 @@ import 'package:ministrant_manager/features/auth/user_session_service.dart';
 /// detail; offline_isolation_integration_test.dart is where the
 /// SnapshotStore wiring itself is actually verified. A throwaway
 /// temp-dir-backed store here just satisfies the constructor.
-SnapshotStore _throwawaySnapshotStore() => SnapshotStore(rootOverride: Directory.systemTemp.createTempSync('user_session_service_test_'));
+SnapshotStore _throwawaySnapshotStore() => SnapshotStore(
+      encryptor: SnapshotEncryptor(hexKey: 'e' * 64),
+      rootOverride: Directory.systemTemp.createTempSync('user_session_service_test_'),
+    );
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
