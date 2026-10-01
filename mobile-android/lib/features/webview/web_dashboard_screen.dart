@@ -42,9 +42,12 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setNavigationDelegate(NavigationDelegate(
-        onPageFinished: (_) {
+        onPageFinished: (url) {
           if (mounted) setState(() => _state = _DashboardLoadState.ready);
-          if (widget.isOnline) _captureRenderedSnapshot();
+          // Capture only the actual dashboard, never a child PHP page.
+          if (widget.isOnline && (url?.contains('/public/dashboard.php') ?? false)) {
+            Future<void>.delayed(const Duration(milliseconds: 700), _captureRenderedSnapshot);
+          }
         },
         onWebResourceError: (error) {
           if (mounted) {
