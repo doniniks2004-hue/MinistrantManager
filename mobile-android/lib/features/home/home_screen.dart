@@ -310,6 +310,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return WebDashboardScreen(
       handoffService: _handoffService,
       secureStorage: widget.userSessionService.secureStorage,
+      db: widget.db,
       isOnline: !showOffline,
       lastSyncAt: _lastSyncAt,
     );

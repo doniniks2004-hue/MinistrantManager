@@ -1,6 +1,8 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
+import '../../core/database/app_database.dart';
 import '../../core/secure/secure_storage_service.dart';
 import 'webview_handoff_service.dart';
 
@@ -12,12 +14,14 @@ class WebDashboardScreen extends StatefulWidget {
     super.key,
     required this.handoffService,
     required this.secureStorage,
+    required this.db,
     required this.isOnline,
     this.lastSyncAt,
   });
 
   final WebviewHandoffService handoffService;
   final SecureStorageService secureStorage;
+  final AppDatabase db;
   final bool isOnline;
   final DateTime? lastSyncAt;
 
@@ -40,6 +44,7 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
       ..setNavigationDelegate(NavigationDelegate(
         onPageFinished: (_) {
           if (mounted) setState(() => _state = _DashboardLoadState.ready);
+          if (widget.isOnline) _captureRenderedSnapshot();
         },
         onWebResourceError: (error) {
           if (mounted) {
@@ -70,6 +75,43 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
 
   String? _allowedHost;
 
+  Future<void> _captureRenderedSnapshot() async {
+    try {
+      // Freeze the currently rendered PHP surface into one HTML document.
+      // Stylesheet rules are inlined so the offline copy does not depend on
+      // a network request for the PHP site's CSS. Images remain on their
+      // original URLs and can still be served from the WebView resource cache.
+      const script = r'''
+        (() => {
+          const root = document.documentElement.cloneNode(true);
+          const styles = [];
+          for (const sheet of Array.from(document.styleSheets)) {
+            try {
+              for (const rule of Array.from(sheet.cssRules)) styles.push(rule.cssText);
+            } catch (_) {}
+          }
+          root.querySelectorAll('link[rel="stylesheet"]').forEach(el => el.remove());
+          const head = root.querySelector('head') || root;
+          const style = document.createElement('style');
+          style.textContent = styles.join("\n");
+          head.appendChild(style);
+          return root.outerHTML;
+        })()
+      ''';
+      final raw = await _controller.runJavaScriptReturningResult(script);
+      var html = raw.toString();
+      if (html.length >= 2 && html.startsWith('"') && html.endsWith('"')) {
+        try { html = jsonDecode(html) as String; } catch (_) {}
+      }
+      if (html.length > 200) {
+        await widget.db.saveWebDashboardSnapshot(html);
+      }
+    } catch (_) {
+      // Snapshotting is best-effort. A successful online PHP page must
+      // never fail because its offline cache could not be captured.
+    }
+  }
+
   Future<void> _openDashboard() async {
     try {
       final serverUrl = await widget.secureStorage.serverUrl;
@@ -84,14 +126,15 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
         }
         await _controller.loadRequest(handoff);
       } else {
-        // Android/iOS WebView retains the same browser cache used by the
-        // online visit. Loading the exact dashboard URL keeps the PHP UI
-        // identical; if the cache is unavailable, we show a clear state
-        // instead of inventing a second offline UI.
-        await _controller.loadRequest(Uri.parse('$serverUrl/public/dashboard.php'));
-        // WebView will use its retained browser cache when the device has
-        // no network. We deliberately keep the same HTTPS origin so the
-        // cached CSS/images/session storage belong to the parish host.
+        // Never hit the network in offline mode. Reopen the last rendered
+        // PHP document captured while online. The HTML already contains
+        // the live role-specific dashboard markup and inlined CSS, so this
+        // is the same web surface rather than a second Flutter UI.
+        final snapshot = await widget.db.getWebDashboardSnapshot();
+        if (snapshot == null || snapshot.html.length < 200) {
+          throw StateError('Brak zapisanej wersji panelu.');
+        }
+        await _controller.loadHtmlString(snapshot.html, baseUrl: serverUrl);
       }
     } catch (e) {
       if (mounted) {

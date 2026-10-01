@@ -302,11 +302,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final showOffline = _authState == DeviceAuthState.offlineWithinLease;
 
     // The legacy PHP dashboard is the source of truth for the actual UI.
-    // Online: exact PHP dashboard through one-time handoff. Offline:
-    // the WebView displays the last locally retained web surface.
+    // Online: WebView opens dashboard.php through the one-time handoff,
+    // so role-specific sidebar/content are rendered by the exact same PHP
+    // code as in the browser. Offline: the same WebView asks its local
+    // browser cache for the last successfully loaded dashboard; the only
+    // Flutter-owned UI is the small offline banner.
     return WebDashboardScreen(
       handoffService: _handoffService,
       secureStorage: widget.userSessionService.secureStorage,
+      db: widget.db,
       isOnline: !showOffline,
       lastSyncAt: _lastSyncAt,
     );

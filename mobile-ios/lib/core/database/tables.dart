@@ -246,3 +246,16 @@ class ClientConfigCache extends Table {
   @override
   Set<Column> get primaryKey => {id};
 }
+
+/// Last successfully rendered legacy PHP dashboard for the currently
+/// signed-in user. This is a UI snapshot, not a second implementation of
+/// the PHP application. It exists solely so the exact PHP surface can be
+/// reopened when the device has no network connection.
+class WebDashboardSnapshotCache extends Table {
+  IntColumn get id => integer().withDefault(const Constant(1))();
+  TextColumn get html => text()();
+  DateTimeColumn get capturedAt => dateTime()();
+
+  @override
+  Set<Column> get primaryKey => {id};
+}
