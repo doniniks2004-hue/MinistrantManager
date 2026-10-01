@@ -29,6 +29,13 @@ function webview_module_registry(): array
     $adminOrPriestOrSenior = [1, 2, 3];
 
     return [
+        // The dashboard itself is legacy PHP and therefore MUST remain the
+        // visual source of truth for mobile. It renders the exact sidebar,
+        // tiles and role-specific navigation used by the browser.
+        'dashboard' => [
+            'title' => 'Panel główny', 'path' => '/public/dashboard.php',
+            'icon' => 'calendar', 'order' => 1, 'required_role' => null,
+        ],
         'justifications' => [
             'title' => 'Usprawiedliwienia', 'path' => '/public/justifications.php',
             'icon' => 'note', 'order' => 60, 'required_role' => null,
@@ -311,6 +318,10 @@ function build_modules(\mysqli $conn): array
     ];
 
     foreach (webview_module_registry() as $id => $def) {
+        // dashboard.php is the app's TOP-LEVEL shell, not a tile inside itself.
+        if ($id === 'dashboard') {
+            continue;
+        }
         if (isset($def['enabled_check']) && !$def['enabled_check']($conn)) {
             continue;
         }

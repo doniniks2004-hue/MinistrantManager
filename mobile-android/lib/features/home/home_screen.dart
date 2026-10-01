@@ -6,10 +6,9 @@ import '../../core/sync/sync_engine.dart';
 import '../auth/login_screen.dart';
 import '../auth/user_session_service.dart';
 import '../config/config_service.dart';
-import '../dashboard/dashboard_screen.dart';
-import '../dashboard/module_descriptor.dart';
 import '../revocation/revocation_handler.dart';
 import '../webview/webview_handoff_service.dart';
+import '../webview/web_dashboard_screen.dart';
 
 /// Spec §26–§28: renders instantly from SQLite, shows an OFFLINE banner
 /// with the timestamp of the last known-good sync when relevant, and
@@ -58,8 +57,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _lastSyncFailed = false;
   Map<String, dynamic>? _clientConfig;
   bool? _hasUserSession; // null while checking
-  List<ModuleDescriptor>? _modules;
-  int? _userRoleId;
   late final WebviewHandoffService _handoffService;
 
   @override
@@ -165,24 +162,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     }
 
-    // Hybrid dashboard milestone: the module list itself also survives
-    // offline (ConfigService's own cache-fallback) — a fresh install with
-    // no cache yet and no connectivity is the only case with nothing to
-    // show, same as any other config-dependent screen.
-    List<ModuleDescriptor>? modules;
-    int? roleId;
-    if (hasUserSession) {
-      final rawModules = await widget.configService.loadModules();
-      modules = rawModules != null ? ModuleDescriptor.parseList(rawModules) : null;
-      roleId = await widget.userSessionService.secureStorage.currentUserRoleId;
-    }
-
     final meta = await widget.db.ensureSyncMetadata();
     setState(() {
       _lastSyncAt = meta.lastSyncAt;
       _hasUserSession = hasUserSession;
-      _modules = modules;
-      _userRoleId = roleId;
     });
   }
 
@@ -195,8 +178,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await widget.userSessionService.logout();
     setState(() {
       _hasUserSession = false;
-      _modules = null;
-      _userRoleId = null;
     });
   }
 
@@ -318,26 +299,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return LoginScreen(userSessionService: widget.userSessionService, onLoggedIn: _onLoggedIn);
     }
 
-    if (_modules == null) {
-      // Logged in, but the module list hasn't resolved yet (first frame,
-      // or genuinely offline with no cache at all yet).
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
-    }
-
     final showOffline = _authState == DeviceAuthState.offlineWithinLease;
 
-    return DashboardScreen(
-      modules: _modules!,
-      userRoleId: _userRoleId,
-      db: widget.db,
-      secureStorage: widget.userSessionService.secureStorage,
+    // The legacy PHP dashboard is the source of truth for the actual UI.
+    // Online: WebView opens dashboard.php through the one-time handoff,
+    // so role-specific sidebar/content are rendered by the exact same PHP
+    // code as in the browser. Offline: the same WebView asks its local
+    // browser cache for the last successfully loaded dashboard; the only
+    // Flutter-owned UI is the small offline banner.
+    return WebDashboardScreen(
       handoffService: _handoffService,
-      appVersion: widget.appVersion,
+      secureStorage: widget.userSessionService.secureStorage,
       isOnline: !showOffline,
-      syncFailed: _lastSyncFailed,
       lastSyncAt: _lastSyncAt,
-      onSync: _bootstrapThenSync,
-      onLogout: _onLogout,
     );
   }
 }
