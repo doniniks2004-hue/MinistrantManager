@@ -6,6 +6,7 @@ import 'dart:io' show Platform;
 import 'core/database/app_database.dart';
 import 'core/deeplink/deep_link_service.dart';
 import 'core/network/api_client.dart';
+import 'core/offline/snapshot_store.dart';
 import 'core/secure/secure_storage_service.dart';
 import 'core/sync/sync_engine.dart';
 import 'features/activation/activation_screen.dart';
@@ -32,6 +33,16 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
   AppDatabase? _db;
   late final SecureStorageService _secureStorage;
   late final ApiClient _api;
+  // Offline-architecture milestone, P7: one shared instance for the
+  // whole app lifetime — no rootOverride, so it resolves the real
+  // platform application-support directory (see SnapshotStore's own
+  // docblock for why NOT the temp-files directory). Shared by
+  // UserSessionService (logout/user-switch clearing) and
+  // RevocationHandler (parish clearing on revoke/disable) alike, so
+  // there is exactly one on-disk cache root for the whole app, never
+  // two independently-constructed stores that could disagree about
+  // where "the" cache lives.
+  late final SnapshotStore _snapshotStore;
   SyncEngine? _syncEngine;
   ActivationService? _activationService;
   RevocationHandler? _revocationHandler;
@@ -49,6 +60,7 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
     super.initState();
     _secureStorage = SecureStorageService();
     _api = ApiClient(_secureStorage);
+    _snapshotStore = SnapshotStore();
     _init();
     _deepLinkService.listen((token) {
       // A link can arrive before _init() finishes (cold start) or any
@@ -94,9 +106,9 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
     final db = AppDatabase(dbKey);
     final syncEngine = SyncEngine(db: db, api: _api, secureStorage: _secureStorage);
     final activationService = ActivationService(api: _api, secureStorage: _secureStorage);
-    final revocationHandler = RevocationHandler(db: db, secureStorage: _secureStorage);
+    final revocationHandler = RevocationHandler(db: db, secureStorage: _secureStorage, snapshotStore: _snapshotStore);
     final configService = ConfigService(db: db, api: _api);
-    final userSessionService = UserSessionService(api: _api, secureStorage: _secureStorage, db: db);
+    final userSessionService = UserSessionService(api: _api, secureStorage: _secureStorage, db: db, snapshotStore: _snapshotStore);
 
     setState(() {
       _db = db;
