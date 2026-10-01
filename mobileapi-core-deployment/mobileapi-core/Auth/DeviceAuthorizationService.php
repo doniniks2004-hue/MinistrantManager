@@ -98,10 +98,20 @@ class DeviceAuthorizationService
         );
         $stmt->bind_param('s', $installationId);
         $stmt->execute();
-        $row = $stmt->get_result()->fetch_assoc();
+        $state = null;
+        $leaseHours = null;
+        $checkedAt = null;
+        $expiresAt = null;
+        $stmt->bind_result($state, $leaseHours, $checkedAt, $expiresAt);
+        $hasRow = $stmt->fetch();
         $stmt->close();
 
-        return $row ?: null;
+        return $hasRow ? [
+            'state' => $state,
+            'offline_lease_hours' => (int) $leaseHours,
+            'checked_at' => $checkedAt,
+            'expires_at' => $expiresAt,
+        ] : null;
     }
 
     private function writeCache(string $installationId, string $state, int $offlineLeaseHours): void
