@@ -34,23 +34,6 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
   AppDatabase? _db;
   late final SecureStorageService _secureStorage;
   late final ApiClient _api;
-  // Offline-architecture milestone, P7/P8.2: no rootOverride, so it
-  // resolves the real platform application-support directory (see
-  // SnapshotStore's own docblock for why NOT the temp-files directory).
-  // Shared by UserSessionService (logout/user-switch clearing) and
-  // RevocationHandler (parish clearing + key crypto-erase on revoke/
-  // disable) alike, so there is exactly one on-disk cache root for the
-  // whole app, never two independently-constructed stores that could
-  // disagree about where "the" cache lives. REBUILT (not constructed
-  // once in initState like before P8.2) inside
-  // _openFreshDatabaseAndWireServices() every time that runs — same
-  // reasoning as `dbKey`/`AppDatabase` just below it: after a
-  // revoke-triggered crypto-erase, RevocationHandler has already deleted
-  // the OLD snapshot encryption key, so an encryptor built from it would
-  // be stale; this field must be rebuilt with a freshly-resolved
-  // (possibly newly-generated) key every time this method runs, exactly
-  // like the database it sits right next to.
-  SnapshotStore? _snapshotStore;
   SyncEngine? _syncEngine;
   ActivationService? _activationService;
   RevocationHandler? _revocationHandler;
@@ -111,9 +94,15 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
   Future<void> _openFreshDatabaseAndWireServices() async {
     final dbKey = await _secureStorage.getOrCreateDbEncryptionKey();
     final db = AppDatabase(dbKey);
-    // Offline-architecture milestone, P8.2: resolved fresh every call,
-    // exactly like dbKey just above — see _snapshotStore's own field
-    // docblock for why this can never be built once and reused forever.
+    // Offline-architecture milestone, P8.2: resolved fresh on every call
+    // to this method, exactly like dbKey just above — after a revoke-
+    // triggered crypto-erase, RevocationHandler has already deleted the
+    // OLD snapshot encryption key, so building this once and reusing it
+    // forever would keep using a stale encryptor referencing a key that
+    // no longer exists. A purely local variable is enough: nothing
+    // outside this method currently needs to read it (both consumers,
+    // RevocationHandler and UserSessionService, are constructed right
+    // here with it), so there is no state field for it on this class.
     final snapshotKey = await _secureStorage.getOrCreateSnapshotEncryptionKey();
     final snapshotStore = SnapshotStore(encryptor: SnapshotEncryptor(hexKey: snapshotKey));
     final syncEngine = SyncEngine(db: db, api: _api, secureStorage: _secureStorage);
@@ -124,7 +113,6 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
 
     setState(() {
       _db = db;
-      _snapshotStore = snapshotStore;
       _syncEngine = syncEngine;
       _activationService = activationService;
       _revocationHandler = revocationHandler;
