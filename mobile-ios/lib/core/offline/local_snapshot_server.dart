@@ -166,11 +166,21 @@ class LocalSnapshotServer {
   }
 
   static const Map<String, String> _extensionToMimeType = {
+    // Review round fix (real bug, caught by CI): snapshot PAGE files
+    // keep their ORIGINAL legacy filename — /dashboard.php,
+    // /public/schedule.php, etc. — because the whole point of this
+    // server is serving them back at the SAME path the WebView already
+    // knows. Their content is pure rendered HTML by the time they're
+    // captured, so .php must map to text/html here, same as .html
+    // itself — this was the one missing entry the test caught
+    // (dashboard.php was falling through to the application/
+    // octet-stream default, which a WebView won't render as a page).
+    '.php': 'text/html',
     '.html': 'text/html',
     '.htm': 'text/html',
     '.css': 'text/css',
-    '.js': 'text/javascript',
-    '.mjs': 'text/javascript',
+    '.js': 'application/javascript',
+    '.mjs': 'application/javascript',
     '.json': 'application/json',
     '.png': 'image/png',
     '.jpg': 'image/jpeg',
