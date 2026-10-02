@@ -1,3 +1,4 @@
+import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 
 import '../../core/network/api_client.dart';
@@ -45,7 +46,7 @@ class WebviewHandoffService {
 
     final dio = await api.parish();
     debugPrint('WebviewHandoffService: POST ${dio.options.baseUrl}/mobile/webview/handoff');
-    final resp = await dio.post('/mobile/webview/handoff', data: {'path': path});
+    final resp = await dio.post('/mobile/webview/handoff', data: {'path': path}, options: Options(sendTimeout: const Duration(seconds: 2), connectTimeout: const Duration(seconds: 2), receiveTimeout: const Duration(seconds: 2)));
     debugPrint('WebviewHandoffService: handoff response statusCode=${resp.statusCode} body=${resp.data}');
 
     final ticket = resp.data['ticket'] as String;
