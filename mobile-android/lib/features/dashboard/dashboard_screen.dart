@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../core/database/app_database.dart';
+import '../../core/offline/offline_page_coordinator.dart';
 import '../../core/secure/secure_storage_service.dart';
 import '../announcements/announcements_screen.dart';
 import '../attendance/attendance_screen.dart';
@@ -9,16 +10,24 @@ import '../ranking/ranking_screen.dart';
 import '../revocation/revocation_handler.dart';
 import '../schedule/my_schedule_screen.dart';
 import '../substitutions/substitutions_screen.dart';
-import '../webview/legacy_module_screen.dart';
-import '../webview/webview_handoff_service.dart';
+import '../webview/offline_aware_page_screen.dart';
 import 'module_descriptor.dart';
 
 /// Hybrid dashboard milestone — the app's main screen post-login.
 /// Renders a grid of tiles from the server-driven module list, routing
-/// each tap to either a native screen or a [LegacyModuleScreen] (WebView)
-/// — review round point 1: the dashboard makes NO assumption that any
-/// given module is native; that's entirely a server decision, re-read on
-/// every sync.
+/// each tap to either a native screen or an [OfflineAwarePageScreen]
+/// (WebView, online-or-offline-aware as of P13) — review round point 1:
+/// the dashboard makes NO assumption that any given module is native;
+/// that's entirely a server decision, re-read on every sync.
+///
+/// P13 fix: this is the ONE place a WebView module tap actually reaches
+/// a screen — until this round it unconditionally built the OLD,
+/// online-only LegacyModuleScreen, meaning the entire P2-P10 offline
+/// chain (capture, encryption, local server, MinistrantBridge) was fully
+/// built and fully tested but completely UNREACHABLE from the real app.
+/// LegacyModuleScreen itself is left in place (not deleted) rather than
+/// removed outright, in case it's still wanted as a reference/fallback —
+/// it is simply no longer constructed anywhere in the real app.
 class DashboardScreen extends StatelessWidget {
   const DashboardScreen({
     super.key,
@@ -26,7 +35,7 @@ class DashboardScreen extends StatelessWidget {
     required this.userRoleId,
     required this.db,
     required this.secureStorage,
-    required this.handoffService,
+    required this.offlinePageCoordinator,
     required this.appVersion,
     required this.isOnline,
     required this.syncFailed,
@@ -41,7 +50,12 @@ class DashboardScreen extends StatelessWidget {
   final int? userRoleId;
   final AppDatabase db;
   final SecureStorageService secureStorage;
-  final WebviewHandoffService handoffService;
+
+  /// P13 fix — see this class's own docblock: the actual online<->offline
+  /// chain a WebView module tap now goes through, instead of the old
+  /// always-online LegacyModuleScreen.
+  final OfflinePageCoordinator offlinePageCoordinator;
+
   final String appVersion;
   final bool isOnline;
   final bool syncFailed;
@@ -147,14 +161,24 @@ class DashboardScreen extends StatelessWidget {
         final serverUrl = await secureStorage.serverUrl;
         if (serverUrl == null) return;
         final host = Uri.parse(serverUrl).host;
+        // P13 fix — see this class's own docblock: parishId/userId are
+        // this specific (page, user)'s offline-snapshot identity, the
+        // same values UserSessionService/RevocationHandler already key
+        // everything by. Fetched fresh at tap time rather than threaded
+        // through as constructor fields, matching how `serverUrl`/`host`
+        // just above are already handled the same way.
+        final parishId = await secureStorage.parishId;
+        final userId = await secureStorage.currentUserId;
+        if (parishId == null || userId == null) return;
         if (context.mounted) {
           Navigator.of(context).push(MaterialPageRoute(
-            builder: (_) => LegacyModuleScreen(
+            builder: (_) => OfflineAwarePageScreen(
               title: module.title,
-              path: module.path!,
-              handoffService: handoffService,
+              targetPath: module.path!,
               allowedHost: host,
-              isOnline: isOnline,
+              parishId: parishId,
+              userId: userId.toString(),
+              coordinator: offlinePageCoordinator,
             ),
           ));
         }

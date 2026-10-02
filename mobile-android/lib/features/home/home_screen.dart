@@ -6,10 +6,10 @@ import '../../core/sync/sync_engine.dart';
 import '../auth/login_screen.dart';
 import '../auth/user_session_service.dart';
 import '../config/config_service.dart';
+import '../../core/offline/offline_page_coordinator.dart';
 import '../dashboard/dashboard_screen.dart';
 import '../dashboard/module_descriptor.dart';
 import '../revocation/revocation_handler.dart';
-import '../webview/webview_handoff_service.dart';
 
 /// Spec §26–§28: renders instantly from SQLite, shows an OFFLINE banner
 /// with the timestamp of the last known-good sync when relevant, and
@@ -32,6 +32,7 @@ class HomeScreen extends StatefulWidget {
     required this.configService,
     required this.revocationHandler,
     required this.userSessionService,
+    required this.offlinePageCoordinator,
     required this.onRevoked,
     required this.appVersion,
     required this.osVersion,
@@ -43,6 +44,19 @@ class HomeScreen extends StatefulWidget {
   final ConfigService configService;
   final RevocationHandler revocationHandler;
   final UserSessionService userSessionService;
+
+  /// P13 fix: constructed once in main.dart (rebuilt fresh on every
+  /// revoke/reset cycle, same as everything else wired there) and passed
+  /// down here, rather than this screen building its own
+  /// WebviewHandoffService internally the way it used to — the real
+  /// online<->offline chain needs a SHARED OfflinePageCoordinator with a
+  /// SHARED LocalSnapshotServer instance (its rootDirectory gets
+  /// repointed per page load; a screen-local one would lose that state
+  /// every time this widget rebuilds). Its own `handoffService` field is
+  /// how OfflineAwarePageScreen reaches WebviewHandoffService when it
+  /// needs to — nothing here needs a separate reference to it.
+  final OfflinePageCoordinator offlinePageCoordinator;
+
   final VoidCallback onRevoked;
   final String appVersion;
   final String osVersion;
@@ -60,12 +74,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool? _hasUserSession; // null while checking
   List<ModuleDescriptor>? _modules;
   int? _userRoleId;
-  late final WebviewHandoffService _handoffService;
 
   @override
   void initState() {
     super.initState();
-    _handoffService = WebviewHandoffService(api: widget.api, secureStorage: widget.userSessionService.secureStorage);
     WidgetsBinding.instance.addObserver(this);
     _bootstrapThenSync();
   }
@@ -331,7 +343,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       userRoleId: _userRoleId,
       db: widget.db,
       secureStorage: widget.userSessionService.secureStorage,
-      handoffService: _handoffService,
+      offlinePageCoordinator: widget.offlinePageCoordinator,
       appVersion: widget.appVersion,
       isOnline: !showOffline,
       syncFailed: _lastSyncFailed,
