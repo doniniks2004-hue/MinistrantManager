@@ -6,6 +6,8 @@ import '../auth/login_screen.dart';
 import '../auth/user_session_service.dart';
 import '../config/config_service.dart';
 import '../../core/offline/offline_page_coordinator.dart';
+import '../dashboard/dashboard_screen.dart';
+import '../dashboard/module_descriptor.dart';
 import '../revocation/revocation_handler.dart';
 import '../webview/offline_aware_page_screen.dart';
 
@@ -67,6 +69,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   int? _userId;
   String? _parishId;
   String? _serverUrl;
+  List<ModuleDescriptor>? _modules;
+  int? _userRoleId;
 
   @override
   void initState() {
@@ -170,12 +174,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     }
 
-    // The legacy PHP dashboard is the single UI source of truth. Native
-    // module descriptors are deliberately not loaded here: doing so would
-    // recreate the hybrid dashboard we are explicitly replacing.
     final userId = hasUserSession ? await widget.userSessionService.secureStorage.currentUserId : null;
     final parishId = hasUserSession ? await widget.userSessionService.secureStorage.parishId : null;
     final serverUrl = hasUserSession ? await widget.userSessionService.secureStorage.serverUrl : null;
+
+    List<ModuleDescriptor>? modules;
+    int? roleId;
+    if (hasUserSession && status.state != DeviceAuthState.active) {
+      final rawModules = await widget.configService.loadModules();
+      modules = rawModules != null ? ModuleDescriptor.parseList(rawModules) : null;
+      roleId = await widget.userSessionService.secureStorage.currentUserRoleId;
+    }
 
     await widget.db.ensureSyncMetadata();
     setState(() {
@@ -183,6 +192,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _userId = userId;
       _parishId = parishId;
       _serverUrl = serverUrl;
+      _modules = modules;
+      _userRoleId = roleId;
     });
   }
 
@@ -313,22 +324,58 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
-    return OfflineAwarePageScreen(
-      title: 'Ministrant Manager',
-      targetPath: '/public/dashboard.php',
-      allowedHost: Uri.parse(_serverUrl!).host,
-      parishId: _parishId!,
-      userId: _userId!.toString(),
-      coordinator: widget.offlinePageCoordinator,
+    // ONLINE: the real legacy PHP dashboard is the complete UI source of truth.
+    if (_authState == DeviceAuthState.active) {
+      return OfflineAwarePageScreen(
+        title: 'Ministrant Manager',
+        targetPath: '/public/dashboard.php',
+        allowedHost: Uri.parse(_serverUrl!).host,
+        parishId: _parishId!,
+        userId: _userId!.toString(),
+        coordinator: widget.offlinePageCoordinator,
+        onLogout: () async {
+          await widget.userSessionService.logout();
+          if (mounted) {
+            setState(() {
+              _hasUserSession = false;
+              _userId = null;
+              _modules = null;
+              _userRoleId = null;
+            });
+          }
+        },
+      );
+    }
+
+    // OFFLINE: keep the existing native dashboard as the offline menu.
+    if (_modules == null) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
+    return DashboardScreen(
+      modules: _modules!,
+      userRoleId: _userRoleId,
+      db: widget.db,
+      secureStorage: widget.userSessionService.secureStorage,
+      offlinePageCoordinator: widget.offlinePageCoordinator,
+      appVersion: widget.appVersion,
+      isOnline: false,
+      syncFailed: false,
+      lastSyncAt: null,
+      onSync: _bootstrapThenSync,
       onLogout: () async {
         await widget.userSessionService.logout();
         if (mounted) {
           setState(() {
             _hasUserSession = false;
             _userId = null;
+            _modules = null;
+            _userRoleId = null;
           });
         }
       },
+      revocationHandler: widget.revocationHandler,
+      onParishReset: widget.onRevoked,
     );
   }
 }
