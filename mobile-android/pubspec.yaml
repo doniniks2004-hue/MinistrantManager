@@ -129,10 +129,10 @@ dev_dependencies:
 
 flutter_native_splash:
   color: "#F5F5F5"
-  image: assets/branding/splash_logo.png
+  image: assets/branding/app_icon.png
   android_12:
     color: "#F5F5F5"
-    image: assets/branding/splash_logo.png
+    image: assets/branding/app_icon.png
 
 flutter:
   uses-material-design: true
