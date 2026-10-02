@@ -1,28 +1,43 @@
 import 'package:path/path.dart' as p;
 
+import '../../features/webview/webview_handoff_service.dart';
 import 'connectivity_probe.dart';
 import 'local_snapshot_server.dart';
 import 'snapshot_capture_service.dart';
 import 'snapshot_store.dart';
 
-/// Offline-architecture milestone, P6. The decision logic connecting
-/// every piece built so far (P2-P5) to an actual WebView — deliberately
-/// separated from any real `WebViewController` so it can be fully
-/// tested without one (webview_flutter has no platform channel in
-/// `flutter test`, so anything that genuinely touches a WebViewController
-/// cannot be unit-tested here — see the actual WebView screen's own
-/// docblock for that honest limit).
+/// Offline-architecture milestone, P6 (P10 fix: targetPath/handoffUrl
+/// separation). The decision logic connecting every piece built so far
+/// (P2-P5) to an actual WebView — deliberately separated from any real
+/// `WebViewController` so it can be fully tested without one
+/// (webview_flutter has no platform channel in `flutter test`, so
+/// anything that genuinely touches a WebViewController cannot be
+/// unit-tested here — see the actual WebView screen's own docblock for
+/// that honest limit).
 ///
 /// ```
 /// ONLINE:  PHP -> WebView -> render -> SnapshotCaptureService -> ... -> SnapshotStore
 /// OFFLINE: brak internetu -> LocalSnapshotServer -> 127.0.0.1 -> WebView -> ostatni snapshot
 /// ```
+///
+/// P10 finding, against the REAL Szarlej installation: a WebView never
+/// navigates to a legacy page's own path directly — `mobile_handoff.php`
+/// mints a short-lived, single-use ticket and the PHP side 302-redirects
+/// from there to the real target. [PageLoadOnline] therefore carries TWO
+/// separate things, deliberately never conflated: [PageLoadOnline.url]
+/// (the one-time handoff URL, for navigation ONLY) and
+/// [PageLoadOnline.targetPath] (the page's actual identity — e.g.
+/// `/public/dashboard.php` — used for the offline snapshot key AND as
+/// the base for resolving that page's own relative resource references,
+/// which would resolve to the wrong thing entirely if based on
+/// mobile_handoff.php's own location instead).
 class OfflinePageCoordinator {
   OfflinePageCoordinator({
     required this.connectivityProbe,
     required this.captureService,
     required this.snapshotStore,
     required this.localServer,
+    required this.handoffService,
   });
 
   final ConnectivityProbe connectivityProbe;
@@ -30,27 +45,44 @@ class OfflinePageCoordinator {
   final SnapshotStore snapshotStore;
   final LocalSnapshotServer localServer;
 
-  /// Decides how [pageUrl] should be loaded for (parishId, userId) right
-  /// now. Never touches a WebViewController itself — the caller takes
-  /// the returned [PageLoadPlan] and performs the actual `loadRequest`
-  /// (the one genuinely WebView-specific step left).
+  /// Mints the one-time handoff URL for the online branch — the SAME
+  /// service LegacyModuleScreen already uses, so there is exactly one
+  /// way this app ever asks the server for a ticket.
+  final WebviewHandoffService handoffService;
+
+  /// Decides how [targetPath] (e.g. `/public/dashboard.php` — the
+  /// page's own identity, NEVER a handoff URL) should be loaded for
+  /// (parishId, userId) right now. Never touches a WebViewController
+  /// itself — the caller takes the returned [PageLoadPlan] and performs
+  /// the actual `loadRequest` (the one genuinely WebView-specific step
+  /// left).
   Future<PageLoadPlan> plan({
     required String parishId,
     required String userId,
-    required Uri pageUrl,
+    required String targetPath,
   }) async {
-    final reachable = await connectivityProbe.canReach(pageUrl);
+    final path = p.normalize(targetPath);
+    final serverUrlString = await handoffService.secureStorage.serverUrl;
+
+    final reachable = serverUrlString != null && await connectivityProbe.canReach(Uri.parse(serverUrlString).resolve(path));
     if (reachable) {
-      return PageLoadOnline(url: pageUrl);
+      try {
+        final handoffUrl = await handoffService.requestHandoffUrl(path);
+        return PageLoadOnline(url: handoffUrl, targetPath: path);
+      } catch (_) {
+        // The ticket-mint call itself failed despite the server being
+        // reachable a moment ago (flaky connection, auth hiccup, ...) —
+        // fall through to the offline branch below rather than
+        // propagating this to the caller.
+      }
     }
 
-    final pagePath = p.normalize(pageUrl.path);
-    final manifest = await snapshotStore.readManifestFor(parishId: parishId, userId: userId, pagePath: pagePath);
+    final manifest = await snapshotStore.readManifestFor(parishId: parishId, userId: userId, pagePath: path);
     if (manifest == null) {
       return const PageLoadOfflineNoSnapshot();
     }
 
-    final pageDir = await snapshotStore.getPageDirectoryIfReady(parishId: parishId, userId: userId, pagePath: pagePath);
+    final pageDir = await snapshotStore.getPageDirectoryIfReady(parishId: parishId, userId: userId, pagePath: path);
     if (pageDir == null) {
       // A manifest existed a moment ago but the directory is gone now
       // (e.g. a concurrent clearForUser/clearForParish mid-check) —
@@ -70,6 +102,11 @@ class OfflinePageCoordinator {
   /// Called once an ONLINE page has finished rendering (the caller gets
   /// [renderedHtml] from the WebView itself — see this coordinator's own
   /// docblock on why that extraction step lives outside this class).
+  /// [targetPath] is the SAME page identity [plan] returned in
+  /// [PageLoadOnline.targetPath] — never the handoff URL the WebView
+  /// actually navigated to, which SnapshotCaptureService itself
+  /// re-derives into a real, absolute URL (server base + targetPath) for
+  /// resolving the page's own relative resource references correctly.
   /// Fire-and-forget by design: a failed background capture must never
   /// surface to the user or interrupt their online session — the
   /// PREVIOUS snapshot (if any) simply remains as next time's offline
@@ -78,15 +115,18 @@ class OfflinePageCoordinator {
   void captureInBackground({
     required String parishId,
     required String userId,
-    required Uri pageUrl,
+    required String targetPath,
     required String renderedHtml,
   }) {
     () async {
       try {
+        final serverUrlString = await handoffService.secureStorage.serverUrl;
+        if (serverUrlString == null) return;
         await captureService.captureAndSave(
           parishId: parishId,
           userId: userId,
-          pageUrl: pageUrl,
+          serverBaseUrl: Uri.parse(serverUrlString),
+          targetPath: targetPath,
           renderedHtml: renderedHtml,
         );
       } catch (_) {
@@ -103,12 +143,16 @@ sealed class PageLoadPlan {
   const PageLoadPlan();
 }
 
-/// Load [url] for real — the actual PHP page, via the existing handoff
-/// mechanism (unchanged by this milestone). The caller should trigger
-/// [OfflinePageCoordinator.captureInBackground] once it finishes loading.
+/// Load [url] — a one-time handoff URL, for navigation ONLY (P10: never
+/// store it, never resolve resources against it — see this file's own
+/// class-level docblock for why). [targetPath] is the page's real
+/// identity; the caller passes THIS to
+/// [OfflinePageCoordinator.captureInBackground] once the page finishes
+/// loading, never [url].
 class PageLoadOnline extends PageLoadPlan {
-  const PageLoadOnline({required this.url});
+  const PageLoadOnline({required this.url, required this.targetPath});
   final Uri url;
+  final String targetPath;
 }
 
 /// Load [url] — a `LocalSnapshotServer` URL already pointed at the

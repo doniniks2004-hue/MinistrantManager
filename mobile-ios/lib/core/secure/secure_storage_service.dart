@@ -101,6 +101,11 @@ class SecureStorageService {
     await _storage.delete(key: _kCurrentUserId);
     await _storage.delete(key: _kCurrentUserFullName);
     await _storage.delete(key: _kCurrentUserRoleId);
+    // P10: the legacy PHP "remember me" continuity token (see its own
+    // field docblock) is issued per-user, at login — a stale one must
+    // never survive this specific user's session ending, same as every
+    // other credential cleared above.
+    await _storage.delete(key: _kLegacyRememberToken);
   }
 
   Future<void> savedActivation({
@@ -202,4 +207,30 @@ class SecureStorageService {
   /// generates a genuinely NEW key, never reuses this one — matching
   /// `deleteDbEncryptionKey()`'s own exact reasoning.
   Future<void> deleteSnapshotEncryptionKey() => _storage.delete(key: _kSnapshotEncryptionKey);
+
+  static const _kLegacyRememberToken = 'legacy_remember_token';
+
+  /// P10 (real-Szarlej finding): the legacy PHP app's OWN pre-existing
+  /// "remember me" mechanism (src/auth.php's issue_remember_token_from_central,
+  /// handed to the WebView via footer.php's `_pending_remember_token` ->
+  /// MinistrantBridge.saveRememberToken bridge call) — entirely separate
+  /// from this app's own mobile_user_token/handoff-ticket system, which
+  /// predates it and was built independently ("Iteration 2 point 2" per
+  /// session_login.php's own comment; the two "don't need to know about
+  /// each other"). Review round: "remember_token może być przekazany do
+  /// istniejącego bezpiecznego storage, a nie wrzucony do zwykłego cache
+  /// WebView" — stored here, in flutter_secure_storage, specifically so
+  /// it is NOT sitting in the WebView's own cookie jar/cache (which
+  /// clearActivation()/logout's cookie-clearing could wipe without this
+  /// app ever knowing a legacy session-continuity token existed). This
+  /// class only stores and returns the token as an opaque string; how
+  /// (or whether) it's ever presented back to the legacy PHP app is
+  /// outside this round's scope — the server-side consumption mechanism
+  /// is pre-existing, separately-built PHP logic this mobile project
+  /// doesn't own and doesn't yet have a client-side use for.
+  Future<void> setLegacyRememberToken(String token) => _storage.write(key: _kLegacyRememberToken, value: token);
+
+  Future<String?> get legacyRememberToken => _storage.read(key: _kLegacyRememberToken);
+
+  Future<void> deleteLegacyRememberToken() => _storage.delete(key: _kLegacyRememberToken);
 }
