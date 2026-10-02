@@ -263,6 +263,58 @@ void main() {
       expect(body, contains('Last known good'));
     });
 
+    test(
+      'DIAGNOSTIC: isolates the 400 reported against the offline-plan URL — prints the real response instead of guessing',
+      () async {
+        fakeStore['server_url'] = 'http://127.0.0.1:1';
+        await store.writeSnapshot(
+          parishId: 'witosa',
+          userId: '9001',
+          pagePath: '/public/dashboard.php',
+          html: '<html><body>Diagnostic snapshot</body></html>',
+          assets: {},
+          capturedAt: DateTime.utc(2026, 10, 1, 8, 42, 0),
+        );
+
+        final secureStorage = SecureStorageService();
+        final handoffService = _FakeHandoffService(secureStorage);
+        final coordinator = OfflinePageCoordinator(
+          connectivityProbe: ConnectivityProbe(timeout: const Duration(milliseconds: 200)),
+          captureService: captureService,
+          snapshotStore: store,
+          localServer: localServer,
+          handoffService: handoffService,
+        );
+
+        final plan = await coordinator.plan(parishId: 'witosa', userId: '9001', targetPath: '/public/dashboard.php');
+        final offlinePlan = plan as PageLoadOffline;
+
+        // ignore: avoid_print
+        print('DIAGNOSTIC offlinePlan.url = ${offlinePlan.url}');
+        // ignore: avoid_print
+        print('DIAGNOSTIC offlinePlan.url.toString() = ${offlinePlan.url.toString()}');
+        // ignore: avoid_print
+        print('DIAGNOSTIC localServer.isRunning = ${localServer.isRunning}, port = ${localServer.port}');
+
+        final client = HttpClient();
+        final request = await client.getUrl(offlinePlan.url);
+        // ignore: avoid_print
+        print('DIAGNOSTIC request.method = ${request.method}, request.uri = ${request.uri}');
+        final response = await request.close();
+        // ignore: avoid_print
+        print('DIAGNOSTIC statusCode = ${response.statusCode}, reasonPhrase = ${response.reasonPhrase}');
+        // ignore: avoid_print
+        print('DIAGNOSTIC headers = ${response.headers}');
+        final body = await utf8.decoder.bind(response).join();
+        // ignore: avoid_print
+        print('DIAGNOSTIC body = $body');
+
+        // Deliberately no hard assertion here beyond "the request completed" —
+        // this test's entire purpose is the printed output above, not a
+        // pass/fail signal.
+      },
+    );
+
     test('formatOfflineBannerText produces the exact required format', () {
       expect(formatOfflineBannerText(DateTime(2026, 10, 1, 8, 42)), 'OFFLINE • ostatnia synchronizacja: 08:42');
       expect(formatOfflineBannerText(DateTime(2026, 10, 1, 23, 5)), 'OFFLINE • ostatnia synchronizacja: 23:05');
