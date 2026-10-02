@@ -1,7 +1,9 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:ministrant_manager/core/network/api_client.dart';
 import 'package:ministrant_manager/core/offline/connectivity_probe.dart';
 import 'package:ministrant_manager/core/offline/local_snapshot_server.dart';
 import 'package:ministrant_manager/core/offline/offline_page_coordinator.dart';
@@ -9,6 +11,27 @@ import 'package:ministrant_manager/core/offline/page_resource_downloader.dart';
 import 'package:ministrant_manager/core/offline/snapshot_capture_service.dart';
 import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
 import 'package:ministrant_manager/core/offline/snapshot_store.dart';
+import 'package:ministrant_manager/core/secure/secure_storage_service.dart';
+import 'package:ministrant_manager/features/webview/webview_handoff_service.dart';
+
+/// P10 fix: a test double for WebviewHandoffService, which
+/// OfflinePageCoordinator now requires (targetPath/handoffUrl
+/// separation — see that class's own docblock for the real-Szarlej
+/// finding this fixes). Overrides ONLY requestHandoffUrl(); secureStorage
+/// is still the REAL field OfflinePageCoordinator reads
+/// (handoffService.secureStorage.serverUrl) for its reachability check.
+class _FakeHandoffService extends WebviewHandoffService {
+  _FakeHandoffService(SecureStorageService secureStorage) : super(api: ApiClient(secureStorage), secureStorage: secureStorage);
+
+  Uri? handoffUrlToReturn;
+  Object? errorToThrow;
+
+  @override
+  Future<Uri> requestHandoffUrl(String path) async {
+    if (errorToThrow != null) throw errorToThrow!;
+    return handoffUrlToReturn!;
+  }
+}
 
 /// Offline-architecture milestone, P8.2: SnapshotStore/LocalSnapshotServer
 /// now require a SnapshotEncryptor. A fixed, valid 64-character hex test
@@ -69,6 +92,44 @@ void main() {
   });
 
   group('OfflinePageCoordinator', () {
+    const secureStorageChannel = MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
+    final fakeStore = <String, String>{};
+
+    setUp(() {
+      TestWidgetsFlutterBinding.ensureInitialized();
+      fakeStore.clear();
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+        secureStorageChannel,
+        (call) async {
+          final args = call.arguments as Map?;
+          final key = args?['key'] as String?;
+          switch (call.method) {
+            case 'read':
+              return key != null ? fakeStore[key] : null;
+            case 'write':
+              final value = args?['value'] as String?;
+              if (key != null) {
+                if (value == null) {
+                  fakeStore.remove(key);
+                } else {
+                  fakeStore[key] = value;
+                }
+              }
+              return null;
+            case 'delete':
+              if (key != null) fakeStore.remove(key);
+              return null;
+            default:
+              return null;
+          }
+        },
+      );
+    });
+
+    tearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(secureStorageChannel, null);
+    });
+
     late Directory tempRoot;
     late SnapshotStore store;
     late LocalSnapshotServer localServer;
@@ -88,42 +149,86 @@ void main() {
       }
     });
 
-    test('a reachable page plans to load online, unchanged URL', () async {
+    test('a reachable page plans to load online via a freshly-minted handoff URL, never targetPath itself', () async {
       final site = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       site.listen((request) async => request.response.close());
-      final pageUrl = Uri.parse('http://127.0.0.1:${site.port}/public/dashboard.php');
+      fakeStore['server_url'] = 'http://127.0.0.1:${site.port}';
+
+      final secureStorage = SecureStorageService();
+      final handoffUrl = Uri.parse('http://127.0.0.1:${site.port}/public/mobile_handoff.php?ticket=abc123');
+      final handoffService = _FakeHandoffService(secureStorage)..handoffUrlToReturn = handoffUrl;
 
       final coordinator = OfflinePageCoordinator(
         connectivityProbe: ConnectivityProbe(),
         captureService: captureService,
         snapshotStore: store,
         localServer: localServer,
+        handoffService: handoffService,
       );
 
-      final plan = await coordinator.plan(parishId: 'witosa', userId: '9001', pageUrl: pageUrl);
+      final plan = await coordinator.plan(parishId: 'witosa', userId: '9001', targetPath: '/public/dashboard.php');
       expect(plan, isA<PageLoadOnline>());
-      expect((plan as PageLoadOnline).url, pageUrl);
+      final onlinePlan = plan as PageLoadOnline;
+      expect(onlinePlan.url, handoffUrl, reason: 'navigation must use the one-time handoff URL, never the plain target path');
+      expect(onlinePlan.targetPath, '/public/dashboard.php', reason: 'the page identity must still be the real target, for capture/storage later');
+
+      await site.close(force: true);
+    });
+
+    test('reachable but handoff-ticket-minting fails anyway falls through to the offline branch', () async {
+      final site = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      site.listen((request) async => request.response.close());
+      fakeStore['server_url'] = 'http://127.0.0.1:${site.port}';
+
+      await store.writeSnapshot(
+        parishId: 'witosa',
+        userId: '9001',
+        pagePath: '/public/dashboard.php',
+        html: '<html><body>Fallback snapshot</body></html>',
+        assets: {},
+        capturedAt: DateTime.utc(2026, 10, 1, 8, 0, 0),
+      );
+
+      final secureStorage = SecureStorageService();
+      final handoffService = _FakeHandoffService(secureStorage)..errorToThrow = Exception('ticket mint failed');
+
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: store,
+        localServer: localServer,
+        handoffService: handoffService,
+      );
+
+      final plan = await coordinator.plan(parishId: 'witosa', userId: '9001', targetPath: '/public/dashboard.php');
+      expect(
+        plan,
+        isA<PageLoadOffline>(),
+        reason: 'reachability succeeding is not enough on its own — the ticket mint call itself can still fail',
+      );
 
       await site.close(force: true);
     });
 
     test('unreachable page with no prior snapshot plans offlineNoSnapshot', () async {
+      fakeStore['server_url'] = 'http://127.0.0.1:1';
+      final secureStorage = SecureStorageService();
+      final handoffService = _FakeHandoffService(secureStorage);
+
       final coordinator = OfflinePageCoordinator(
         connectivityProbe: ConnectivityProbe(timeout: const Duration(milliseconds: 200)),
         captureService: captureService,
         snapshotStore: store,
         localServer: localServer,
+        handoffService: handoffService,
       );
 
-      final plan = await coordinator.plan(
-        parishId: 'witosa',
-        userId: '9001',
-        pageUrl: Uri.parse('http://127.0.0.1:1/public/dashboard.php'),
-      );
+      final plan = await coordinator.plan(parishId: 'witosa', userId: '9001', targetPath: '/public/dashboard.php');
       expect(plan, isA<PageLoadOfflineNoSnapshot>());
     });
 
     test('unreachable page WITH a prior snapshot plans offline, pointed at a working LocalSnapshotServer URL', () async {
+      fakeStore['server_url'] = 'http://127.0.0.1:1';
       await store.writeSnapshot(
         parishId: 'witosa',
         userId: '9001',
@@ -133,18 +238,18 @@ void main() {
         capturedAt: DateTime.utc(2026, 10, 1, 8, 42, 0),
       );
 
+      final secureStorage = SecureStorageService();
+      final handoffService = _FakeHandoffService(secureStorage);
+
       final coordinator = OfflinePageCoordinator(
         connectivityProbe: ConnectivityProbe(timeout: const Duration(milliseconds: 200)),
         captureService: captureService,
         snapshotStore: store,
         localServer: localServer,
+        handoffService: handoffService,
       );
 
-      final plan = await coordinator.plan(
-        parishId: 'witosa',
-        userId: '9001',
-        pageUrl: Uri.parse('http://127.0.0.1:1/public/dashboard.php'),
-      );
+      final plan = await coordinator.plan(parishId: 'witosa', userId: '9001', targetPath: '/public/dashboard.php');
       expect(plan, isA<PageLoadOffline>());
       final offlinePlan = plan as PageLoadOffline;
       expect(offlinePlan.capturedAt, DateTime.utc(2026, 10, 1, 8, 42, 0));
@@ -163,18 +268,23 @@ void main() {
       expect(formatOfflineBannerText(DateTime(2026, 10, 1, 23, 5)), 'OFFLINE • ostatnia synchronizacja: 23:05');
     });
 
-    test('captureInBackground eventually persists a snapshot without the caller awaiting it', () async {
+    test('captureInBackground eventually persists a snapshot keyed by targetPath, without the caller awaiting it', () async {
+      fakeStore['server_url'] = 'https://szarlej.ministrant.eu';
+      final secureStorage = SecureStorageService();
+      final handoffService = _FakeHandoffService(secureStorage);
+
       final coordinator = OfflinePageCoordinator(
         connectivityProbe: ConnectivityProbe(),
         captureService: captureService,
         snapshotStore: store,
         localServer: localServer,
+        handoffService: handoffService,
       );
 
       coordinator.captureInBackground(
         parishId: 'witosa',
         userId: '9001',
-        pageUrl: Uri.parse('http://127.0.0.1:1/public/dashboard.php'),
+        targetPath: '/public/dashboard.php',
         renderedHtml: '<html><body>Freshly rendered</body></html>',
       );
 

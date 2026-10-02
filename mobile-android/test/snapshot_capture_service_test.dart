@@ -86,7 +86,8 @@ void main() {
       await service.captureAndSave(
         parishId: 'witosa',
         userId: '9001',
-        pageUrl: onlineBaseUrl.resolve('/public/dashboard.php'),
+        serverBaseUrl: onlineBaseUrl,
+        targetPath: '/public/dashboard.php',
         renderedHtml: html,
       );
 
@@ -108,7 +109,8 @@ void main() {
         await service.captureAndSave(
           parishId: 'witosa',
           userId: '9001',
-          pageUrl: onlineBaseUrl.resolve('/public/dashboard.php'),
+          serverBaseUrl: onlineBaseUrl,
+        targetPath: '/public/dashboard.php',
           renderedHtml: html,
         );
 
@@ -148,14 +150,16 @@ void main() {
       await service.captureAndSave(
         parishId: 'witosa',
         userId: '9001',
-        pageUrl: onlineBaseUrl.resolve('/public/dashboard.php'),
+        serverBaseUrl: onlineBaseUrl,
+        targetPath: '/public/dashboard.php',
         renderedHtml: await fetchOnline('/public/dashboard.php'),
       );
 
       await service.captureAndSave(
         parishId: 'witosa',
         userId: '9001',
-        pageUrl: onlineBaseUrl.resolve('/public/dashboard.php'),
+        serverBaseUrl: onlineBaseUrl,
+        targetPath: '/public/dashboard.php',
         renderedHtml: '<html><body><p>Dashboard v2, no stylesheet or image at all</p></body></html>',
       );
 
@@ -174,7 +178,8 @@ void main() {
       await service.captureAndSave(
         parishId: 'witosa',
         userId: 'admin-1',
-        pageUrl: onlineBaseUrl.resolve('/public/dashboard.php'),
+        serverBaseUrl: onlineBaseUrl,
+        targetPath: '/public/dashboard.php',
         renderedHtml: html,
       );
 

@@ -36,40 +36,40 @@ class SnapshotCaptureService {
   final PageResourceDownloader downloader;
   final SnapshotStore store;
 
-  /// Captures [renderedHtml] (already fetched/rendered from [pageUrl] —
-  /// getting that render is a WebView-integration concern, deliberately
-  /// not this class's job; review round: "Nie będę tego łączył z
-  /// WebView na skróty") and atomically replaces this (parish, user,
-  /// page)'s snapshot with it.
+  /// Captures [renderedHtml] (already fetched/rendered — getting that
+  /// render is a WebView-integration concern, deliberately not this
+  /// class's job; review round: "Nie będę tego łączył z WebView na
+  /// skróty") and atomically replaces this (parish, user, page)'s
+  /// snapshot with it.
+  ///
+  /// P10 finding, against the REAL Szarlej installation: [targetPath] —
+  /// e.g. `/public/dashboard.php` — is the page's own identity, NEVER
+  /// the one-time `mobile_handoff.php?ticket=...` URL the WebView
+  /// actually navigated through to reach it (review round: "targetPath
+  /// ≠ handoffUrl... obowiązkowo"). [serverBaseUrl] (just the scheme +
+  /// host, e.g. `https://szarlej.ministrant.eu`) combined with
+  /// [targetPath] reconstructs the real, absolute URL this page is
+  /// actually located at, which is what [PageResourceDownloader] needs
+  /// to correctly resolve that page's own relative resource references
+  /// — resolving them against the handoff script's location instead
+  /// would silently produce wrong paths for every relative reference on
+  /// the page.
   Future<void> captureAndSave({
     required String parishId,
     required String userId,
-    required Uri pageUrl,
+    required Uri serverBaseUrl,
+    required String targetPath,
     required String renderedHtml,
   }) async {
+    final path = p.normalize(targetPath);
+    final pageUrl = serverBaseUrl.resolve(path);
     final captured = await downloader.capture(pageUrl: pageUrl, renderedHtml: renderedHtml);
     await store.writeSnapshot(
       parishId: parishId,
       userId: userId,
-      pagePath: _pagePathFor(pageUrl),
+      pagePath: path,
       html: captured.html,
       assets: captured.assets,
     );
   }
-
-  /// [SnapshotStore] keys a snapshot by site-relative PATH (review round
-  /// layout: `/public/dashboard.php`, never a full URL with scheme/host
-  /// baked in — the same page on a parish's http vs https, or reached
-  /// via two differently-cased hostnames, is still "the same page" for
-  /// snapshotting purposes). Query strings are deliberately dropped too,
-  /// matching [PageResourceDownloader]'s own asset-key convention
-  /// (`style.css?v=1` and `style.css?v=2` are the same underlying
-  /// resource) — a page reached as `/public/dashboard.php?tab=history`
-  /// and plain `/public/dashboard.php` share one snapshot slot. If a
-  /// real legacy page is ever found where that's actually wrong (the
-  /// query string genuinely selects different, worth-caching-separately
-  /// content), that's a real product decision to make with Dominik when
-  /// such a page is actually identified — not something to guess at
-  /// preemptively here.
-  String _pagePathFor(Uri pageUrl) => p.normalize(pageUrl.path);
 }
