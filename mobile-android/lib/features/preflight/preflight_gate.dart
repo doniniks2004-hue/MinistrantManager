@@ -72,8 +72,11 @@ class _PreflightGateState extends State<PreflightGate> {
 
   @override
   Widget build(BuildContext context) {
+    // Never block the application UI on the central config request. The child
+    // can render its local/offline state immediately; if config arrives later,
+    // this gate will rebuild and apply maintenance/update rules.
     if (!_checked) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+      return widget.child;
     }
 
     final config = _config;

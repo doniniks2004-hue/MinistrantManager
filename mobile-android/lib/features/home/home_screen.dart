@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import '../../core/util/store_link_launcher.dart';
 import '../../core/database/app_database.dart';
@@ -99,6 +100,45 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // unconditionally and first — it has no activation dependency and
     // must be available even to a screen that's about to show a blocking
     // UPDATE_REQUIRED/maintenance state.
+    // OFFLINE-FIRST: establish the local UI state before ANY network request.
+    final localHasUserSession = await widget.userSessionService.secureStorage.hasUserSession;
+    final localUserId = localHasUserSession ? await widget.userSessionService.secureStorage.currentUserId : null;
+    final localParishId = localHasUserSession ? await widget.userSessionService.secureStorage.parishId : null;
+    final localServerUrl = localHasUserSession ? await widget.userSessionService.secureStorage.serverUrl : null;
+    final localRoleId = localHasUserSession ? await widget.userSessionService.secureStorage.currentUserRoleId : null;
+    final localMeta = await widget.db.ensureSyncMetadata();
+    final localWithinLease = widget.syncEngine.offlineLease.isWithinLease(
+      localMeta.lastAuthorizationCheck,
+      leaseHours: localMeta.offlineLeaseHours,
+    );
+
+    List<ModuleDescriptor>? localModules;
+    final cachedModules = await widget.db.getDashboardConfig();
+    if (cachedModules != null) {
+      try {
+        localModules = ModuleDescriptor.parseList(
+          (jsonDecode(cachedModules.configJson) as List<dynamic>).cast<Map<String, dynamic>>(),
+        );
+      } catch (_) {
+        localModules = null;
+      }
+    }
+
+    if (localHasUserSession && localUserId != null && localParishId != null && localServerUrl != null && localWithinLease) {
+      if (mounted) {
+        setState(() {
+          _authState = DeviceAuthState.offlineWithinLease;
+          _hasUserSession = true;
+          _userId = localUserId;
+          _parishId = localParishId;
+          _serverUrl = localServerUrl;
+          _modules = localModules;
+          _userRoleId = localRoleId;
+        });
+      }
+    }
+
+    // Network config is deliberately fetched only after local UI state is rendered.
     final clientConfig = await widget.configService.loadClientConfig();
 
     final status = await widget.syncEngine.checkDeviceStatus(
