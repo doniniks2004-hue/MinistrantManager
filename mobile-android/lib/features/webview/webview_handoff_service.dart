@@ -1,3 +1,6 @@
+import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
+
 import '../../core/network/api_client.dart';
 import '../../core/secure/secure_storage_service.dart';
 
@@ -18,18 +21,43 @@ class WebviewHandoffService {
   /// to ever ask for a path this client didn't get from the server.
   ///
   /// Throws on any failure (network, auth, invalid path) — the caller
-  /// (LegacyModuleScreen) is expected to show its own error/retry state
-  /// rather than this service inventing one.
+  /// (LegacyModuleScreen / OfflinePageCoordinator) is expected to show
+  /// its own error/retry state (or fall back to offline) rather than
+  /// this service inventing one.
+  ///
+  /// K12 diagnostic round: every step logs via debugPrint, on BOTH the
+  /// success and failure path — review round's own request, since a
+  /// silent fallback to offline gave no way to tell "the server actually
+  /// rejected this" from "some precondition was never met" from "it
+  /// quietly worked and something ELSE failed afterward". Permanent, not
+  /// a throwaway print — never logs mobile_user_token/installation_id
+  /// VALUES (only whether they're present), since those are real
+  /// credentials; serverUrl and the ticket are logged in full, since
+  /// neither is sensitive the same way (the ticket is explicitly
+  /// short-lived and single-use by design).
   Future<Uri> requestHandoffUrl(String path) async {
-    final dio = await api.parish();
-    final resp = await dio.post('/mobile/webview/handoff', data: {'path': path});
-    final ticket = resp.data['ticket'] as String;
-
     final serverUrl = await secureStorage.serverUrl;
+    final hasToken = await secureStorage.mobileUserToken != null;
+    final hasInstallationId = await secureStorage.installationId != null;
+    debugPrint(
+      'WebviewHandoffService.requestHandoffUrl("$path"): '
+      'serverUrl=$serverUrl hasMobileUserToken=$hasToken hasInstallationId=$hasInstallationId',
+    );
+
+    final dio = await api.parish();
+    debugPrint('WebviewHandoffService: POST ${dio.options.baseUrl}/mobile/webview/handoff');
+    final resp = await dio.post('/mobile/webview/handoff', data: {'path': path}, options: Options(sendTimeout: const Duration(seconds: 2), connectTimeout: const Duration(seconds: 2), receiveTimeout: const Duration(seconds: 2)));
+    debugPrint('WebviewHandoffService: handoff response statusCode=${resp.statusCode} body=${resp.data}');
+
+    final ticket = resp.data['ticket'] as String;
+    debugPrint('WebviewHandoffService: ticket received (length=${ticket.length})');
+
     if (serverUrl == null) {
       throw StateError('No server_url — device not activated.');
     }
 
-    return Uri.parse('$serverUrl/public/mobile_handoff.php').replace(queryParameters: {'ticket': ticket});
+    final handoffUrl = Uri.parse('$serverUrl/public/mobile_handoff.php').replace(queryParameters: {'ticket': ticket});
+    debugPrint('WebviewHandoffService: final handoff URL = $handoffUrl');
+    return handoffUrl;
   }
 }

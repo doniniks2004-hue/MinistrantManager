@@ -1,3 +1,5 @@
+import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
 import '../../features/webview/webview_handoff_service.dart';
@@ -62,24 +64,50 @@ class OfflinePageCoordinator {
     required String targetPath,
   }) async {
     final path = p.normalize(targetPath);
-    final serverUrlString = await handoffService.secureStorage.serverUrl;
 
-    final reachable = serverUrlString != null && await connectivityProbe.canReach(Uri.parse(serverUrlString).resolve(path));
-    if (reachable) {
-      try {
-        final handoffUrl = await handoffService.requestHandoffUrl(path);
-        return PageLoadOnline(url: handoffUrl, targetPath: path);
-      } catch (_) {
-        // The ticket-mint call itself failed despite the server being
-        // reachable a moment ago (flaky connection, auth hiccup, ...) —
-        // fall through to the offline branch below rather than
-        // propagating this to the caller.
+    // The authenticated handoff request is the real online test. Do not
+    // perform a separate unauthenticated HEAD first: that creates a second
+    // network dependency and can reject a server that is perfectly capable
+    // of serving the actual mobile handoff. If the real request succeeds,
+    // the WebView gets the real PHP page immediately.
+    String? diagnosticMessage;
+    try {
+      final handoffUrl = await handoffService.requestHandoffUrl(path);
+      return PageLoadOnline(url: handoffUrl, targetPath: path);
+    } catch (e) {
+      // Real online handoff failed. Fall through to the last known-good
+      // snapshot. This is the only offline decision that matters to the UI
+      // — but WHY it failed must never be swallowed silently; a device
+      // that's actually online but falls back to "no snapshot" is
+      // indistinguishable from a genuinely offline one without this.
+      // DioException is by far the most informative/likely case (the
+      // real request actually reached the server and it said no) so it
+      // gets its own branch; anything else (StateError from
+      // ApiClient.parish()'s own precondition check — not activated, no
+      // mobile_user_token yet — or a cast failure on a malformed
+      // response) is printed as-is.
+      //
+      // K12 diagnostic round 3: debugPrint alone turned out to be
+      // unreliable to actually capture on a real device (no guarantee
+      // logcat is attached, or that a release APK's Dart stdout is even
+      // forwarded there) — this exact text is ALSO carried on
+      // PageLoadOfflineNoSnapshot itself, so the real device's OWN
+      // screen can show it directly, with no dependency on logcat
+      // working at all. Kept as a plain field (not removing the
+      // debugPrint above) since a working logcat is still the easier
+      // place to read it from once it IS working.
+      if (e is DioException) {
+        diagnosticMessage = 'DioException type=${e.type} statusCode=${e.response?.statusCode} '
+            'responseData=${e.response?.data} message=${e.message}';
+      } else {
+        diagnosticMessage = e.toString();
       }
+      debugPrint('OfflinePageCoordinator.plan(): online handoff for "$path" failed -- $diagnosticMessage');
     }
 
     final manifest = await snapshotStore.readManifestFor(parishId: parishId, userId: userId, pagePath: path);
     if (manifest == null) {
-      return const PageLoadOfflineNoSnapshot();
+      return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage);
     }
 
     final pageDir = await snapshotStore.getPageDirectoryIfReady(parishId: parishId, userId: userId, pagePath: path);
@@ -87,7 +115,7 @@ class OfflinePageCoordinator {
       // A manifest existed a moment ago but the directory is gone now
       // (e.g. a concurrent clearForUser/clearForParish mid-check) —
       // treat exactly like "no snapshot", never crash on the race.
-      return const PageLoadOfflineNoSnapshot();
+      return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage);
     }
 
     final port = await localServer.start();
@@ -168,7 +196,15 @@ class PageLoadOffline extends PageLoadPlan {
 /// should show an explanatory empty state rather than attempting to
 /// load anything.
 class PageLoadOfflineNoSnapshot extends PageLoadPlan {
-  const PageLoadOfflineNoSnapshot();
+  const PageLoadOfflineNoSnapshot({this.diagnosticMessage});
+
+  /// K12 diagnostic round 3: why the online attempt (if one was even
+  /// made) failed — null when this page was never actually attempted
+  /// online at all (shouldn't normally happen given plan() always tries
+  /// the handoff first, but kept nullable rather than assuming). Shown
+  /// directly on screen by the caller, specifically so this doesn't
+  /// depend on logcat being readable on the real device at all.
+  final String? diagnosticMessage;
 }
 
 /// "OFFLINE • ostatnia synchronizacja: HH:MM" — review round P7: "Jedyny
