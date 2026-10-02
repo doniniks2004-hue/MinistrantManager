@@ -123,7 +123,7 @@ class ActivationService {
         if (displayCode != null) 'display_code': displayCode,
       });
       final parish = resp.data['parish'] as Map<String, dynamic>;
-      return ActivationResult(parishName: parish['name'] as String, serverUrl: parish['server_url'] as String);
+      final serverUrl = _normalizeParishServerUrl(parish['server_url'] as String);\n      return ActivationResult(parishName: parish['name'] as String, serverUrl: serverUrl);
     } catch (_) {
       throw ActivationError('Kod aktywacyjny jest nieprawidłowy, wygasł lub został unieważniony.');
     }
