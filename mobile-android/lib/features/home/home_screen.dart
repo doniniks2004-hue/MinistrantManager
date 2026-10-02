@@ -7,6 +7,7 @@ import '../auth/user_session_service.dart';
 import '../config/config_service.dart';
 import '../../core/offline/offline_page_coordinator.dart';
 import '../revocation/revocation_handler.dart';
+import '../webview/offline_aware_page_screen.dart';
 
 /// Spec §26–§28: renders instantly from SQLite, shows an OFFLINE banner
 /// with the timestamp of the last known-good sync when relevant, and
