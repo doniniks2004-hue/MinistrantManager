@@ -71,7 +71,7 @@ class ConfigService {
       // expected JSON object. Treat any unexpected shape exactly like an
       // unavailable config and fall back to the cached copy.
       if (raw is! Map) {
-        return _cachedClientConfig();
+        return await _cachedClientConfig();
       }
 
       final data = Map<String, dynamic>.from(raw);
