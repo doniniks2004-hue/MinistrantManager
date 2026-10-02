@@ -256,11 +256,31 @@ void main() {
 
       // The capstone proof: the URL the plan hands back is ACTUALLY
       // servable, right now, by the SAME localServer instance.
-      final client = HttpClient();
-      final response = await (await client.getUrl(offlinePlan.url)).close();
-      expect(response.statusCode, 200);
-      final body = await utf8.decoder.bind(response).join();
-      expect(body, contains('Last known good'));
+      //
+      // Review round fix (test-harness bug, root-caused via the
+      // dedicated diagnostic test below — NOT a LocalSnapshotServer or
+      // OfflinePageCoordinator bug): this group's setUp() calls
+      // TestWidgetsFlutterBinding.ensureInitialized() (needed for the
+      // secure-storage MethodChannel mock), which installs
+      // flutter_test's own HttpOverrides — intercepting HttpClient
+      // globally and faking a 400 response instead of letting the
+      // request actually reach our real, listening LocalSnapshotServer.
+      // Temporarily clearing HttpOverrides.global escapes that ambient
+      // mock for exactly this one real TCP round-trip (restored in
+      // finally, so it never leaks into any other test in this file) —
+      // the same mechanism local_snapshot_server_test.dart's tests never
+      // needed because that file never calls ensureInitialized() at all.
+      final previousHttpOverrides = HttpOverrides.current;
+      HttpOverrides.global = null;
+      try {
+        final client = HttpClient();
+        final response = await (await client.getUrl(offlinePlan.url)).close();
+        expect(response.statusCode, 200);
+        final body = await utf8.decoder.bind(response).join();
+        expect(body, contains('Last known good'));
+      } finally {
+        HttpOverrides.global = previousHttpOverrides;
+      }
     });
 
     test(
@@ -296,18 +316,31 @@ void main() {
         // ignore: avoid_print
         print('DIAGNOSTIC localServer.isRunning = ${localServer.isRunning}, port = ${localServer.port}');
 
-        final client = HttpClient();
-        final request = await client.getUrl(offlinePlan.url);
-        // ignore: avoid_print
-        print('DIAGNOSTIC request.method = ${request.method}, request.uri = ${request.uri}');
-        final response = await request.close();
-        // ignore: avoid_print
-        print('DIAGNOSTIC statusCode = ${response.statusCode}, reasonPhrase = ${response.reasonPhrase}');
-        // ignore: avoid_print
-        print('DIAGNOSTIC headers = ${response.headers}');
-        final body = await utf8.decoder.bind(response).join();
-        // ignore: avoid_print
-        print('DIAGNOSTIC body = $body');
+        // Confirmed root cause (see this file's own capstone test for
+        // the full explanation): flutter_test's own ambient
+        // HttpOverrides, installed by this group's
+        // TestWidgetsFlutterBinding.ensureInitialized() call, faked the
+        // original 400 this diagnostic test was built to isolate.
+        // Escaped here too (restored in finally) so this diagnostic now
+        // shows the REAL response for confirmation.
+        final previousHttpOverrides = HttpOverrides.current;
+        HttpOverrides.global = null;
+        try {
+          final client = HttpClient();
+          final request = await client.getUrl(offlinePlan.url);
+          // ignore: avoid_print
+          print('DIAGNOSTIC request.method = ${request.method}, request.uri = ${request.uri}');
+          final response = await request.close();
+          // ignore: avoid_print
+          print('DIAGNOSTIC statusCode = ${response.statusCode}, reasonPhrase = ${response.reasonPhrase}');
+          // ignore: avoid_print
+          print('DIAGNOSTIC headers = ${response.headers}');
+          final body = await utf8.decoder.bind(response).join();
+          // ignore: avoid_print
+          print('DIAGNOSTIC body = $body');
+        } finally {
+          HttpOverrides.global = previousHttpOverrides;
+        }
 
         // Deliberately no hard assertion here beyond "the request completed" —
         // this test's entire purpose is the printed output above, not a
