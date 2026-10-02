@@ -29,6 +29,23 @@ function webview_module_registry(): array
     $adminOrPriestOrSenior = [1, 2, 3];
 
     return [
+        // P14 fix (real K12 finding): the app's online UI is now the
+        // real /public/dashboard.php itself, not a native screen — see
+        // the mobile app's own OfflinePageCoordinator/WebviewHandoffService.
+        // This entry exists ONLY so the handoff endpoint's path-lookup
+        // loop below finds it and mints a ticket for it; 'hidden' => true
+        // means build_dashboard_modules()'s own tile-building loop
+        // further down skips it, so it never ALSO shows up as a second,
+        // redundant tile in the native module list. required_role is
+        // null deliberately -- dashboard.php itself still does its own
+        // full session-based role rendering once the WebView actually
+        // loads it (same as every role already sees correctly today);
+        // this registry entry only controls whether a ticket can be
+        // minted for the path at all, not what the page then shows.
+        'dashboard' => [
+            'title' => 'Panel główny', 'path' => '/public/dashboard.php',
+            'icon' => 'home', 'order' => 0, 'required_role' => null, 'hidden' => true,
+        ],
         'justifications' => [
             'title' => 'Usprawiedliwienia', 'path' => '/public/justifications.php',
             'icon' => 'note', 'order' => 60, 'required_role' => null,
@@ -311,6 +328,14 @@ function build_modules(\mysqli $conn): array
     ];
 
     foreach (webview_module_registry() as $id => $def) {
+        // P14 fix: a registry entry that exists purely to be a legal
+        // handoff target (see 'dashboard' above) must never ALSO become
+        // a visible tile — it's not a feature a user taps into, it's
+        // the app's own main online UI, already shown without this list
+        // at all.
+        if ($def['hidden'] ?? false) {
+            continue;
+        }
         if (isset($def['enabled_check']) && !$def['enabled_check']($conn)) {
             continue;
         }
