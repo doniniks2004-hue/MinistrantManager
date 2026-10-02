@@ -118,10 +118,14 @@ class ActivationService {
   /// "✓ Znaleziono parafię ... [AKTYWUJ]" confirmation screen.
   Future<ActivationResult> checkCode({String? token, String? displayCode}) async {
     try {
-      final resp = await api.central.post('/activation/check', data: {
-        if (token != null) 'token': token,
-        if (displayCode != null) 'display_code': displayCode,
-      });
+      final resp = await api.central.post(
+        '/activation/check',
+        data: {
+          if (token != null) 'token': token,
+          if (displayCode != null) 'display_code': displayCode,
+        },
+        options: Options(contentType: Headers.formUrlEncodedContentType),
+      );
       final parish = resp.data['parish'] as Map<String, dynamic>;
       return ActivationResult(parishName: parish['name'] as String, serverUrl: parish['server_url'] as String);
     } catch (_) {
@@ -137,12 +141,16 @@ class ActivationService {
     final meta = await _deviceMeta();
 
     try {
-      final resp = await api.central.post('/activation/confirm', data: {
-        if (token != null) 'token': token,
-        if (displayCode != null) 'display_code': displayCode,
-        'installation_id': installationId,
-        ...meta,
-      });
+      final resp = await api.central.post(
+        '/activation/confirm',
+        data: {
+          if (token != null) 'token': token,
+          if (displayCode != null) 'display_code': displayCode,
+          'installation_id': installationId,
+          ...meta,
+        },
+        options: Options(contentType: Headers.formUrlEncodedContentType),
+      );
 
       final parish = resp.data['parish'] as Map<String, dynamic>;
       final device = resp.data['device'] as Map<String, dynamic>;
