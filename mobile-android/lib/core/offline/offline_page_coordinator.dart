@@ -62,19 +62,18 @@ class OfflinePageCoordinator {
     required String targetPath,
   }) async {
     final path = p.normalize(targetPath);
-    final serverUrlString = await handoffService.secureStorage.serverUrl;
 
-    final reachable = serverUrlString != null && await connectivityProbe.canReach(Uri.parse(serverUrlString).resolve(path));
-    if (reachable) {
-      try {
-        final handoffUrl = await handoffService.requestHandoffUrl(path);
-        return PageLoadOnline(url: handoffUrl, targetPath: path);
-      } catch (_) {
-        // The ticket-mint call itself failed despite the server being
-        // reachable a moment ago (flaky connection, auth hiccup, ...) —
-        // fall through to the offline branch below rather than
-        // propagating this to the caller.
-      }
+    // The authenticated handoff request is the real online test. Do not
+    // perform a separate unauthenticated HEAD first: that creates a second
+    // network dependency and can reject a server that is perfectly capable
+    // of serving the actual mobile handoff. If the real request succeeds,
+    // the WebView gets the real PHP page immediately.
+    try {
+      final handoffUrl = await handoffService.requestHandoffUrl(path);
+      return PageLoadOnline(url: handoffUrl, targetPath: path);
+    } catch (_) {
+      // Real online handoff failed. Fall through to the last known-good
+      // snapshot. This is the only offline decision that matters to the UI.
     }
 
     final manifest = await snapshotStore.readManifestFor(parishId: parishId, userId: userId, pagePath: path);
