@@ -35,6 +35,7 @@ class OfflineAwarePageScreen extends StatefulWidget {
     required this.parishId,
     required this.userId,
     required this.coordinator,
+    this.onLogout,
   });
 
   final String title;
@@ -53,6 +54,7 @@ class OfflineAwarePageScreen extends StatefulWidget {
   final String parishId;
   final String userId;
   final OfflinePageCoordinator coordinator;
+  final Future<void> Function()? onLogout;
 
   @override
   State<OfflineAwarePageScreen> createState() => _OfflineAwarePageScreenState();
@@ -101,18 +103,21 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
   String? _errorMessage;
   String? _offlineBannerText;
 
+  /// K12 diagnostic round 3: why the online handoff attempt failed,
+  /// shown directly on the noSnapshot screen below — see
+  /// PageLoadOfflineNoSnapshot's own field docblock for why this
+  /// doesn't depend on logcat being readable on the real device at all.
+  String? _noSnapshotDiagnostic;
+
   /// Set once [widget.coordinator.plan] actually returns — governs both
   /// whether a finished page load should trigger a background capture
   /// AND which host [_decideNavigation] allows, so it is never left at
   /// a stale default while a plan is in flight.
   bool _isOnlineMode = true;
 
-  /// P10: driven by the legacy page's own scroll-direction bridge
-  /// messages — review round: a native-feeling collapsing top bar, the
-  /// SAME cosmetic behavior footer.php's own (previously unconnected)
-  /// JS already describes ("jak w Facebooku"). Purely visual; never
-  /// affects navigation, capture, or the online/offline decision.
-  bool _appBarVisible = true;
+  /// Legacy PHP may send scroll-direction bridge messages. The bridge is
+  /// retained for compatibility, but the PHP page remains visually in
+  /// charge; no native app bar is added.
 
   @override
   void initState() {
@@ -177,11 +182,8 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
           }
           break;
         case 'scroll':
-          final direction = data['direction'] as String?;
-          final shouldShow = direction != 'down';
-          if (shouldShow != _appBarVisible && mounted) {
-            setState(() => _appBarVisible = shouldShow);
-          }
+          // The legacy page owns its own header. Scroll messages are
+          // intentionally not used to alter native UI.
           break;
         case 'debug_ping':
           // No app-side action — purely a liveness signal from the
@@ -196,6 +198,16 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
 
   void _onPageFinished(String url) {
     if (mounted) setState(() => _state = _LoadState.ready);
+
+    final finishedUri = Uri.tryParse(url);
+    if (widget.onLogout != null &&
+        finishedUri != null &&
+        finishedUri.host == widget.allowedHost &&
+        finishedUri.path.toLowerCase().contains('logout')) {
+      widget.onLogout!();
+      return;
+    }
+
     if (_isOnlineMode) {
       // Review round §6: "Cały wyrenderowany DOM" — outerHTML of the
       // root element, not the server's original response body, so
@@ -258,7 +270,10 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
         break;
       case PageLoadOfflineNoSnapshot():
         _isOnlineMode = false;
-        setState(() => _state = _LoadState.noSnapshot);
+        setState(() {
+          _state = _LoadState.noSnapshot;
+          _noSnapshotDiagnostic = plan.diagnosticMessage;
+        });
     }
   }
 
@@ -284,24 +299,8 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
       child: Scaffold(
         body: Column(
           children: [
-            // P10: a native-feeling collapsing top bar — purely visual,
-            // see _appBarVisible's own docblock. Deliberately a simple
-            // show/hide rather than an animated height: AppBar assumes
-            // a fixed internal layout, and forcing it through a
-            // shrinking height mid-transition risks a real overflow
-            // error on-device for a purely cosmetic feature — not worth
-            // that risk for something this minor.
-            if (_appBarVisible)
-              AppBar(
-                title: Text(widget.title),
-                actions: [
-                  if (_state == _LoadState.ready)
-                    IconButton(icon: const Icon(Icons.refresh), onPressed: _loadPage),
-                ],
-              ),
-            // Review round P7: "Jedyny dodatkowy element aplikacji" — one
-            // thin banner line, nothing else about the page's own look
-            // changes between online and offline.
+            // The PHP page owns the entire visual chrome. The app adds
+            // exactly one native element when offline: the status banner.
             if (_offlineBannerText != null)
               Container(
                 width: double.infinity,
@@ -323,9 +322,40 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
   Widget _buildBody() {
     switch (_state) {
       case _LoadState.noSnapshot:
-        return const _MessageState(
-          icon: Icons.wifi_off,
-          message: 'Brak zapisanej wersji tej strony. Połącz się z internetem, aby ją pobrać.',
+        // K12 diagnostic round 3: the diagnostic block below is
+        // deliberately SelectableText (not plain Text, like the rest of
+        // this message) specifically so it can be copied directly off
+        // the device screen and relayed verbatim — no re-typing from a
+        // photo, no transcription mistakes.
+        return Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.wifi_off, size: 48, color: Colors.grey),
+                const SizedBox(height: 16),
+                const Text(
+                  'Brak zapisanej wersji tej strony. Połącz się z internetem, aby ją pobrać.',
+                  textAlign: TextAlign.center,
+                ),
+                if (_noSnapshotDiagnostic != null) ...[
+                  const SizedBox(height: 20),
+                  const Text(
+                    'DIAGNOSTYKA (dla programisty):',
+                    style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.grey),
+                  ),
+                  const SizedBox(height: 4),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(color: Colors.grey.shade200, borderRadius: BorderRadius.circular(4)),
+                    child: SelectableText(_noSnapshotDiagnostic!, style: const TextStyle(fontSize: 11, fontFamily: 'monospace')),
+                  ),
+                ],
+              ],
+            ),
+          ),
         );
       case _LoadState.error:
         return _MessageState(

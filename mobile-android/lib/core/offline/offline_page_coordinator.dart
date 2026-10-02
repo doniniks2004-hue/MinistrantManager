@@ -70,6 +70,7 @@ class OfflinePageCoordinator {
     // network dependency and can reject a server that is perfectly capable
     // of serving the actual mobile handoff. If the real request succeeds,
     // the WebView gets the real PHP page immediately.
+    String? diagnosticMessage;
     try {
       final handoffUrl = await handoffService.requestHandoffUrl(path);
       return PageLoadOnline(url: handoffUrl, targetPath: path);
@@ -85,20 +86,28 @@ class OfflinePageCoordinator {
       // ApiClient.parish()'s own precondition check — not activated, no
       // mobile_user_token yet — or a cast failure on a malformed
       // response) is printed as-is.
+      //
+      // K12 diagnostic round 3: debugPrint alone turned out to be
+      // unreliable to actually capture on a real device (no guarantee
+      // logcat is attached, or that a release APK's Dart stdout is even
+      // forwarded there) — this exact text is ALSO carried on
+      // PageLoadOfflineNoSnapshot itself, so the real device's OWN
+      // screen can show it directly, with no dependency on logcat
+      // working at all. Kept as a plain field (not removing the
+      // debugPrint above) since a working logcat is still the easier
+      // place to read it from once it IS working.
       if (e is DioException) {
-        debugPrint(
-          'OfflinePageCoordinator.plan(): online handoff for "$path" failed -- '
-          'DioException type=${e.type} statusCode=${e.response?.statusCode} '
-          'responseData=${e.response?.data} message=${e.message}',
-        );
+        diagnosticMessage = 'DioException type=${e.type} statusCode=${e.response?.statusCode} '
+            'responseData=${e.response?.data} message=${e.message}';
       } else {
-        debugPrint('OfflinePageCoordinator.plan(): online handoff for "$path" failed -- $e');
+        diagnosticMessage = e.toString();
       }
+      debugPrint('OfflinePageCoordinator.plan(): online handoff for "$path" failed -- $diagnosticMessage');
     }
 
     final manifest = await snapshotStore.readManifestFor(parishId: parishId, userId: userId, pagePath: path);
     if (manifest == null) {
-      return const PageLoadOfflineNoSnapshot();
+      return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage);
     }
 
     final pageDir = await snapshotStore.getPageDirectoryIfReady(parishId: parishId, userId: userId, pagePath: path);
@@ -106,7 +115,7 @@ class OfflinePageCoordinator {
       // A manifest existed a moment ago but the directory is gone now
       // (e.g. a concurrent clearForUser/clearForParish mid-check) —
       // treat exactly like "no snapshot", never crash on the race.
-      return const PageLoadOfflineNoSnapshot();
+      return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage);
     }
 
     final port = await localServer.start();
@@ -187,7 +196,15 @@ class PageLoadOffline extends PageLoadPlan {
 /// should show an explanatory empty state rather than attempting to
 /// load anything.
 class PageLoadOfflineNoSnapshot extends PageLoadPlan {
-  const PageLoadOfflineNoSnapshot();
+  const PageLoadOfflineNoSnapshot({this.diagnosticMessage});
+
+  /// K12 diagnostic round 3: why the online attempt (if one was even
+  /// made) failed — null when this page was never actually attempted
+  /// online at all (shouldn't normally happen given plan() always tries
+  /// the handoff first, but kept nullable rather than assuming). Shown
+  /// directly on screen by the caller, specifically so this doesn't
+  /// depend on logcat being readable on the real device at all.
+  final String? diagnosticMessage;
 }
 
 /// "OFFLINE • ostatnia synchronizacja: HH:MM" — review round P7: "Jedyny

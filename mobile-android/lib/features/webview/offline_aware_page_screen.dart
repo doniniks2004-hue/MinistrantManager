@@ -103,6 +103,12 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
   String? _errorMessage;
   String? _offlineBannerText;
 
+  /// K12 diagnostic round 3: why the online handoff attempt failed,
+  /// shown directly on the noSnapshot screen below — see
+  /// PageLoadOfflineNoSnapshot's own field docblock for why this
+  /// doesn't depend on logcat being readable on the real device at all.
+  String? _noSnapshotDiagnostic;
+
   /// Set once [widget.coordinator.plan] actually returns — governs both
   /// whether a finished page load should trigger a background capture
   /// AND which host [_decideNavigation] allows, so it is never left at
@@ -264,7 +270,10 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
         break;
       case PageLoadOfflineNoSnapshot():
         _isOnlineMode = false;
-        setState(() => _state = _LoadState.noSnapshot);
+        setState(() {
+          _state = _LoadState.noSnapshot;
+          _noSnapshotDiagnostic = plan.diagnosticMessage;
+        });
     }
   }
 
@@ -313,9 +322,40 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
   Widget _buildBody() {
     switch (_state) {
       case _LoadState.noSnapshot:
-        return const _MessageState(
-          icon: Icons.wifi_off,
-          message: 'Brak zapisanej wersji tej strony. Połącz się z internetem, aby ją pobrać.',
+        // K12 diagnostic round 3: the diagnostic block below is
+        // deliberately SelectableText (not plain Text, like the rest of
+        // this message) specifically so it can be copied directly off
+        // the device screen and relayed verbatim — no re-typing from a
+        // photo, no transcription mistakes.
+        return Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.wifi_off, size: 48, color: Colors.grey),
+                const SizedBox(height: 16),
+                const Text(
+                  'Brak zapisanej wersji tej strony. Połącz się z internetem, aby ją pobrać.',
+                  textAlign: TextAlign.center,
+                ),
+                if (_noSnapshotDiagnostic != null) ...[
+                  const SizedBox(height: 20),
+                  const Text(
+                    'DIAGNOSTYKA (dla programisty):',
+                    style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.grey),
+                  ),
+                  const SizedBox(height: 4),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(color: Colors.grey.shade200, borderRadius: BorderRadius.circular(4)),
+                    child: SelectableText(_noSnapshotDiagnostic!, style: const TextStyle(fontSize: 11, fontFamily: 'monospace')),
+                  ),
+                ],
+              ],
+            ),
+          ),
         );
       case _LoadState.error:
         return _MessageState(
