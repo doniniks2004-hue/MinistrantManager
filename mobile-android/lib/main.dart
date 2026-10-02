@@ -184,6 +184,7 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
       _syncEngine = null;
       _activationService = null;
       _revocationHandler = null;
+      _offlinePageCoordinator = null;
       _configService = null;
       _userSessionService = null;
     });
@@ -217,7 +218,6 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
               child: _isActivated!
                   ? HomeScreen(
                       db: _db!,
-                      api: _api,
                       syncEngine: _syncEngine!,
                       configService: _configService!,
                       revocationHandler: _revocationHandler!,

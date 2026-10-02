@@ -35,6 +35,7 @@ class OfflineAwarePageScreen extends StatefulWidget {
     required this.parishId,
     required this.userId,
     required this.coordinator,
+    this.onLogout,
   });
 
   final String title;
@@ -53,6 +54,7 @@ class OfflineAwarePageScreen extends StatefulWidget {
   final String parishId;
   final String userId;
   final OfflinePageCoordinator coordinator;
+  final Future<void> Function()? onLogout;
 
   @override
   State<OfflineAwarePageScreen> createState() => _OfflineAwarePageScreenState();
@@ -107,12 +109,9 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
   /// a stale default while a plan is in flight.
   bool _isOnlineMode = true;
 
-  /// P10: driven by the legacy page's own scroll-direction bridge
-  /// messages — review round: a native-feeling collapsing top bar, the
-  /// SAME cosmetic behavior footer.php's own (previously unconnected)
-  /// JS already describes ("jak w Facebooku"). Purely visual; never
-  /// affects navigation, capture, or the online/offline decision.
-  bool _appBarVisible = true;
+  /// Legacy PHP may send scroll-direction bridge messages. The bridge is
+  /// retained for compatibility, but the PHP page remains visually in
+  /// charge; no native app bar is added.
 
   @override
   void initState() {
@@ -177,11 +176,8 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
           }
           break;
         case 'scroll':
-          final direction = data['direction'] as String?;
-          final shouldShow = direction != 'down';
-          if (shouldShow != _appBarVisible && mounted) {
-            setState(() => _appBarVisible = shouldShow);
-          }
+          // The legacy page owns its own header. Scroll messages are
+          // intentionally not used to alter native UI.
           break;
         case 'debug_ping':
           // No app-side action — purely a liveness signal from the
@@ -196,6 +192,16 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
 
   void _onPageFinished(String url) {
     if (mounted) setState(() => _state = _LoadState.ready);
+
+    final finishedUri = Uri.tryParse(url);
+    if (widget.onLogout != null &&
+        finishedUri != null &&
+        finishedUri.host == widget.allowedHost &&
+        finishedUri.path.toLowerCase().contains('logout')) {
+      widget.onLogout!();
+      return;
+    }
+
     if (_isOnlineMode) {
       // Review round §6: "Cały wyrenderowany DOM" — outerHTML of the
       // root element, not the server's original response body, so
@@ -284,24 +290,8 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
       child: Scaffold(
         body: Column(
           children: [
-            // P10: a native-feeling collapsing top bar — purely visual,
-            // see _appBarVisible's own docblock. Deliberately a simple
-            // show/hide rather than an animated height: AppBar assumes
-            // a fixed internal layout, and forcing it through a
-            // shrinking height mid-transition risks a real overflow
-            // error on-device for a purely cosmetic feature — not worth
-            // that risk for something this minor.
-            if (_appBarVisible)
-              AppBar(
-                title: Text(widget.title),
-                actions: [
-                  if (_state == _LoadState.ready)
-                    IconButton(icon: const Icon(Icons.refresh), onPressed: _loadPage),
-                ],
-              ),
-            // Review round P7: "Jedyny dodatkowy element aplikacji" — one
-            // thin banner line, nothing else about the page's own look
-            // changes between online and offline.
+            // The PHP page owns the entire visual chrome. The app adds
+            // exactly one native element when offline: the status banner.
             if (_offlineBannerText != null)
               Container(
                 width: double.infinity,

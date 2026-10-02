@@ -1,14 +1,11 @@
 import 'package:flutter/material.dart';
 import '../../core/util/store_link_launcher.dart';
 import '../../core/database/app_database.dart';
-import '../../core/network/api_client.dart';
 import '../../core/sync/sync_engine.dart';
 import '../auth/login_screen.dart';
 import '../auth/user_session_service.dart';
 import '../config/config_service.dart';
 import '../../core/offline/offline_page_coordinator.dart';
-import '../dashboard/dashboard_screen.dart';
-import '../dashboard/module_descriptor.dart';
 import '../revocation/revocation_handler.dart';
 
 /// Spec §26–§28: renders instantly from SQLite, shows an OFFLINE banner
@@ -16,18 +13,15 @@ import '../revocation/revocation_handler.dart';
 /// updates reactively once the background sync completes.
 ///
 /// Hybrid dashboard milestone: this screen owns the DEVICE-level
-/// lifecycle (status/heartbeat/revoke/offline-lease, maintenance/update-
-/// required — all unchanged) AND the USER-level lifecycle on top of it:
-/// once the device is confirmed active/offline-ok, it checks whether a
-/// `mobile_user_token` exists (UserSessionService) and shows LoginScreen
-/// if not, or DashboardScreen if so — the dashboard, not a single fixed
-/// screen, is the top-level post-login content now; individual modules
-/// (native or WebView) are reached BY NAVIGATING FROM the dashboard.
+/// Owns device/user lifecycle and, after login, opens the real legacy PHP
+/// dashboard through the offline-aware WebView. The PHP page is the
+/// single source of truth for the post-login UI; native Flutter UI is
+/// intentionally limited to activation, login, device state and the
+/// single allowed offline-status banner.
 class HomeScreen extends StatefulWidget {
   const HomeScreen({
     super.key,
     required this.db,
-    required this.api,
     required this.syncEngine,
     required this.configService,
     required this.revocationHandler,
@@ -39,7 +33,6 @@ class HomeScreen extends StatefulWidget {
   });
 
   final AppDatabase db;
-  final ApiClient api;
   final SyncEngine syncEngine;
   final ConfigService configService;
   final RevocationHandler revocationHandler;
@@ -68,12 +61,11 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   DeviceAuthState? _authState;
   String? _minimumSupportedAppVersion;
-  DateTime? _lastSyncAt;
-  bool _lastSyncFailed = false;
   Map<String, dynamic>? _clientConfig;
   bool? _hasUserSession; // null while checking
-  List<ModuleDescriptor>? _modules;
-  int? _userRoleId;
+  int? _userId;
+  String? _parishId;
+  String? _serverUrl;
 
   @override
   void initState() {
@@ -152,7 +144,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       try {
         await widget.syncEngine.runFullSync();
         await widget.syncEngine.heartbeat(appVersion: widget.appVersion, osVersion: widget.osVersion);
-        _lastSyncFailed = false;
+        // Online sync succeeded; the PHP dashboard below remains the single source of truth for the UI.
       } on ParishSessionExpiredException {
         // Review round point 4: the PARISH rejected the mobile_user_token
         // — a USER session problem, never a device problem. Clear ONLY
@@ -170,46 +162,32 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         // silently render an empty dashboard/module as if the user
         // genuinely had no data, while the sync in fact never even ran.
         debugPrint('Parish contract error during sync: $e');
-        _lastSyncFailed = true;
+        // Keep the authenticated PHP dashboard as the UI source of truth even if background sync fails.
       } catch (_) {
         // Genuine transport failure / timeout / 5xx — cached data on
         // screen is still valid, no visible error needed (spec §26).
       }
     }
 
-    // Hybrid dashboard milestone: the module list itself also survives
-    // offline (ConfigService's own cache-fallback) — a fresh install with
-    // no cache yet and no connectivity is the only case with nothing to
-    // show, same as any other config-dependent screen.
-    List<ModuleDescriptor>? modules;
-    int? roleId;
-    if (hasUserSession) {
-      final rawModules = await widget.configService.loadModules();
-      modules = rawModules != null ? ModuleDescriptor.parseList(rawModules) : null;
-      roleId = await widget.userSessionService.secureStorage.currentUserRoleId;
-    }
+    // The legacy PHP dashboard is the single UI source of truth. Native
+    // module descriptors are deliberately not loaded here: doing so would
+    // recreate the hybrid dashboard we are explicitly replacing.
+    final userId = hasUserSession ? await widget.userSessionService.secureStorage.currentUserId : null;
+    final parishId = hasUserSession ? await widget.userSessionService.secureStorage.parishId : null;
+    final serverUrl = hasUserSession ? await widget.userSessionService.secureStorage.serverUrl : null;
 
-    final meta = await widget.db.ensureSyncMetadata();
+    await widget.db.ensureSyncMetadata();
     setState(() {
-      _lastSyncAt = meta.lastSyncAt;
       _hasUserSession = hasUserSession;
-      _modules = modules;
-      _userRoleId = roleId;
+      _userId = userId;
+      _parishId = parishId;
+      _serverUrl = serverUrl;
     });
   }
 
   void _onLoggedIn() {
     setState(() => _hasUserSession = true);
     _bootstrapThenSync();
-  }
-
-  Future<void> _onLogout() async {
-    await widget.userSessionService.logout();
-    setState(() {
-      _hasUserSession = false;
-      _modules = null;
-      _userRoleId = null;
-    });
   }
 
   Future<void> _openStoreListing() async {
@@ -330,34 +308,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return LoginScreen(userSessionService: widget.userSessionService, onLoggedIn: _onLoggedIn);
     }
 
-    if (_modules == null) {
-      // Logged in, but the module list hasn't resolved yet (first frame,
-      // or genuinely offline with no cache at all yet).
+    if (_userId == null || _parishId == null || _serverUrl == null) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
-    final showOffline = _authState == DeviceAuthState.offlineWithinLease;
-
-    return DashboardScreen(
-      modules: _modules!,
-      userRoleId: _userRoleId,
-      db: widget.db,
-      secureStorage: widget.userSessionService.secureStorage,
-      offlinePageCoordinator: widget.offlinePageCoordinator,
-      appVersion: widget.appVersion,
-      isOnline: !showOffline,
-      syncFailed: _lastSyncFailed,
-      lastSyncAt: _lastSyncAt,
-      onSync: _bootstrapThenSync,
-      onLogout: _onLogout,
-      revocationHandler: widget.revocationHandler,
-      // Offline-architecture milestone, P9: a manual "Zmień parafię"
-      // completing is, deliberately, handled by the EXACT SAME callback
-      // as a server-reported revocation — both end with the app back at
-      // the activation screen with fresh services, and there is only
-      // ever one correct way to do that rebuild (see main.dart's own
-      // _onRevoked docblock).
-      onParishReset: widget.onRevoked,
+    return OfflineAwarePageScreen(
+      title: 'Ministrant Manager',
+      targetPath: '/public/dashboard.php',
+      allowedHost: Uri.parse(_serverUrl!).host,
+      parishId: _parishId!,
+      userId: _userId!.toString(),
+      coordinator: widget.offlinePageCoordinator,
+      onLogout: () async {
+        await widget.userSessionService.logout();
+        if (mounted) {
+          setState(() {
+            _hasUserSession = false;
+            _userId = null;
+          });
+        }
+      },
     );
   }
 }
