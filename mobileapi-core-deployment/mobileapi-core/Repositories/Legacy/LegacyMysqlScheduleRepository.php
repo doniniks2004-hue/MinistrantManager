@@ -37,8 +37,22 @@ final class LegacyMysqlScheduleRepository implements ScheduleRepositoryInterface
         );
         $stmt->bind_param('ss', $fromStr, $toStr);
         $stmt->execute();
-        $result = $stmt->get_result();
-        while ($row = $result->fetch_assoc()) {
+        $id = null;
+        $eventId = null;
+        $userId = null;
+        $guestName = null;
+        $isPresent = null;
+        $status = null;
+        $stmt->bind_result($id, $eventId, $userId, $guestName, $isPresent, $status);
+        while ($stmt->fetch()) {
+            $row = [
+                'id' => $id,
+                'event_id' => $eventId,
+                'user_id' => $userId,
+                'guest_name' => $guestName,
+                'is_present' => $isPresent,
+                'status' => $status,
+            ];
             $rows[] = [
                 // Review round fix, point 4: canonical string keys, both
                 // for this row's own id AND for the event it references —
@@ -69,8 +83,14 @@ final class LegacyMysqlScheduleRepository implements ScheduleRepositoryInterface
         );
         $stmt->bind_param('ss', $fromStr, $toStr);
         $stmt->execute();
-        $result = $stmt->get_result();
-        while ($row = $result->fetch_assoc()) {
+        $id = null;
+        $userId = null;
+        $stmt->bind_result($id, $userId);
+        while ($stmt->fetch()) {
+            $row = [
+                'id' => $id,
+                'user_id' => $userId,
+            ];
             $rows[] = [
                 // This assignment IS the weekday_events row — its own
                 // canonical id and its event_id are the same value,
