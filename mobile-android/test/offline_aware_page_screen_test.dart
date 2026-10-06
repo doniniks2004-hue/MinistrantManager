@@ -1,0 +1,346 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:ministrant_manager/core/network/api_client.dart';
+import 'package:ministrant_manager/core/offline/connectivity_probe.dart';
+import 'package:ministrant_manager/core/offline/local_snapshot_server.dart';
+import 'package:ministrant_manager/core/offline/offline_page_coordinator.dart';
+import 'package:ministrant_manager/core/offline/page_resource_downloader.dart';
+import 'package:ministrant_manager/core/offline/snapshot_capture_service.dart';
+import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
+import 'package:ministrant_manager/core/offline/snapshot_store.dart';
+import 'package:ministrant_manager/core/secure/secure_storage_service.dart';
+import 'package:ministrant_manager/features/webview/offline_aware_page_screen.dart';
+import 'package:ministrant_manager/features/webview/webview_handoff_service.dart';
+import 'package:webview_flutter/webview_flutter.dart' show WebViewWidget;
+import 'package:webview_flutter_platform_interface/webview_flutter_platform_interface.dart';
+
+/// Screen-LOGIC tests only. A fake WebViewPlatform replaces Chromium /
+/// WKWebView, so these check what OfflineAwarePageScreen decides and when
+/// (timers, overlay, mounting, stale results) — NOT that a real browser
+/// engine renders anything. Real rendering, cold start with the radios
+/// off, and the 2 s target still need a device.
+
+// ---------------------------------------------------------------------------
+// Fake platform (signatures taken from webview_flutter_platform_interface
+// 2.15.1, the version pinned in pubspec.lock).
+// ---------------------------------------------------------------------------
+
+class _FakePlatform extends WebViewPlatform {
+  final controllers = <_FakeController>[];
+  final delegates = <_FakeDelegate>[];
+
+  @override
+  PlatformWebViewController createPlatformWebViewController(
+    PlatformWebViewControllerCreationParams params,
+  ) {
+    final controller = _FakeController(params);
+    controllers.add(controller);
+    return controller;
+  }
+
+  @override
+  PlatformNavigationDelegate createPlatformNavigationDelegate(
+    PlatformNavigationDelegateCreationParams params,
+  ) {
+    final delegate = _FakeDelegate(params);
+    delegates.add(delegate);
+    return delegate;
+  }
+
+  @override
+  PlatformWebViewWidget createPlatformWebViewWidget(
+    PlatformWebViewWidgetCreationParams params,
+  ) => _FakeWidget(params);
+}
+
+class _FakeController extends PlatformWebViewController {
+  _FakeController(PlatformWebViewControllerCreationParams params)
+    : super.implementation(params);
+
+  /// Whether the web view widget was already part of the tree.
+  bool attached = false;
+
+  /// For every loadRequest: was the widget attached at that moment?
+  final attachedAtLoad = <bool>[];
+  final loaded = <Uri>[];
+
+  @override
+  Future<void> setJavaScriptMode(JavaScriptMode javaScriptMode) async {}
+
+  @override
+  Future<void> addJavaScriptChannel(
+    JavaScriptChannelParams javaScriptChannelParams,
+  ) async {}
+
+  @override
+  Future<void> setPlatformNavigationDelegate(
+    PlatformNavigationDelegate handler,
+  ) async {}
+
+  @override
+  Future<void> loadRequest(LoadRequestParams params) async {
+    attachedAtLoad.add(attached);
+    loaded.add(params.uri);
+  }
+
+  @override
+  Future<void> runJavaScript(String javaScript) async {}
+
+  @override
+  Future<bool> canGoBack() async => false;
+
+  @override
+  Future<void> goBack() async {}
+
+  @override
+  Future<void> loadHtmlString(String html, {String? baseUrl}) async {}
+
+  @override
+  Future<void> clearCache() async {}
+
+  @override
+  Future<void> clearLocalStorage() async {}
+}
+
+class _FakeDelegate extends PlatformNavigationDelegate {
+  _FakeDelegate(PlatformNavigationDelegateCreationParams params)
+    : super.implementation(params);
+
+  PageEventCallback? onPageFinished;
+
+  @override
+  Future<void> setOnNavigationRequest(
+    NavigationRequestCallback onNavigationRequest,
+  ) async {}
+
+  @override
+  Future<void> setOnPageStarted(PageEventCallback onPageStarted) async {}
+
+  @override
+  Future<void> setOnPageFinished(PageEventCallback onPageFinished) async {
+    this.onPageFinished = onPageFinished;
+  }
+
+  @override
+  Future<void> setOnHttpError(HttpResponseErrorCallback onHttpError) async {}
+
+  @override
+  Future<void> setOnWebResourceError(
+    WebResourceErrorCallback onWebResourceError,
+  ) async {}
+}
+
+class _FakeWidget extends PlatformWebViewWidget {
+  _FakeWidget(PlatformWebViewWidgetCreationParams params)
+    : super.implementation(params);
+
+  @override
+  Widget build(BuildContext context) {
+    (params.controller as _FakeController).attached = true;
+    return const SizedBox.expand(key: Key('fake-web-view'));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Coordinator whose plan() is scripted; everything else is the real class
+// (never touched: nothing here reads the store or starts the server).
+// ---------------------------------------------------------------------------
+
+final _encryptor = SnapshotEncryptor(hexKey: 'a' * 64);
+
+class _ScriptedCoordinator extends OfflinePageCoordinator {
+  factory _ScriptedCoordinator(
+    Future<PageLoadPlan> Function(bool forceOffline) script,
+  ) => _ScriptedCoordinator._(SnapshotStore(encryptor: _encryptor), script);
+
+  _ScriptedCoordinator._(SnapshotStore store, this.script)
+    : super(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: SnapshotCaptureService(
+          downloader: PageResourceDownloader(),
+          store: store,
+        ),
+        snapshotStore: store,
+        localServer: LocalSnapshotServer(encryptor: _encryptor),
+        handoffService: WebviewHandoffService(
+          api: ApiClient(SecureStorageService()),
+          secureStorage: SecureStorageService(),
+        ),
+      );
+
+  final Future<PageLoadPlan> Function(bool forceOffline) script;
+  int planCalls = 0;
+
+  @override
+  Future<PageLoadPlan> plan({
+    required String parishId,
+    required String userId,
+    required String targetPath,
+    bool forceOffline = false,
+  }) {
+    planCalls++;
+    return script(forceOffline);
+  }
+}
+
+final _localUrl = Uri.parse('http://127.0.0.1:1/token/snapshot.html');
+final _ticketUrl = Uri.parse(
+  'https://szarlej.ministrant.eu/public/mobile_handoff.php?ticket=t',
+);
+
+PageLoadOffline _offlinePlan() =>
+    PageLoadOffline(url: _localUrl, capturedAt: DateTime.utc(2026, 10, 1, 8));
+
+PageLoadOnline _onlinePlan() =>
+    PageLoadOnline(url: _ticketUrl, targetPath: '/public/dashboard.php');
+
+Widget _host(OfflinePageCoordinator coordinator) => MaterialApp(
+  home: OfflineAwarePageScreen(
+    title: 'Panel',
+    targetPath: '/public/dashboard.php',
+    allowedHost: 'szarlej.ministrant.eu',
+    parishId: 'p',
+    userId: 'u',
+    coordinator: coordinator,
+  ),
+);
+
+Future<PageLoadPlan> _after(Duration delay, PageLoadPlan plan) async {
+  await Future<void>.delayed(delay);
+  return plan;
+}
+
+void main() {
+  late _FakePlatform platform;
+
+  setUp(() {
+    platform = _FakePlatform();
+    WebViewPlatform.instance = platform;
+  });
+
+  const spinner = CircularProgressIndicator;
+
+  testWidgets('the web view is attached BEFORE the first navigation', (
+    tester,
+  ) async {
+    final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
+    await tester.pumpWidget(_host(coordinator));
+    await tester.pump(const Duration(milliseconds: 1));
+
+    final controller = platform.controllers.single;
+    expect(controller.loaded, [_localUrl]);
+    expect(
+      controller.attachedAtLoad,
+      [true],
+      reason: 'loadRequest must run against a mounted web view',
+    );
+  });
+
+  testWidgets('the web view stays mounted while loading and on error', (
+    tester,
+  ) async {
+    final coordinator = _ScriptedCoordinator(
+      (_) => _after(const Duration(milliseconds: 100), _offlinePlan()),
+    );
+    await tester.pumpWidget(_host(coordinator));
+
+    expect(find.byType(spinner), findsOneWidget);
+    expect(find.byType(WebViewWidget), findsOneWidget);
+
+    await tester.pump(const Duration(milliseconds: 2001));
+    expect(find.byType(spinner), findsNothing);
+    expect(find.text('SPRÓBUJ PONOWNIE'), findsOneWidget);
+    expect(find.byType(WebViewWidget), findsOneWidget);
+  });
+
+  testWidgets(
+    'offline total deadline is absolute: 1400 ms of planning leaves no spinner at 2001 ms',
+    (tester) async {
+      final coordinator = _ScriptedCoordinator(
+        (_) => _after(const Duration(milliseconds: 1400), _offlinePlan()),
+      );
+      await tester.pumpWidget(_host(coordinator));
+
+      await tester.pump(const Duration(milliseconds: 1400));
+      expect(
+        find.byType(spinner),
+        findsOneWidget,
+        reason: 'plan finished, the local page has not reported finished yet',
+      );
+      expect(platform.controllers.single.loaded, [_localUrl]);
+
+      await tester.pump(const Duration(milliseconds: 601)); // t = 2001 ms
+      expect(find.byType(spinner), findsNothing);
+      expect(find.textContaining('nie otworzyła się na czas'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'a plan that completes AFTER the deadline cannot bring the abandoned load back',
+    (tester) async {
+      final coordinator = _ScriptedCoordinator(
+        (_) => _after(const Duration(milliseconds: 2500), _offlinePlan()),
+      );
+      await tester.pumpWidget(_host(coordinator));
+
+      await tester.pump(const Duration(milliseconds: 2001));
+      expect(find.textContaining('nie otworzyła się na czas'), findsOneWidget);
+
+      await tester.pump(const Duration(milliseconds: 600)); // plan resolves
+      expect(
+        platform.controllers.single.loaded,
+        isEmpty,
+        reason: 'the late plan must not start a navigation',
+      );
+      expect(find.textContaining('nie otworzyła się na czas'), findsOneWidget);
+      expect(find.byType(spinner), findsNothing);
+    },
+  );
+
+  testWidgets(
+    'once a handoff ticket exists the 2 s offline budget no longer applies; the page gets its own budget, then falls back',
+    (tester) async {
+      final coordinator = _ScriptedCoordinator(
+        (forceOffline) async =>
+            forceOffline ? const PageLoadOfflineNoSnapshot() : _onlinePlan(),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await tester.pump(const Duration(milliseconds: 1));
+      expect(platform.controllers.single.loaded, [_ticketUrl]);
+
+      await tester.pump(const Duration(seconds: 3));
+      expect(
+        find.byType(spinner),
+        findsOneWidget,
+        reason: 'a slow but reachable page is not "offline"',
+      );
+
+      await tester.pump(const Duration(seconds: 5, milliseconds: 1)); // > 8 s
+      await tester.pump(const Duration(milliseconds: 1));
+      expect(find.byType(spinner), findsNothing);
+      expect(find.textContaining('Brak zapisanej wersji'), findsOneWidget);
+      expect(coordinator.planCalls, 2, reason: 'online attempt + offline fallback');
+    },
+  );
+
+  testWidgets('a page that finishes in time removes the overlay and the deadline', (
+    tester,
+  ) async {
+    final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
+    await tester.pumpWidget(_host(coordinator));
+    await tester.pump(const Duration(milliseconds: 1));
+
+    platform.delegates.single.onPageFinished!(
+      'https://szarlej.ministrant.eu/public/dashboard.php',
+    );
+    await tester.pump(const Duration(milliseconds: 1));
+
+    expect(find.byType(spinner), findsNothing);
+    expect(find.byType(WebViewWidget), findsOneWidget);
+    expect(find.text('SPRÓBUJ PONOWNIE'), findsNothing);
+
+    // No deadline fires afterwards and flips a finished page to an error.
+    await tester.pump(const Duration(seconds: 10));
+    expect(find.text('SPRÓBUJ PONOWNIE'), findsNothing);
+  });
+}

@@ -63,11 +63,25 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
   /// Tunable — verify on a real device on a slow mobile connection.
   static const _pageRenderBudget = Duration(seconds: 8);
 
-  /// How long the LOCAL snapshot may take to produce onPageFinished (or a
-  /// handled error) before the screen stops waiting and says so. A
-  /// loopback page normally loads in well under a second; this is a
-  /// failure detector, never a target.
-  static const _offlineRenderBudget = Duration(seconds: 2);
+  /// ONE absolute budget for everything that stands between "load
+  /// started" and "saved view on screen": the handoff attempt, local
+  /// planning, and rendering the loopback page. It is a single timer
+  /// started when the load starts — NOT a budget per stage. Per-stage
+  /// budgets add up (1.4 s of planning left the full 2 s render budget
+  /// still to run: spinner until 3.4 s); one timer cannot. It does not
+  /// apply once a handoff ticket exists (the online page then has
+  /// [_pageRenderBudget]). A failure detector, not a target: a loopback
+  /// page normally renders in well under a second. Worst case on a
+  /// Wi-Fi-without-internet network: the 1.5 s connect budget leaves
+  /// ~0.5 s for local planning and rendering — if on-device measurement
+  /// shows that is too tight, shorten OfflinePageCoordinator.onlineTimeout
+  /// rather than lengthening this.
+  static const _offlineTotalBudget = Duration(seconds: 2);
+
+  /// True from the moment a handoff ticket is in hand (PageLoadOnline) —
+  /// from then on [_offlineTotalBudget] no longer applies.
+  bool _onlineRendering = false;
+  Timer? _totalDeadline;
 
   late final WebViewController _controller;
   _LoadState _state = _LoadState.loading;
@@ -106,6 +120,8 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
                   uri.path.endsWith('/snapshot.html')) {
                 _navigationDeadline?.cancel();
                 _navigationDeadline = null;
+                _totalDeadline?.cancel();
+                _totalDeadline = null;
                 _failedDocuments.add(uri.toString());
                 setState(() {
                   _state = _LoadState.error;
@@ -127,6 +143,8 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
           onWebResourceError: (e) {
             if (!mounted || _loggingOut || e.isForMainFrame != true) return;
             _navigationDeadline?.cancel();
+            _totalDeadline?.cancel();
+            _totalDeadline = null;
             if (_online) {
               unawaited(_loadPage(forceOffline: true));
             } else {
@@ -154,6 +172,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
   void dispose() {
     _loadGeneration++;
     _navigationDeadline?.cancel();
+    _totalDeadline?.cancel();
     _captureTimer?.cancel();
     super.dispose();
   }
@@ -205,24 +224,19 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
     });
   }
 
-  /// Offline counterpart of [_startDeadline]. The online path was
-  /// bounded; this one was not — if the local page never produced
-  /// onPageFinished (or an error the delegate handles) the screen sat on
-  /// the spinner forever. Guarded by [generation] so a timer from an
-  /// earlier load can never flip a newer load into the error state.
-  void _armOfflineDeadline(int generation) {
+  /// Expiry of [_offlineTotalBudget]. Gives up on THIS load completely —
+  /// including bumping [_loadGeneration] — so a plan, loadRequest or page
+  /// callback that finishes late cannot bring the abandoned load back
+  /// and flip the screen under the user after the error is already shown.
+  void _expireOfflineBudget(int generation) {
+    if (!mounted || _loggingOut || generation != _loadGeneration) return;
+    if (_onlineRendering || _state != _LoadState.loading) return;
+    _loadGeneration++;
     _navigationDeadline?.cancel();
-    _navigationDeadline = Timer(_offlineRenderBudget, () {
-      if (!mounted ||
-          _loggingOut ||
-          generation != _loadGeneration ||
-          _state != _LoadState.loading) {
-        return;
-      }
-      setState(() {
-        _state = _LoadState.error;
-        _errorText = 'Zapisana kopia strony nie otworzyła się. Spróbuj ponownie.';
-      });
+    _navigationDeadline = null;
+    setState(() {
+      _state = _LoadState.error;
+      _errorText = 'Zapisana kopia strony nie otworzyła się na czas. Spróbuj ponownie.';
     });
   }
 
@@ -263,6 +277,8 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
     }
     _navigationDeadline?.cancel();
     _navigationDeadline = null;
+    _totalDeadline?.cancel();
+    _totalDeadline = null;
     // A login redirect means the PHP session expired; never cache it.
     if (_online && uri.pathSegments.lastOrNull?.toLowerCase() == 'login.php') {
       unawaited(_logout());
@@ -352,6 +368,7 @@ $_captureChannel.postMessage(JSON.stringify({
     _loggingOut = true;
     _loadGeneration++;
     _navigationDeadline?.cancel();
+    _totalDeadline?.cancel();
     _captureTimer?.cancel();
     if (mounted) setState(() => _state = _LoadState.loading);
     widget.coordinator.localServer.rootDirectory = null;
@@ -370,6 +387,12 @@ $_captureChannel.postMessage(JSON.stringify({
     _captureTimer?.cancel();
     if (!mounted || _loggingOut) return;
     setState(() => _state = _LoadState.loading);
+    _onlineRendering = false;
+    _totalDeadline?.cancel();
+    _totalDeadline = Timer(
+      _offlineTotalBudget,
+      () => _expireOfflineBudget(generation),
+    );
     try {
       // No page deadline here on purpose: plan() is itself bounded
       // (handoff by onlineTimeout, local view by offlinePlanTimeout), and
@@ -390,6 +413,12 @@ $_captureChannel.postMessage(JSON.stringify({
               : null;
           _banner = null;
           _errorText = null;
+          // A ticket exists: the server answered, so this is no longer
+          // "is the network there" but "is the page slow" — it gets its
+          // own, longer budget instead of the 2 s offline one.
+          _onlineRendering = true;
+          _totalDeadline?.cancel();
+          _totalDeadline = null;
           _startDeadline();
           await _controller.loadRequest(plan.url);
         case PageLoadOffline():
@@ -401,7 +430,6 @@ $_captureChannel.postMessage(JSON.stringify({
           // failed (corrupt copy); the entry must not swallow the
           // onPageFinished of a legitimate retry.
           _failedDocuments.removeWhere((u) => u.startsWith('http://'));
-          _armOfflineDeadline(generation);
           await _controller.loadRequest(plan.url);
         case PageLoadOfflineNoSnapshot():
           _online = false;

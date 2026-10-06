@@ -62,11 +62,7 @@ class OfflinePageCoordinator {
   /// forever on plan() itself.
   final Duration offlinePlanTimeout;
 
-  /// Bumped at the start of every plan(). A plan that was superseded
-  /// while it was still running (timed out, or a newer page was
-  /// requested) must never repoint the shared loopback server at ITS
-  /// page when it finally finishes — [LocalSnapshotServer.rootDirectory]
-  /// is a single mutable slot shared by every load.
+  /// Bumped at the start of every plan() — "a NEWER plan exists".
   int _planGeneration = 0;
   Future<void> _captureQueue = Future<void>.value();
   final SnapshotCaptureService captureService;
@@ -90,7 +86,16 @@ class OfflinePageCoordinator {
     required String targetPath,
     bool forceOffline = false,
   }) async {
-    final generation = ++_planGeneration;
+    // A plan that is no longer wanted — superseded by a newer one, OR
+    // expired by its own deadline — must never repoint the shared
+    // loopback server at ITS page when its (still running) local steps
+    // finally finish: LocalSnapshotServer.rootDirectory is ONE mutable
+    // slot shared by every load. Future.timeout() only changes the
+    // Future the caller sees; it does not stop the async work behind it.
+    // The expiry is therefore recorded on THIS plan's own ticket, never
+    // on _planGeneration: bumping the shared counter on expiry would let
+    // an old timeout invalidate a newer, perfectly healthy plan.
+    final ticket = _PlanTicket(++_planGeneration);
     final path = snapshotPagePath(Uri.parse(targetPath));
     if (path == null) return const PageLoadOfflineNoSnapshot();
     String? diagnosticMessage;
@@ -112,21 +117,27 @@ class OfflinePageCoordinator {
     }
 
     return _planOffline(
-      generation: generation,
+      ticket: ticket,
       parishId: parishId,
       userId: userId,
       path: path,
       diagnosticMessage: diagnosticMessage,
     ).timeout(
       offlinePlanTimeout,
-      onTimeout: () => PageLoadOfflineNoSnapshot(
-        diagnosticMessage: kDebugMode ? 'offline plan timed out' : null,
-      ),
+      onTimeout: () {
+        ticket.expired = true;
+        return PageLoadOfflineNoSnapshot(
+          diagnosticMessage: kDebugMode ? 'offline plan timed out' : null,
+        );
+      },
     );
   }
 
+  bool _isStale(_PlanTicket ticket) =>
+      ticket.expired || ticket.generation != _planGeneration;
+
   Future<PageLoadPlan> _planOffline({
-    required int generation,
+    required _PlanTicket ticket,
     required String parishId,
     required String userId,
     required String path,
@@ -137,7 +148,7 @@ class OfflinePageCoordinator {
       userId: userId,
       pagePath: path,
     );
-    if (manifest == null) {
+    if (manifest == null || _isStale(ticket)) {
       return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage);
     }
 
@@ -146,7 +157,7 @@ class OfflinePageCoordinator {
       userId: userId,
       pagePath: path,
     );
-    if (pageDir == null) {
+    if (pageDir == null || _isStale(ticket)) {
       // A manifest existed a moment ago but the directory is gone now
       // (e.g. a concurrent clearForUser/clearForParish mid-check) —
       // treat exactly like "no snapshot", never crash on the race.
@@ -154,11 +165,9 @@ class OfflinePageCoordinator {
     }
 
     await localServer.start();
-    // Superseded while we were awaiting (timed out, or a newer plan()
-    // started): do NOT touch the shared server slot. The caller already
-    // discards stale plans, but by then this assignment would have
-    // pointed the server at the wrong page.
-    if (generation != _planGeneration) {
+    // Re-checked after the LAST await, immediately before the one
+    // assignment that has a side effect outside this plan.
+    if (_isStale(ticket)) {
       return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage);
     }
     localServer.rootDirectory = pageDir;
@@ -207,6 +216,14 @@ class OfflinePageCoordinator {
       }
     });
   }
+}
+
+/// Identity of ONE plan() call. [generation] is its position in the
+/// sequence of plans; [expired] is set only by this plan's own deadline.
+class _PlanTicket {
+  _PlanTicket(this.generation);
+  final int generation;
+  bool expired = false;
 }
 
 /// What [OfflinePageCoordinator.plan] decided — a sealed hierarchy
