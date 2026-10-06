@@ -44,10 +44,26 @@ class OfflinePageCoordinator {
     required this.localServer,
     required this.handoffService,
     this.onlineTimeout = const Duration(milliseconds: 1500),
+    this.offlinePlanTimeout = const Duration(milliseconds: 1500),
   });
 
   final ConnectivityProbe connectivityProbe;
+
+  /// Budget for the CONNECT phase only: minting the handoff ticket. It
+  /// deliberately does NOT cover rendering the PHP page afterwards — the
+  /// screen owns a separate, longer budget for that, started only once a
+  /// ticket actually exists (a slow-but-working server must not be
+  /// mistaken for "no network" just because the ticket took a while).
   final Duration onlineTimeout;
+
+  /// Budget for building the LOCAL view (manifest, directory, starting
+  /// the loopback server). Normally a few milliseconds; this exists so a
+  /// stuck filesystem/server step can never leave the screen waiting
+  /// forever on plan() itself.
+  final Duration offlinePlanTimeout;
+
+  /// Bumped at the start of every plan() — "a NEWER plan exists".
+  int _planGeneration = 0;
   Future<void> _captureQueue = Future<void>.value();
   final SnapshotCaptureService captureService;
   final SnapshotStore snapshotStore;
@@ -70,6 +86,16 @@ class OfflinePageCoordinator {
     required String targetPath,
     bool forceOffline = false,
   }) async {
+    // A plan that is no longer wanted — superseded by a newer one, OR
+    // expired by its own deadline — must never repoint the shared
+    // loopback server at ITS page when its (still running) local steps
+    // finally finish: LocalSnapshotServer.rootDirectory is ONE mutable
+    // slot shared by every load. Future.timeout() only changes the
+    // Future the caller sees; it does not stop the async work behind it.
+    // The expiry is therefore recorded on THIS plan's own ticket, never
+    // on _planGeneration: bumping the shared counter on expiry would let
+    // an old timeout invalidate a newer, perfectly healthy plan.
+    final ticket = _PlanTicket(++_planGeneration);
     final path = snapshotPagePath(Uri.parse(targetPath));
     if (path == null) return const PageLoadOfflineNoSnapshot();
     String? diagnosticMessage;
@@ -90,12 +116,39 @@ class OfflinePageCoordinator {
       }
     }
 
+    return _planOffline(
+      ticket: ticket,
+      parishId: parishId,
+      userId: userId,
+      path: path,
+      diagnosticMessage: diagnosticMessage,
+    ).timeout(
+      offlinePlanTimeout,
+      onTimeout: () {
+        ticket.expired = true;
+        return PageLoadOfflineNoSnapshot(
+          diagnosticMessage: kDebugMode ? 'offline plan timed out' : null,
+        );
+      },
+    );
+  }
+
+  bool _isStale(_PlanTicket ticket) =>
+      ticket.expired || ticket.generation != _planGeneration;
+
+  Future<PageLoadPlan> _planOffline({
+    required _PlanTicket ticket,
+    required String parishId,
+    required String userId,
+    required String path,
+    required String? diagnosticMessage,
+  }) async {
     final manifest = await snapshotStore.readManifestFor(
       parishId: parishId,
       userId: userId,
       pagePath: path,
     );
-    if (manifest == null) {
+    if (manifest == null || _isStale(ticket)) {
       return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage);
     }
 
@@ -104,7 +157,7 @@ class OfflinePageCoordinator {
       userId: userId,
       pagePath: path,
     );
-    if (pageDir == null) {
+    if (pageDir == null || _isStale(ticket)) {
       // A manifest existed a moment ago but the directory is gone now
       // (e.g. a concurrent clearForUser/clearForParish mid-check) —
       // treat exactly like "no snapshot", never crash on the race.
@@ -112,8 +165,17 @@ class OfflinePageCoordinator {
     }
 
     await localServer.start();
+    // Re-checked after the LAST await, immediately before the one
+    // assignment that has a side effect outside this plan.
+    if (_isStale(ticket)) {
+      return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage);
+    }
     localServer.rootDirectory = pageDir;
 
+    // Each assignment of rootDirectory above rotates LocalSnapshotServer's
+    // access token, which is part of this URL's path — so every offline
+    // plan already has its own document URL, and the previous plan's URL
+    // stops being "owned" by the server. The screen relies on that.
     return PageLoadOffline(
       url: localServer.urlFor('/snapshot.html'),
       capturedAt: manifest.capturedAt,
@@ -158,6 +220,14 @@ class OfflinePageCoordinator {
       }
     });
   }
+}
+
+/// Identity of ONE plan() call. [generation] is its position in the
+/// sequence of plans; [expired] is set only by this plan's own deadline.
+class _PlanTicket {
+  _PlanTicket(this.generation);
+  final int generation;
+  bool expired = false;
 }
 
 /// What [OfflinePageCoordinator.plan] decided — a sealed hierarchy
