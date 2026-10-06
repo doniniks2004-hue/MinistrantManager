@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
-import 'package:path/path.dart' as p;
+
+import 'page_identity.dart';
 
 import '../../features/webview/webview_handoff_service.dart';
 import 'connectivity_probe.dart';
@@ -40,9 +43,12 @@ class OfflinePageCoordinator {
     required this.snapshotStore,
     required this.localServer,
     required this.handoffService,
+    this.onlineTimeout = const Duration(milliseconds: 1500),
   });
 
   final ConnectivityProbe connectivityProbe;
+  final Duration onlineTimeout;
+  Future<void> _captureQueue = Future<void>.value();
   final SnapshotCaptureService captureService;
   final SnapshotStore snapshotStore;
   final LocalSnapshotServer localServer;
@@ -62,55 +68,42 @@ class OfflinePageCoordinator {
     required String parishId,
     required String userId,
     required String targetPath,
+    bool forceOffline = false,
   }) async {
-    final path = p.normalize(targetPath);
-
-    // The authenticated handoff request is the real online test. Do not
-    // perform a separate unauthenticated HEAD first: that creates a second
-    // network dependency and can reject a server that is perfectly capable
-    // of serving the actual mobile handoff. If the real request succeeds,
-    // the WebView gets the real PHP page immediately.
+    final path = snapshotPagePath(Uri.parse(targetPath));
+    if (path == null) return const PageLoadOfflineNoSnapshot();
     String? diagnosticMessage;
-    try {
-      final handoffUrl = await handoffService.requestHandoffUrl(path);
-      return PageLoadOnline(url: handoffUrl, targetPath: path);
-    } catch (e) {
-      // Real online handoff failed. Fall through to the last known-good
-      // snapshot. This is the only offline decision that matters to the UI
-      // — but WHY it failed must never be swallowed silently; a device
-      // that's actually online but falls back to "no snapshot" is
-      // indistinguishable from a genuinely offline one without this.
-      // DioException is by far the most informative/likely case (the
-      // real request actually reached the server and it said no) so it
-      // gets its own branch; anything else (StateError from
-      // ApiClient.parish()'s own precondition check — not activated, no
-      // mobile_user_token yet — or a cast failure on a malformed
-      // response) is printed as-is.
-      //
-      // K12 diagnostic round 3: debugPrint alone turned out to be
-      // unreliable to actually capture on a real device (no guarantee
-      // logcat is attached, or that a release APK's Dart stdout is even
-      // forwarded there) — this exact text is ALSO carried on
-      // PageLoadOfflineNoSnapshot itself, so the real device's OWN
-      // screen can show it directly, with no dependency on logcat
-      // working at all. Kept as a plain field (not removing the
-      // debugPrint above) since a working logcat is still the easier
-      // place to read it from once it IS working.
-      if (e is DioException) {
-        diagnosticMessage = 'DioException type=${e.type} statusCode=${e.response?.statusCode} '
-            'responseData=${e.response?.data} message=${e.message}';
-      } else {
-        diagnosticMessage = e.toString();
+    if (!forceOffline) {
+      try {
+        final handoffUrl = await handoffService
+            .requestHandoffUrl(path)
+            .timeout(onlineTimeout);
+        return PageLoadOnline(url: handoffUrl, targetPath: path);
+      } catch (e) {
+        // No URLs, response bodies, tickets, or exception messages.
+        if (kDebugMode) {
+          diagnosticMessage = e is DioException
+              ? 'handoff: ${e.type.name}; HTTP ${e.response?.statusCode ?? "none"}'
+              : 'handoff: ${e.runtimeType}';
+          debugPrint(diagnosticMessage);
+        }
       }
-      debugPrint('OfflinePageCoordinator.plan(): online handoff for "$path" failed -- $diagnosticMessage');
     }
 
-    final manifest = await snapshotStore.readManifestFor(parishId: parishId, userId: userId, pagePath: path);
+    final manifest = await snapshotStore.readManifestFor(
+      parishId: parishId,
+      userId: userId,
+      pagePath: path,
+    );
     if (manifest == null) {
       return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage);
     }
 
-    final pageDir = await snapshotStore.getPageDirectoryIfReady(parishId: parishId, userId: userId, pagePath: path);
+    final pageDir = await snapshotStore.getPageDirectoryIfReady(
+      parishId: parishId,
+      userId: userId,
+      pagePath: path,
+    );
     if (pageDir == null) {
       // A manifest existed a moment ago but the directory is gone now
       // (e.g. a concurrent clearForUser/clearForParish mid-check) —
@@ -118,11 +111,11 @@ class OfflinePageCoordinator {
       return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage);
     }
 
-    final port = await localServer.start();
+    await localServer.start();
     localServer.rootDirectory = pageDir;
 
     return PageLoadOffline(
-      url: Uri.parse('http://127.0.0.1:$port/snapshot.html'),
+      url: localServer.urlFor('/snapshot.html'),
       capturedAt: manifest.capturedAt,
     );
   }
@@ -146,8 +139,10 @@ class OfflinePageCoordinator {
     required String targetPath,
     required String renderedHtml,
   }) {
-    () async {
+    final generation = snapshotStore.generation;
+    _captureQueue = _captureQueue.then((_) async {
       try {
+        if (snapshotStore.generation != generation) return;
         final serverUrlString = await handoffService.secureStorage.serverUrl;
         if (serverUrlString == null) return;
         await captureService.captureAndSave(
@@ -156,11 +151,12 @@ class OfflinePageCoordinator {
           serverBaseUrl: Uri.parse(serverUrlString),
           targetPath: targetPath,
           renderedHtml: renderedHtml,
+          expectedGeneration: generation,
         );
       } catch (_) {
-        // Best-effort — see this method's own docblock.
+        // A failed capture leaves the previous snapshot intact.
       }
-    }();
+    });
   }
 }
 

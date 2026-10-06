@@ -1,7 +1,7 @@
 name: ministrant_manager
 description: Ministrant Manager — natywna aplikacja mobilna z obsługą offline.
 publish_to: 'none'
-version: 1.0.0+1
+version: 1.0.0+2
 
 environment:
   sdk: '>=3.6.0 <4.0.0' # required by Drift >=2.32's sqlite3 3.x support and its build-hook config below

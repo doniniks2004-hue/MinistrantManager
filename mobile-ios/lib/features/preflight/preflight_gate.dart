@@ -49,7 +49,15 @@ class _PreflightGateState extends State<PreflightGate> {
   }
 
   Future<void> _check() async {
-    final config = await widget.configService.loadClientConfig();
+    // Preflight must never become a startup deadlock. The global config is
+    // an advisory gate; if the central service does not answer promptly,
+    // proceed to activation/home and let the normal online/offline flows
+    // handle connectivity. A successful response still applies maintenance
+    // and minimum-version rules exactly as before.
+    final config = await widget.configService.loadClientConfig().timeout(
+      const Duration(seconds: 5),
+      onTimeout: () => null,
+    );
     if (!mounted) return;
     setState(() {
       _config = config;
@@ -64,8 +72,11 @@ class _PreflightGateState extends State<PreflightGate> {
 
   @override
   Widget build(BuildContext context) {
+    // Never block the application UI on the central config request. The child
+    // can render its local/offline state immediately; if config arrives later,
+    // this gate will rebuild and apply maintenance/update rules.
     if (!_checked) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+      return widget.child;
     }
 
     final config = _config;

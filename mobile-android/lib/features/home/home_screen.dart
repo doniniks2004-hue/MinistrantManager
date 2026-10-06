@@ -1,14 +1,15 @@
-import 'dart:convert';
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+
 import '../../core/util/store_link_launcher.dart';
 import '../../core/database/app_database.dart';
 import '../../core/sync/sync_engine.dart';
 import '../auth/login_screen.dart';
 import '../auth/user_session_service.dart';
 import '../config/config_service.dart';
+import '../device_settings/device_settings_screen.dart';
 import '../../core/offline/offline_page_coordinator.dart';
-import '../dashboard/dashboard_screen.dart';
-import '../dashboard/module_descriptor.dart';
 import '../revocation/revocation_handler.dart';
 import '../webview/offline_aware_page_screen.dart';
 
@@ -70,18 +71,75 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   int? _userId;
   String? _parishId;
   String? _serverUrl;
-  List<ModuleDescriptor>? _modules;
-  int? _userRoleId;
+  bool _syncInProgress = false;
+  int _sessionGeneration = 0;
+  Timer? _leaseTimer;
+
+  Future<void> _openDeviceSettings() async {
+    final slug = await widget.userSessionService.secureStorage.parishSlug;
+    if (!mounted) return;
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+          builder: (_) => DeviceSettingsScreen(
+                revocationHandler: widget.revocationHandler,
+                parishSlug: slug,
+                onParishReset: () {
+                  _sessionGeneration++;
+                  Navigator.of(context).popUntil((route) => route.isFirst);
+                  widget.onRevoked();
+                },
+              )),
+    );
+  }
+
+  AppBar _deviceSettingsBar() => AppBar(
+        title: const Text('Ministrant Manager'),
+        actions: [
+          IconButton(
+            tooltip: 'Urządzenie / Parafia',
+            onPressed: _openDeviceSettings,
+            icon: const Icon(Icons.settings_outlined),
+          )
+        ],
+      );
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _bootstrapThenSync();
+    _leaseTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => _checkLocalLease(),
+    );
+  }
+
+  Future<void> _checkLocalLease() async {
+    bool allowsData() =>
+        _authState == DeviceAuthState.active ||
+        _authState == DeviceAuthState.offlineWithinLease;
+    if (!allowsData()) return;
+    final generation = _sessionGeneration;
+    try {
+      final meta = await widget.db.ensureSyncMetadata();
+      if (!mounted || generation != _sessionGeneration || !allowsData()) return;
+      if (!widget.syncEngine.offlineLease.isWithinLease(
+        meta.lastAuthorizationCheck,
+        leaseHours: meta.offlineLeaseHours,
+      )) {
+        widget.offlinePageCoordinator.localServer.rootDirectory = null;
+        setState(() => _authState = DeviceAuthState.offlineLeaseExpired);
+        unawaited(_bootstrapThenSync());
+      }
+    } catch (_) {
+      // A reset may close the previous database while this check is pending.
+    }
   }
 
   @override
   void dispose() {
+    _sessionGeneration++;
+    _leaseTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -96,56 +154,66 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _bootstrapThenSync() async {
+    if (_syncInProgress) return;
+    _syncInProgress = true;
+    final generation = _sessionGeneration;
+    try {
+      await _refreshState(generation);
+    } catch (_) {
+      // Preserve the locally validated lease state on malformed responses.
+    } finally {
+      _syncInProgress = false;
+      if (mounted && generation != _sessionGeneration)
+        unawaited(_bootstrapThenSync());
+    }
+  }
+
+  Future<void> _refreshState(int generation) async {
     // Client-config (global: store URLs, maintenance mode) is checked
     // unconditionally and first — it has no activation dependency and
     // must be available even to a screen that's about to show a blocking
     // UPDATE_REQUIRED/maintenance state.
     // OFFLINE-FIRST: establish the local UI state before ANY network request.
-    final localHasUserSession = await widget.userSessionService.secureStorage.hasUserSession;
-    final localUserId = localHasUserSession ? await widget.userSessionService.secureStorage.currentUserId : null;
-    final localParishId = localHasUserSession ? await widget.userSessionService.secureStorage.parishId : null;
-    final localServerUrl = localHasUserSession ? await widget.userSessionService.secureStorage.serverUrl : null;
-    final localRoleId = localHasUserSession ? await widget.userSessionService.secureStorage.currentUserRoleId : null;
+    final localHasUserSession =
+        await widget.userSessionService.secureStorage.hasUserSession;
+    final localUserId = localHasUserSession
+        ? await widget.userSessionService.secureStorage.currentUserId
+        : null;
+    final localParishId = localHasUserSession
+        ? await widget.userSessionService.secureStorage.parishId
+        : null;
+    final localServerUrl = localHasUserSession
+        ? await widget.userSessionService.secureStorage.serverUrl
+        : null;
     final localMeta = await widget.db.ensureSyncMetadata();
     final localWithinLease = widget.syncEngine.offlineLease.isWithinLease(
       localMeta.lastAuthorizationCheck,
       leaseHours: localMeta.offlineLeaseHours,
     );
 
-    List<ModuleDescriptor>? localModules;
-    final cachedModules = await widget.db.getDashboardConfig();
-    if (cachedModules != null) {
-      try {
-        localModules = ModuleDescriptor.parseList(
-          (jsonDecode(cachedModules.configJson) as List<dynamic>).cast<Map<String, dynamic>>(),
+    if (!mounted || generation != _sessionGeneration) return;
+    setState(() {
+      _authState = localWithinLease
+          ? DeviceAuthState.offlineWithinLease
+          : DeviceAuthState.offlineLeaseExpired;
+      _hasUserSession = localHasUserSession;
+      _userId = localUserId;
+      _parishId = localParishId;
+      _serverUrl = localServerUrl;
+    });
+
+    // Global config and device authorization are independent; a config timeout
+    // must not postpone a confirmed revocation or opening the online page.
+    final configFuture = widget.configService.loadClientConfig().catchError(
+          (_) => null,
         );
-      } catch (_) {
-        localModules = null;
-      }
-    }
-
-    if (localHasUserSession && localUserId != null && localParishId != null && localServerUrl != null && localWithinLease) {
-      if (mounted) {
-        setState(() {
-          _authState = DeviceAuthState.offlineWithinLease;
-          _hasUserSession = true;
-          _userId = localUserId;
-          _parishId = localParishId;
-          _serverUrl = localServerUrl;
-          _modules = localModules;
-          _userRoleId = localRoleId;
-        });
-      }
-    }
-
-    // Network config is deliberately fetched only after local UI state is rendered.
-    final clientConfig = await widget.configService.loadClientConfig();
 
     final status = await widget.syncEngine.checkDeviceStatus(
       appVersion: widget.appVersion,
       osVersion: widget.osVersion,
     );
 
+    if (!mounted || generation != _sessionGeneration) return;
     if (status == null) {
       // Not activated — shouldn't normally reach HomeScreen in this state.
       return;
@@ -154,10 +222,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() {
       _authState = status.state;
       _minimumSupportedAppVersion = status.minimumSupportedAppVersion;
-      _clientConfig = clientConfig;
     });
 
-    if (status.state == DeviceAuthState.revoked || status.state == DeviceAuthState.parishDisabled) {
+    if (status.state != DeviceAuthState.active &&
+        status.state != DeviceAuthState.offlineWithinLease) {
+      widget.offlinePageCoordinator.localServer.rootDirectory = null;
+    }
+    if (status.state == DeviceAuthState.revoked ||
+        status.state == DeviceAuthState.parishDisabled) {
       await widget.revocationHandler.handle(status.state);
       widget.onRevoked();
       return;
@@ -183,30 +255,59 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // Is a USER actually signed in on this device? Checked regardless of
     // online/offline device state (offlineWithinLease still shows the
     // login screen if no one's signed in yet).
-    final hasUserSession = await widget.userSessionService.secureStorage.hasUserSession;
+    final hasUserSession =
+        await widget.userSessionService.secureStorage.hasUserSession;
+
+    final earlyUserId = hasUserSession
+        ? await widget.userSessionService.secureStorage.currentUserId
+        : null;
+    final earlyParishId = hasUserSession
+        ? await widget.userSessionService.secureStorage.parishId
+        : null;
+    final earlyServerUrl = hasUserSession
+        ? await widget.userSessionService.secureStorage.serverUrl
+        : null;
+    if (!mounted || generation != _sessionGeneration) return;
+    setState(() {
+      _hasUserSession = hasUserSession;
+      _userId = earlyUserId;
+      _parishId = earlyParishId;
+      _serverUrl = earlyServerUrl;
+    });
+    unawaited(
+      configFuture.then((config) {
+        if (mounted && generation == _sessionGeneration)
+          setState(() => _clientConfig = config);
+      }),
+    );
 
     if (status.state == DeviceAuthState.active && hasUserSession) {
       try {
         await widget.syncEngine.runFullSync();
-        await widget.syncEngine.heartbeat(appVersion: widget.appVersion, osVersion: widget.osVersion);
+        await widget.syncEngine.heartbeat(
+          appVersion: widget.appVersion,
+          osVersion: widget.osVersion,
+        );
         // Online sync succeeded; the PHP dashboard below remains the single source of truth for the UI.
       } on ParishSessionExpiredException {
         // Review round point 4: the PARISH rejected the mobile_user_token
         // — a USER session problem, never a device problem. Clear ONLY
         // the user session and fall through to the login screen; device
         // activation is completely untouched.
+        if (!mounted || generation != _sessionGeneration) return;
         await widget.userSessionService.handleParishSessionExpired();
-        setState(() {
-          _hasUserSession = false;
-        });
+        if (mounted && generation == _sessionGeneration)
+          setState(() {
+            _hasUserSession = false;
+          });
         return;
-      } on ParishContractErrorException catch (e) {
+      } on ParishContractErrorException {
         // Review round fix, point 2: a genuine CONTRACT error
         // (400/403/422 — e.g. the real missing-X-Installation-Id bug)
         // must NEVER be swallowed as a plain network hiccup — that would
         // silently render an empty dashboard/module as if the user
         // genuinely had no data, while the sync in fact never even ran.
-        debugPrint('Parish contract error during sync: $e');
+        // The PHP page remains available; no internal response is logged.
         // Keep the authenticated PHP dashboard as the UI source of truth even if background sync fails.
       } catch (_) {
         // Genuine transport failure / timeout / 5xx — cached data on
@@ -214,30 +315,38 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     }
 
-    final userId = hasUserSession ? await widget.userSessionService.secureStorage.currentUserId : null;
-    final parishId = hasUserSession ? await widget.userSessionService.secureStorage.parishId : null;
-    final serverUrl = hasUserSession ? await widget.userSessionService.secureStorage.serverUrl : null;
+    final userId = hasUserSession
+        ? await widget.userSessionService.secureStorage.currentUserId
+        : null;
+    final parishId = hasUserSession
+        ? await widget.userSessionService.secureStorage.parishId
+        : null;
+    final serverUrl = hasUserSession
+        ? await widget.userSessionService.secureStorage.serverUrl
+        : null;
 
-    List<ModuleDescriptor>? modules;
-    int? roleId;
-    if (hasUserSession && status.state != DeviceAuthState.active) {
-      final rawModules = await widget.configService.loadModules();
-      modules = rawModules != null ? ModuleDescriptor.parseList(rawModules) : null;
-      roleId = await widget.userSessionService.secureStorage.currentUserRoleId;
-    }
-
-    await widget.db.ensureSyncMetadata();
+    if (!mounted || generation != _sessionGeneration) return;
     setState(() {
       _hasUserSession = hasUserSession;
       _userId = userId;
       _parishId = parishId;
       _serverUrl = serverUrl;
-      _modules = modules;
-      _userRoleId = roleId;
     });
   }
 
+  Future<void> _onLogout() async {
+    _sessionGeneration++;
+    widget.offlinePageCoordinator.localServer.rootDirectory = null;
+    await widget.userSessionService.logout();
+    if (mounted)
+      setState(() {
+        _hasUserSession = false;
+        _userId = null;
+      });
+  }
+
   void _onLoggedIn() {
+    _sessionGeneration++;
     setState(() => _hasUserSession = true);
     _bootstrapThenSync();
   }
@@ -256,18 +365,30 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(24),
-            child: Column(mainAxisSize: MainAxisSize.min, children: [
-              const Icon(Icons.build_circle_outlined, size: 48, color: Colors.orange),
-              const SizedBox(height: 16),
-              Text(
-                (_clientConfig?['maintenance_message'] as String?)?.isNotEmpty == true
-                    ? _clientConfig!['maintenance_message'] as String
-                    : 'Ministrant Manager jest chwilowo w trybie konserwacji.',
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 20),
-              FilledButton(onPressed: _bootstrapThenSync, child: const Text('SPRÓBUJ PONOWNIE')),
-            ]),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.build_circle_outlined,
+                  size: 48,
+                  color: Colors.orange,
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  (_clientConfig?['maintenance_message'] as String?)
+                              ?.isNotEmpty ==
+                          true
+                      ? _clientConfig!['maintenance_message'] as String
+                      : 'Ministrant Manager jest chwilowo w trybie konserwacji.',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 20),
+                FilledButton(
+                  onPressed: _bootstrapThenSync,
+                  child: const Text('SPRÓBUJ PONOWNIE'),
+                ),
+              ],
+            ),
           ),
         ),
       );
@@ -276,32 +397,40 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (_authState == DeviceAuthState.updateRequired) {
       final hasStoreUrl = Theme.of(context).platform == TargetPlatform.iOS
           ? (_clientConfig?['ios_store_url'] as String?)?.isNotEmpty == true
-          : (_clientConfig?['android_store_url'] as String?)?.isNotEmpty == true;
+          : (_clientConfig?['android_store_url'] as String?)?.isNotEmpty ==
+              true;
 
       return Scaffold(
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(24),
-            child: Column(mainAxisSize: MainAxisSize.min, children: [
-              const Icon(Icons.system_update, size: 48, color: Colors.orange),
-              const SizedBox(height: 16),
-              const Text(
-                'Dostępna jest wymagana aktualizacja Ministrant Manager.',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                'Aby kontynuować, zaktualizuj aplikację'
-                '${_minimumSupportedAppVersion != null ? " do wersji ${_minimumSupportedAppVersion!} lub nowszej" : ""}.',
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 20),
-              FilledButton(
-                onPressed: hasStoreUrl ? _openStoreListing : null,
-                child: Text(hasStoreUrl ? 'AKTUALIZUJ' : 'Aktualizacja wkrótce dostępna'),
-              ),
-            ]),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.system_update, size: 48, color: Colors.orange),
+                const SizedBox(height: 16),
+                const Text(
+                  'Dostępna jest wymagana aktualizacja Ministrant Manager.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Aby kontynuować, zaktualizuj aplikację'
+                  '${_minimumSupportedAppVersion != null ? " do wersji ${_minimumSupportedAppVersion!} lub nowszej" : ""}.',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 20),
+                FilledButton(
+                  onPressed: hasStoreUrl ? _openStoreListing : null,
+                  child: Text(
+                    hasStoreUrl
+                        ? 'AKTUALIZUJ'
+                        : 'Aktualizacja wkrótce dostępna',
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       );
@@ -309,19 +438,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (_authState == DeviceAuthState.authError) {
       return Scaffold(
+        appBar: _deviceSettingsBar(),
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(24),
-            child: Column(mainAxisSize: MainAxisSize.min, children: [
-              const Icon(Icons.lock_outline, size: 48, color: Colors.red),
-              const SizedBox(height: 16),
-              const Text(
-                'Nie udało się potwierdzić autoryzacji tego urządzenia.\nSpróbuj ponownie za chwilę.',
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 20),
-              FilledButton(onPressed: _bootstrapThenSync, child: const Text('SPRÓBUJ PONOWNIE')),
-            ]),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.lock_outline, size: 48, color: Colors.red),
+                const SizedBox(height: 16),
+                const Text(
+                  'Nie udało się potwierdzić autoryzacji tego urządzenia.\nSpróbuj ponownie za chwilę.',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 20),
+                FilledButton(
+                  onPressed: _bootstrapThenSync,
+                  child: const Text('SPRÓBUJ PONOWNIE'),
+                ),
+              ],
+            ),
           ),
         ),
       );
@@ -331,19 +467,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (isOfflineExpired) {
       return Scaffold(
+        appBar: _deviceSettingsBar(),
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(24),
-            child: Column(mainAxisSize: MainAxisSize.min, children: [
-              const Icon(Icons.wifi_off, size: 48, color: Colors.grey),
-              const SizedBox(height: 16),
-              const Text(
-                'Dostęp do danych wymaga ponownego połączenia\nz serwerem Ministrant Manager.',
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 20),
-              FilledButton(onPressed: _bootstrapThenSync, child: const Text('SPRÓBUJ PONOWNIE')),
-            ]),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.wifi_off, size: 48, color: Colors.grey),
+                const SizedBox(height: 16),
+                const Text(
+                  'Dostęp do danych wymaga ponownego połączenia\nz serwerem Ministrant Manager.',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 20),
+                FilledButton(
+                  onPressed: _bootstrapThenSync,
+                  child: const Text('SPRÓBUJ PONOWNIE'),
+                ),
+              ],
+            ),
           ),
         ),
       );
@@ -357,65 +500,27 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     if (_hasUserSession == false) {
-      return LoginScreen(userSessionService: widget.userSessionService, onLoggedIn: _onLoggedIn);
+      return LoginScreen(
+        userSessionService: widget.userSessionService,
+        onLoggedIn: _onLoggedIn,
+        onOpenDeviceSettings: _openDeviceSettings,
+      );
     }
 
     if (_userId == null || _parishId == null || _serverUrl == null) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
-    // ONLINE: the real legacy PHP dashboard is the complete UI source of truth.
-    if (_authState == DeviceAuthState.active) {
-      return OfflineAwarePageScreen(
-        title: 'Ministrant Manager',
-        targetPath: '/public/dashboard.php',
-        allowedHost: Uri.parse(_serverUrl!).host,
-        parishId: _parishId!,
-        userId: _userId!.toString(),
-        coordinator: widget.offlinePageCoordinator,
-        onLogout: () async {
-          await widget.userSessionService.logout();
-          if (mounted) {
-            setState(() {
-              _hasUserSession = false;
-              _userId = null;
-              _modules = null;
-              _userRoleId = null;
-            });
-          }
-        },
-      );
-    }
-
-    // OFFLINE: keep the existing native dashboard as the offline menu.
-    if (_modules == null) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
-    }
-
-    return DashboardScreen(
-      modules: _modules!,
-      userRoleId: _userRoleId,
-      db: widget.db,
-      secureStorage: widget.userSessionService.secureStorage,
-      offlinePageCoordinator: widget.offlinePageCoordinator,
-      appVersion: widget.appVersion,
-      isOnline: false,
-      syncFailed: false,
-      lastSyncAt: null,
-      onSync: _bootstrapThenSync,
-      onLogout: () async {
-        await widget.userSessionService.logout();
-        if (mounted) {
-          setState(() {
-            _hasUserSession = false;
-            _userId = null;
-            _modules = null;
-            _userRoleId = null;
-          });
-        }
-      },
-      revocationHandler: widget.revocationHandler,
-      onParishReset: widget.onRevoked,
+    return OfflineAwarePageScreen(
+      key: ValueKey('$_parishId:$_userId'),
+      title: 'Ministrant Manager',
+      targetPath: '/public/dashboard.php',
+      allowedHost: Uri.parse(_serverUrl!).host,
+      parishId: _parishId!,
+      userId: _userId!.toString(),
+      coordinator: widget.offlinePageCoordinator,
+      forceOffline: _authState != DeviceAuthState.active,
+      onLogout: _onLogout,
     );
   }
 }

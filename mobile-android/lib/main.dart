@@ -37,6 +37,7 @@ class MinistrantManagerApp extends StatefulWidget {
 }
 
 class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
+  final _navigatorKey = GlobalKey<NavigatorState>();
   AppDatabase? _db;
   late final SecureStorageService _secureStorage;
   late final ApiClient _api;
@@ -126,21 +127,30 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
     // independently-constructed ones that would need to be kept in sync.
     final snapshotEncryptor = SnapshotEncryptor(hexKey: snapshotKey);
     final snapshotStore = SnapshotStore(encryptor: snapshotEncryptor);
-    final syncEngine = SyncEngine(db: db, api: _api, secureStorage: _secureStorage);
-    final activationService = ActivationService(api: _api, secureStorage: _secureStorage);
-    final revocationHandler = RevocationHandler(db: db, secureStorage: _secureStorage, snapshotStore: snapshotStore);
+    final syncEngine =
+        SyncEngine(db: db, api: _api, secureStorage: _secureStorage);
+    final activationService =
+        ActivationService(api: _api, secureStorage: _secureStorage);
+    final revocationHandler = RevocationHandler(
+        db: db, secureStorage: _secureStorage, snapshotStore: snapshotStore);
     final configService = ConfigService(db: db, api: _api);
-    final userSessionService = UserSessionService(api: _api, secureStorage: _secureStorage, db: db, snapshotStore: snapshotStore);
+    final userSessionService = UserSessionService(
+        api: _api,
+        secureStorage: _secureStorage,
+        db: db,
+        snapshotStore: snapshotStore);
 
     // P13 fix: the actual online<->offline WebView chain, built here for
     // the very first time — see this class's own _offlinePageCoordinator
     // field docblock for why it was missing from the real app entirely
     // until now, and why it must be rebuilt fresh on every call to this
     // method, same as snapshotStore above.
-    final handoffService = WebviewHandoffService(api: _api, secureStorage: _secureStorage);
+    final handoffService =
+        WebviewHandoffService(api: _api, secureStorage: _secureStorage);
     final offlinePageCoordinator = OfflinePageCoordinator(
       connectivityProbe: ConnectivityProbe(),
-      captureService: SnapshotCaptureService(downloader: PageResourceDownloader(), store: snapshotStore),
+      captureService: SnapshotCaptureService(
+          downloader: PageResourceDownloader(), store: snapshotStore),
       snapshotStore: snapshotStore,
       localServer: LocalSnapshotServer(encryptor: snapshotEncryptor),
       handoffService: handoffService,
@@ -178,6 +188,9 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
   /// rather than an ActivationScreen briefly wired to now-closed services,
   /// while a fresh database (and fresh key) is opened underneath.
   void _onRevoked() {
+    _navigatorKey.currentState?.popUntil((route) => route.isFirst);
+    final server = _offlinePageCoordinator?.localServer;
+    server?.stop();
     setState(() {
       _isActivated = false;
       _db = null;
@@ -203,9 +216,11 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
         _offlinePageCoordinator != null;
 
     return MaterialApp(
+      navigatorKey: _navigatorKey,
       title: 'Ministrant Manager',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(useMaterial3: true, colorSchemeSeed: const Color(0xFF1C2B4A)),
+      theme: ThemeData(
+          useMaterial3: true, colorSchemeSeed: const Color(0xFF1C2B4A)),
       home: !ready
           ? const Scaffold(body: Center(child: CircularProgressIndicator()))
           // Review round 2, point 5: global client-config (maintenance

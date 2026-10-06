@@ -30,6 +30,15 @@
 		<array>
 			<string>UIInterfaceOrientationPortrait</string>
 		</array>
+        <key>NSAppTransportSecurity</key>
+        <dict>
+            <key>NSAllowsLocalNetworking</key><true/>
+            <key>NSExceptionDomains</key>
+            <dict>
+                <key>127.0.0.1</key>
+                <dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
+            </dict>
+        </dict>
 		<key>NSCameraUsageDescription</key>
 		<string>Aplikacja używa aparatu wyłącznie do zeskanowania kodu QR aktywującego parafię.</string>
 		<key>CADisableMinimumFrameDurationOnPhone</key>

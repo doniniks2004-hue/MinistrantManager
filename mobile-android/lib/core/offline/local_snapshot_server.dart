@@ -1,4 +1,7 @@
+import 'dart:convert';
+import 'dart:math';
 import 'dart:io';
+
 import 'package:path/path.dart' as p;
 
 import 'snapshot_encryptor.dart';
@@ -54,7 +57,30 @@ class LocalSnapshotServer {
   final SnapshotEncryptor encryptor;
 
   HttpServer? _server;
-  Directory? rootDirectory;
+  Directory? _rootDirectory;
+  String _accessToken = '';
+  Directory? get rootDirectory => _rootDirectory;
+  set rootDirectory(Directory? root) {
+    _rootDirectory = root;
+    final random = Random.secure();
+    _accessToken = List.generate(
+      32,
+      (_) => random.nextInt(256).toRadixString(16).padLeft(2, '0'),
+    ).join();
+  }
+
+  Uri urlFor(String path) {
+    if (port == null) throw StateError('Snapshot server not ready.');
+    return Uri.parse(
+      'http://127.0.0.1:$port/$_accessToken/${path.replaceFirst(RegExp(r"^/"), "")}',
+    );
+  }
+
+  bool ownsUrl(Uri uri) =>
+      uri.scheme == 'http' &&
+      uri.host == '127.0.0.1' &&
+      uri.port == port &&
+      uri.path.startsWith('/$_accessToken/');
 
   int? get port => _server?.port;
   bool get isRunning => _server != null;
@@ -86,6 +112,7 @@ class LocalSnapshotServer {
   Future<void> stop() async {
     final server = _server;
     _server = null;
+    rootDirectory = null;
     await server?.close(force: true);
   }
 
@@ -98,6 +125,12 @@ class LocalSnapshotServer {
         return;
       }
 
+      if (!ownsUrl(request.requestedUri)) {
+        response.statusCode = HttpStatus.notFound;
+        await response.close();
+        return;
+      }
+      final requestToken = _accessToken;
       final root = rootDirectory;
       if (root == null) {
         response.statusCode = HttpStatus.notFound;
@@ -105,7 +138,10 @@ class LocalSnapshotServer {
         return;
       }
 
-      final file = _resolveWithinRoot(root, request.uri.path);
+      final file = _resolveWithinRoot(
+        root,
+        request.uri.path.substring(requestToken.length + 1),
+      );
       if (file == null || !await file.exists()) {
         response.statusCode = HttpStatus.notFound;
         await response.close();
@@ -124,16 +160,37 @@ class LocalSnapshotServer {
       // buffering one complete file in memory per request is an
       // acceptable, deliberate trade-off for this specific content.
       final encryptedBytes = await file.readAsBytes();
-      final decryptedBytes = encryptor.decryptBytes(encryptedBytes);
+      var decryptedBytes = encryptor.decryptBytes(encryptedBytes);
+      if (requestToken != _accessToken || root != rootDirectory) {
+        response.statusCode = HttpStatus.notFound;
+        await response.close();
+        return;
+      }
+      final type = _contentTypeFor(file.path);
+      if (type.mimeType == 'text/html' || type.mimeType == 'text/css') {
+        decryptedBytes = utf8.encode(
+          utf8
+              .decode(decryptedBytes)
+              .replaceAll('/assets/', '/$requestToken/assets/'),
+        );
+      }
 
       response.statusCode = HttpStatus.ok;
-      response.headers.contentType = _contentTypeFor(file.path);
+      response.headers.contentType = type;
       response.headers.contentLength = decryptedBytes.length;
       // Review round: this is a point-in-time snapshot the app manages
       // itself — nothing upstream of this server (the WebView, any
       // platform HTTP cache) should ever serve a stale copy of a page
       // after the app has replaced it with a fresher snapshot.
       response.headers.set(HttpHeaders.cacheControlHeader, 'no-store');
+      response.headers.set('Referrer-Policy', 'no-referrer');
+      response.headers.set('X-Content-Type-Options', 'nosniff');
+      response.headers.set(
+        'Content-Security-Policy',
+        "default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+            "style-src 'self' 'unsafe-inline'; connect-src 'none'; form-action 'none'; "
+            "frame-src 'none'; object-src 'none'; base-uri 'none'",
+      );
 
       if (request.method == 'HEAD') {
         await response.close();
@@ -186,8 +243,9 @@ class LocalSnapshotServer {
       // listing, see this class's own docblock.
       return false;
     }
-    final rootWithSeparator =
-        rootCanonical.endsWith(Platform.pathSeparator) ? rootCanonical : '$rootCanonical${Platform.pathSeparator}';
+    final rootWithSeparator = rootCanonical.endsWith(Platform.pathSeparator)
+        ? rootCanonical
+        : '$rootCanonical${Platform.pathSeparator}';
     return targetCanonical.startsWith(rootWithSeparator);
   }
 
@@ -238,7 +296,10 @@ class LocalSnapshotServer {
     final slash = mimeType.indexOf('/');
     final primary = mimeType.substring(0, slash);
     final sub = mimeType.substring(slash + 1);
-    final isText = primary == 'text' || mimeType == 'application/json' || mimeType == 'application/xml';
+    final isText =
+        primary == 'text' ||
+        mimeType == 'application/json' ||
+        mimeType == 'application/xml';
     return ContentType(primary, sub, charset: isText ? 'utf-8' : null);
   }
 }
