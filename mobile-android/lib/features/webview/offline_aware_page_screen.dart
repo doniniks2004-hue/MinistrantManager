@@ -83,6 +83,24 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
   bool _onlineRendering = false;
   Timer? _totalDeadline;
 
+  /// The loopback document the screen is CURRENTLY waiting for or showing
+  /// — null whenever no offline navigation is current (a new load began,
+  /// the load was abandoned by its deadline, or it failed). Callbacks for
+  /// anything else are stale: the engine keeps running a navigation the
+  /// screen has given up on, and its onPageFinished arrives later.
+  /// _loadGeneration cannot guard that (callbacks carry no generation), so
+  /// the navigation is identified by its URL instead — unique per plan,
+  /// see OfflinePageCoordinator.
+  Uri? _offlineLoadUrl;
+
+  bool _isCurrentOfflineDocument(Uri uri) {
+    final current = _offlineLoadUrl;
+    // Scheme/host/port/token prefix are checked by LocalSnapshotServer.ownsUrl.
+    return current != null &&
+        uri.path == current.path &&
+        uri.query == current.query;
+  }
+
   late final WebViewController _controller;
   _LoadState _state = _LoadState.loading;
   String? _errorText;
@@ -117,7 +135,9 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
               // reports "ready" over a blank page.
               if (_state == _LoadState.loading &&
                   widget.coordinator.localServer.ownsUrl(uri) &&
-                  uri.path.endsWith('/snapshot.html')) {
+                  uri.path.endsWith('/snapshot.html') &&
+                  _isCurrentOfflineDocument(uri)) {
+                _offlineLoadUrl = null;
                 _navigationDeadline?.cancel();
                 _navigationDeadline = null;
                 _totalDeadline?.cancel();
@@ -142,12 +162,23 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
           onPageFinished: _onFinished,
           onWebResourceError: (e) {
             if (!mounted || _loggingOut || e.isForMainFrame != true) return;
+            if (!_online) {
+              // An error for a navigation that is no longer the current
+              // one (abandoned, or replaced by a retry) must not fail the
+              // load that IS current.
+              final failed = e.url == null ? null : Uri.tryParse(e.url!);
+              if (_offlineLoadUrl == null ||
+                  (failed != null && !_isCurrentOfflineDocument(failed))) {
+                return;
+              }
+            }
             _navigationDeadline?.cancel();
             _totalDeadline?.cancel();
             _totalDeadline = null;
             if (_online) {
               unawaited(_loadPage(forceOffline: true));
             } else {
+              _offlineLoadUrl = null;
               setState(() {
                 _state = _LoadState.error;
                 _errorText = 'Nie udało się otworzyć zapisanej kopii strony.';
@@ -232,6 +263,9 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
     if (!mounted || _loggingOut || generation != _loadGeneration) return;
     if (_onlineRendering || _state != _LoadState.loading) return;
     _loadGeneration++;
+    // The engine is still running the navigation we are giving up on; its
+    // late onPageFinished must not turn this error back into "ready".
+    _offlineLoadUrl = null;
     _navigationDeadline?.cancel();
     _navigationDeadline = null;
     setState(() {
@@ -259,7 +293,8 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
     if (uri == null ||
         (_online
             ? !_trusted(uri)
-            : !widget.coordinator.localServer.ownsUrl(uri)))
+            : !(widget.coordinator.localServer.ownsUrl(uri) &&
+                  _isCurrentOfflineDocument(uri))))
       return;
     if (_failedDocuments.contains(uri.toString())) return;
     if (_online && _afterHandoffPath != null && snapshotPagePath(uri) != null) {
@@ -367,6 +402,7 @@ $_captureChannel.postMessage(JSON.stringify({
     if (_loggingOut || widget.onLogout == null) return;
     _loggingOut = true;
     _loadGeneration++;
+    _offlineLoadUrl = null;
     _navigationDeadline?.cancel();
     _totalDeadline?.cancel();
     _captureTimer?.cancel();
@@ -388,6 +424,9 @@ $_captureChannel.postMessage(JSON.stringify({
     if (!mounted || _loggingOut) return;
     setState(() => _state = _LoadState.loading);
     _onlineRendering = false;
+    // From here on any offline navigation that was still pending belongs
+    // to an abandoned load.
+    _offlineLoadUrl = null;
     _totalDeadline?.cancel();
     _totalDeadline = Timer(
       _offlineTotalBudget,
@@ -397,7 +436,10 @@ $_captureChannel.postMessage(JSON.stringify({
       // No page deadline here on purpose: plan() is itself bounded
       // (handoff by onlineTimeout, local view by offlinePlanTimeout), and
       // the page-render budget must only start once a ticket exists.
-      if (!forceOffline) _online = true;
+      // A forced-offline load leaves online mode IMMEDIATELY, not when the
+      // plan returns: otherwise an online page the screen just gave up on
+      // could still finish inside that window and flip the screen back.
+      _online = !forceOffline;
       final plan = await widget.coordinator.plan(
         parishId: widget.parishId,
         userId: widget.userId,
@@ -417,6 +459,7 @@ $_captureChannel.postMessage(JSON.stringify({
           // "is the network there" but "is the page slow" — it gets its
           // own, longer budget instead of the 2 s offline one.
           _onlineRendering = true;
+          _offlineLoadUrl = null;
           _totalDeadline?.cancel();
           _totalDeadline = null;
           _startDeadline();
@@ -430,6 +473,7 @@ $_captureChannel.postMessage(JSON.stringify({
           // failed (corrupt copy); the entry must not swallow the
           // onPageFinished of a legitimate retry.
           _failedDocuments.removeWhere((u) => u.startsWith('http://'));
+          _offlineLoadUrl = plan.url;
           await _controller.loadRequest(plan.url);
         case PageLoadOfflineNoSnapshot():
           _online = false;

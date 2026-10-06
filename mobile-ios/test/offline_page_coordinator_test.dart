@@ -448,6 +448,57 @@ void main() {
       },
     );
 
+    test('every offline plan gets its own navigation URL, and it is still served', () async {
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: store,
+        localServer: localServer,
+        handoffService: _FakeHandoffService(SecureStorageService()),
+      );
+      await store.writeSnapshot(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/ranking.php',
+        html: '<html>Ranking</html>',
+        assets: {},
+      );
+      Future<PageLoadOffline> planOffline() async =>
+          await coordinator.plan(
+                parishId: 'p',
+                userId: 'u',
+                targetPath: '/public/ranking.php',
+                forceOffline: true,
+              )
+              as PageLoadOffline;
+
+      final first = await planOffline();
+      final second = await planOffline();
+
+      // Same document, distinguishable navigations: a late callback from
+      // an abandoned load must not be mistaken for the current one.
+      expect(second.url.path, first.url.path);
+      expect(
+        second.url.queryParameters['mm_nav'],
+        isNot(first.url.queryParameters['mm_nav']),
+      );
+      expect(localServer.ownsUrl(first.url), isTrue);
+      expect(localServer.ownsUrl(second.url), isTrue);
+
+      // The query string must have no effect on what the server returns.
+      final previousHttpOverrides = HttpOverrides.current;
+      HttpOverrides.global = null;
+      try {
+        final client = HttpClient();
+        final response = await (await client.getUrl(second.url)).close();
+        expect(response.statusCode, 200);
+        expect(await utf8.decoder.bind(response).join(), contains('Ranking'));
+        client.close(force: true);
+      } finally {
+        HttpOverrides.global = previousHttpOverrides;
+      }
+    });
+
     test('a reachable page plans to load online via a freshly-minted handoff URL, never targetPath itself', () async {
       final site = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       site.listen((request) async => request.response.close());

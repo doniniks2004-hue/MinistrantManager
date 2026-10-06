@@ -172,8 +172,18 @@ class OfflinePageCoordinator {
     }
     localServer.rootDirectory = pageDir;
 
+    // The loopback document URL is otherwise IDENTICAL for every page
+    // and every retry (same port, same token, same file name), which
+    // makes a late onPageFinished from an abandoned navigation
+    // indistinguishable from the one the screen is waiting for. The plan
+    // number makes each navigation's URL unique. The server resolves
+    // files from the path only, so the query string has no effect on
+    // what is served; the screen uses the URL verbatim.
+    final base = localServer.urlFor('/snapshot.html');
     return PageLoadOffline(
-      url: localServer.urlFor('/snapshot.html'),
+      url: base.replace(
+        queryParameters: {...base.queryParameters, 'mm_nav': '${ticket.generation}'},
+      ),
       capturedAt: manifest.capturedAt,
     );
   }

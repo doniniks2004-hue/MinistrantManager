@@ -148,6 +148,19 @@ class _FakeWidget extends PlatformWebViewWidget {
 
 final _encryptor = SnapshotEncryptor(hexKey: 'a' * 64);
 
+/// Owns every fake loopback URL, as the real server does while its root is
+/// unchanged. Without it the screen would drop ALL offline callbacks and
+/// the late-callback tests below would pass vacuously.
+class _OwnedServer extends LocalSnapshotServer {
+  _OwnedServer() : super(encryptor: _encryptor);
+
+  @override
+  bool ownsUrl(Uri uri) =>
+      uri.scheme == 'http' &&
+      uri.host == '127.0.0.1' &&
+      uri.path.startsWith('/token/');
+}
+
 class _ScriptedCoordinator extends OfflinePageCoordinator {
   factory _ScriptedCoordinator(
     Future<PageLoadPlan> Function(bool forceOffline) script,
@@ -161,7 +174,7 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
           store: store,
         ),
         snapshotStore: store,
-        localServer: LocalSnapshotServer(encryptor: _encryptor),
+        localServer: _OwnedServer(),
         handoffService: WebviewHandoffService(
           api: ApiClient(SecureStorageService()),
           secureStorage: SecureStorageService(),
@@ -188,8 +201,13 @@ final _ticketUrl = Uri.parse(
   'https://szarlej.ministrant.eu/public/mobile_handoff.php?ticket=t',
 );
 
-PageLoadOffline _offlinePlan() =>
-    PageLoadOffline(url: _localUrl, capturedAt: DateTime.utc(2026, 10, 1, 8));
+/// What the real coordinator does: one distinct URL per offline plan.
+Uri _localUrlN(int n) => _localUrl.replace(queryParameters: {'mm_nav': '$n'});
+
+PageLoadOffline _offlinePlan([Uri? url]) => PageLoadOffline(
+  url: url ?? _localUrl,
+  capturedAt: DateTime.utc(2026, 10, 1, 8),
+);
 
 PageLoadOnline _onlinePlan() =>
     PageLoadOnline(url: _ticketUrl, targetPath: '/public/dashboard.php');
@@ -320,6 +338,121 @@ void main() {
       expect(find.byType(spinner), findsNothing);
       expect(find.textContaining('Brak zapisanej wersji'), findsOneWidget);
       expect(coordinator.planCalls, 2, reason: 'online attempt + offline fallback');
+    },
+  );
+
+  testWidgets(
+    'a late offline page-finished callback cannot revive an expired load',
+    (tester) async {
+      final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await tester.pump(const Duration(milliseconds: 1));
+      expect(platform.controllers.single.loaded, [_localUrl]);
+
+      await tester.pump(const Duration(milliseconds: 2001));
+      expect(find.textContaining('nie otworzyła się na czas'), findsOneWidget);
+
+      platform.delegates.single.onPageFinished!(_localUrl.toString());
+      await tester.pump();
+
+      expect(
+        find.textContaining('nie otworzyła się na czas'),
+        findsOneWidget,
+        reason: 'An expired navigation must not return to ready on a late callback',
+      );
+      expect(find.byType(spinner), findsNothing);
+    },
+  );
+
+  testWidgets('retry after an expired load opens the page when it finishes', (
+    tester,
+  ) async {
+    final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
+    await tester.pumpWidget(_host(coordinator));
+    await tester.pump(const Duration(milliseconds: 2002));
+    expect(find.text('SPRÓBUJ PONOWNIE'), findsOneWidget);
+
+    await tester.tap(find.text('SPRÓBUJ PONOWNIE'));
+    await tester.pump(const Duration(milliseconds: 1));
+    expect(platform.controllers.single.loaded, [_localUrl, _localUrl]);
+    expect(find.byType(spinner), findsOneWidget);
+
+    platform.delegates.single.onPageFinished!(_localUrl.toString());
+    await tester.pump(const Duration(milliseconds: 1));
+
+    expect(find.byType(spinner), findsNothing);
+    expect(find.text('SPRÓBUJ PONOWNIE'), findsNothing);
+    // The retry's own deadline is gone: nothing flips the page afterwards.
+    await tester.pump(const Duration(seconds: 5));
+    expect(find.text('SPRÓBUJ PONOWNIE'), findsNothing);
+  });
+
+  testWidgets(
+    "a late callback from the PRECEDING navigation cannot finish the retry's load",
+    (tester) async {
+      var plans = 0;
+      final coordinator = _ScriptedCoordinator(
+        (_) async => _offlinePlan(_localUrlN(++plans)),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await tester.pump(const Duration(milliseconds: 2002)); // load #1 expired
+      expect(find.text('SPRÓBUJ PONOWNIE'), findsOneWidget);
+
+      await tester.tap(find.text('SPRÓBUJ PONOWNIE'));
+      await tester.pump(const Duration(milliseconds: 1)); // load #2 started
+      expect(platform.controllers.single.loaded, [
+        _localUrlN(1),
+        _localUrlN(2),
+      ]);
+
+      // The engine finally finishes the navigation the screen abandoned.
+      platform.delegates.single.onPageFinished!(_localUrlN(1).toString());
+      await tester.pump(const Duration(milliseconds: 1));
+      expect(
+        find.byType(spinner),
+        findsOneWidget,
+        reason: 'load #2 is still pending; load #1 finishing is not its result',
+      );
+
+      // Load #2's own callback does finish it.
+      platform.delegates.single.onPageFinished!(_localUrlN(2).toString());
+      await tester.pump(const Duration(milliseconds: 1));
+      expect(find.byType(spinner), findsNothing);
+      expect(find.text('SPRÓBUJ PONOWNIE'), findsNothing);
+    },
+  );
+
+  testWidgets(
+    'an online page the screen already gave up on cannot finish during the offline fallback',
+    (tester) async {
+      final coordinator = _ScriptedCoordinator(
+        (forceOffline) => forceOffline
+            ? _after(
+                const Duration(milliseconds: 500),
+                const PageLoadOfflineNoSnapshot(),
+              )
+            : Future.value(_onlinePlan()),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await tester.pump(const Duration(milliseconds: 1)); // ticket, loading
+      await tester.pump(const Duration(seconds: 8, milliseconds: 10));
+      // The 8 s page budget expired; the offline fallback is now planning.
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(find.byType(spinner), findsOneWidget);
+
+      // The slow online page finally finishes — it was already abandoned.
+      platform.delegates.single.onPageFinished!(
+        'https://szarlej.ministrant.eu/public/dashboard.php',
+      );
+      await tester.pump(const Duration(milliseconds: 1));
+      expect(
+        find.byType(spinner),
+        findsOneWidget,
+        reason: 'must not flip to ready while the fallback plan is running',
+      );
+
+      await tester.pump(const Duration(milliseconds: 600));
+      expect(find.textContaining('Brak zapisanej wersji'), findsOneWidget);
     },
   );
 
