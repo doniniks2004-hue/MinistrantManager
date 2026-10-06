@@ -89,8 +89,12 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
   /// anything else are stale: the engine keeps running a navigation the
   /// screen has given up on, and its onPageFinished arrives later.
   /// _loadGeneration cannot guard that (callbacks carry no generation), so
-  /// the navigation is identified by its URL instead — unique per plan,
-  /// see OfflinePageCoordinator.
+  /// the navigation is identified by its URL instead. Every offline plan
+  /// has its own: LocalSnapshotServer rotates its access token, which is
+  /// part of the URL path, on each rootDirectory assignment. That alone is
+  /// not enough — an abandoned load whose plan was never replaced keeps a
+  /// URL the server still owns, which is exactly the late callback this
+  /// field exists to reject.
   Uri? _offlineLoadUrl;
 
   bool _isCurrentOfflineDocument(Uri uri) {

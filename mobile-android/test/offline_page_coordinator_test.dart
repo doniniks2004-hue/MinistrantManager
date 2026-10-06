@@ -448,7 +448,7 @@ void main() {
       },
     );
 
-    test('every offline plan gets its own navigation URL, and it is still served', () async {
+    test('each offline plan has its own document URL; the previous one stops being owned', () async {
       final coordinator = OfflinePageCoordinator(
         connectivityProbe: ConnectivityProbe(),
         captureService: captureService,
@@ -475,17 +475,14 @@ void main() {
       final first = await planOffline();
       final second = await planOffline();
 
-      // Same document, distinguishable navigations: a late callback from
-      // an abandoned load must not be mistaken for the current one.
-      expect(second.url.path, first.url.path);
-      expect(
-        second.url.queryParameters['mm_nav'],
-        isNot(first.url.queryParameters['mm_nav']),
-      );
-      expect(localServer.ownsUrl(first.url), isTrue);
+      // OfflineAwarePageScreen tells a retry's document from the one it
+      // replaced by this: a late callback for the older URL is rejected
+      // by ownsUrl() itself. If the server ever stopped rotating its
+      // token, that separation would silently disappear — hence a test.
+      expect(second.url.path, isNot(first.url.path));
       expect(localServer.ownsUrl(second.url), isTrue);
+      expect(localServer.ownsUrl(first.url), isFalse);
 
-      // The query string must have no effect on what the server returns.
       final previousHttpOverrides = HttpOverrides.current;
       HttpOverrides.global = null;
       try {

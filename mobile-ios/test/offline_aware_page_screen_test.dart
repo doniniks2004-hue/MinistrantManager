@@ -201,8 +201,9 @@ final _ticketUrl = Uri.parse(
   'https://szarlej.ministrant.eu/public/mobile_handoff.php?ticket=t',
 );
 
-/// What the real coordinator does: one distinct URL per offline plan.
-Uri _localUrlN(int n) => _localUrl.replace(queryParameters: {'mm_nav': '$n'});
+/// What the real server does: every offline plan gets a fresh access token,
+/// which is part of the document URL's PATH.
+Uri _localUrlN(int n) => Uri.parse('http://127.0.0.1:1/token/$n/snapshot.html');
 
 PageLoadOffline _offlinePlan([Uri? url]) => PageLoadOffline(
   url: url ?? _localUrl,
@@ -388,7 +389,7 @@ void main() {
   });
 
   testWidgets(
-    "a late callback from the PRECEDING navigation cannot finish the retry's load",
+    "the screen itself rejects a late callback from the PRECEDING navigation (not only ownsUrl)",
     (tester) async {
       var plans = 0;
       final coordinator = _ScriptedCoordinator(
