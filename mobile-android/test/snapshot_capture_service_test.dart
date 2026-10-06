@@ -60,9 +60,14 @@ void main() {
       await response.close();
     });
 
-    tempRoot = await Directory.systemTemp.createTemp('snapshot_capture_service_test_');
+    tempRoot = await Directory.systemTemp.createTemp(
+      'snapshot_capture_service_test_',
+    );
     store = SnapshotStore(encryptor: _testEncryptor, rootOverride: tempRoot);
-    service = SnapshotCaptureService(downloader: PageResourceDownloader(), store: store);
+    service = SnapshotCaptureService(
+      downloader: PageResourceDownloader(),
+      store: store,
+    );
   });
 
   tearDown(() async {
@@ -91,60 +96,87 @@ void main() {
         renderedHtml: html,
       );
 
-      final manifest = await store.readManifestFor(parishId: 'witosa', userId: '9001', pagePath: '/public/dashboard.php');
+      final manifest = await store.readManifestFor(
+        parishId: 'witosa',
+        userId: '9001',
+        pagePath: '/public/dashboard.php',
+      );
       expect(manifest, isNotNull);
       expect(manifest!.path, '/public/dashboard.php');
-      expect(manifest.resources, containsAll(['assets/assets/style.css', 'assets/assets/logo.png']));
+      expect(
+        manifest.resources,
+        containsAll(['assets/assets/style.css', 'assets/assets/logo.png']),
+      );
 
-      final dir = await store.getPageDirectoryIfReady(parishId: 'witosa', userId: '9001', pagePath: '/public/dashboard.php');
-      expect(await _readDecryptedString('${dir!.path}/snapshot.html'), contains('Dashboard v1'));
-      expect(await _readDecryptedString('${dir.path}/assets/assets/style.css'), 'body { color: blue; }');
-      expect(await _readDecryptedString('${dir.path}/assets/assets/logo.png'), 'PNGDATA');
+      final dir = await store.getPageDirectoryIfReady(
+        parishId: 'witosa',
+        userId: '9001',
+        pagePath: '/public/dashboard.php',
+      );
+      expect(
+        await _readDecryptedString('${dir!.path}/snapshot.html'),
+        contains('Dashboard v1'),
+      );
+      expect(
+        await _readDecryptedString('${dir.path}/assets/assets/style.css'),
+        'body { color: blue; }',
+      );
+      expect(
+        await _readDecryptedString('${dir.path}/assets/assets/logo.png'),
+        'PNGDATA',
+      );
     });
 
-    test(
-      'capstone: the captured snapshot is actually servable end-to-end through a real LocalSnapshotServer — no WebView needed to prove the chain',
-      () async {
-        final html = await fetchOnline('/public/dashboard.php');
-        await service.captureAndSave(
-          parishId: 'witosa',
-          userId: '9001',
-          serverBaseUrl: onlineBaseUrl,
+    test('capstone: the captured snapshot is actually servable end-to-end through a real LocalSnapshotServer — no WebView needed to prove the chain', () async {
+      final html = await fetchOnline('/public/dashboard.php');
+      await service.captureAndSave(
+        parishId: 'witosa',
+        userId: '9001',
+        serverBaseUrl: onlineBaseUrl,
         targetPath: '/public/dashboard.php',
-          renderedHtml: html,
-        );
+        renderedHtml: html,
+      );
 
-        final pageDir = await store.getPageDirectoryIfReady(
-          parishId: 'witosa',
-          userId: '9001',
-          pagePath: '/public/dashboard.php',
-        );
-        expect(pageDir, isNotNull);
+      final pageDir = await store.getPageDirectoryIfReady(
+        parishId: 'witosa',
+        userId: '9001',
+        pagePath: '/public/dashboard.php',
+      );
+      expect(pageDir, isNotNull);
 
-        final localServer = LocalSnapshotServer(encryptor: _testEncryptor);
-        final port = await localServer.start();
-        localServer.rootDirectory = pageDir;
+      final localServer = LocalSnapshotServer(encryptor: _testEncryptor);
+      await localServer.start();
+      localServer.rootDirectory = pageDir;
 
-        final client = HttpClient();
+      final client = HttpClient();
 
-        final pageResp = await (await client.getUrl(Uri.parse('http://127.0.0.1:$port/snapshot.html'))).close();
-        final pageBody = await utf8.decoder.bind(pageResp).join();
-        expect(pageResp.statusCode, 200);
-        expect(pageBody, contains('Dashboard v1'));
-        expect(pageBody, contains('/assets/assets/style.css'), reason: 'the HTML served offline must contain the SAME rewritten reference that was captured');
+      final pageResp = await (await client.getUrl(
+        localServer.urlFor('/snapshot.html'),
+      )).close();
+      final pageBody = await utf8.decoder.bind(pageResp).join();
+      expect(pageResp.statusCode, 200);
+      expect(pageBody, contains('Dashboard v1'));
+      expect(
+        pageBody,
+        contains('/assets/assets/style.css'),
+        reason: 'the HTML served offline must contain the SAME rewritten reference that was captured',
+      );
 
-        final cssResp = await (await client.getUrl(Uri.parse('http://127.0.0.1:$port/assets/assets/style.css'))).close();
-        expect(cssResp.statusCode, 200);
-        expect(cssResp.headers.contentType?.mimeType, 'text/css');
-        expect(await utf8.decoder.bind(cssResp).join(), 'body { color: blue; }');
+      final cssResp = await (await client.getUrl(
+        localServer.urlFor('/assets/assets/style.css'),
+      )).close();
+      expect(cssResp.statusCode, 200);
+      expect(cssResp.headers.contentType?.mimeType, 'text/css');
+      expect(await utf8.decoder.bind(cssResp).join(), 'body { color: blue; }');
 
-        final imgResp = await (await client.getUrl(Uri.parse('http://127.0.0.1:$port/assets/assets/logo.png'))).close();
-        expect(imgResp.statusCode, 200);
-        expect(imgResp.headers.contentType?.mimeType, 'image/png');
+      final imgResp = await (await client.getUrl(
+        localServer.urlFor('/assets/assets/logo.png'),
+      )).close();
+      expect(imgResp.statusCode, 200);
+      expect(imgResp.headers.contentType?.mimeType, 'image/png');
 
-        await localServer.stop();
-      },
-    );
+      await localServer.stop();
+    });
 
     test('a second capture of the same page atomically replaces the first — no leftover files from v1', () async {
       await service.captureAndSave(
@@ -163,8 +195,15 @@ void main() {
         renderedHtml: '<html><body><p>Dashboard v2, no stylesheet or image at all</p></body></html>',
       );
 
-      final dir = await store.getPageDirectoryIfReady(parishId: 'witosa', userId: '9001', pagePath: '/public/dashboard.php');
-      expect(await _readDecryptedString('${dir!.path}/snapshot.html'), contains('Dashboard v2'));
+      final dir = await store.getPageDirectoryIfReady(
+        parishId: 'witosa',
+        userId: '9001',
+        pagePath: '/public/dashboard.php',
+      );
+      expect(
+        await _readDecryptedString('${dir!.path}/snapshot.html'),
+        contains('Dashboard v2'),
+      );
       expect(
         await File('${dir.path}/assets/assets/style.css').exists(),
         isFalse,
@@ -188,7 +227,11 @@ void main() {
         userId: 'ministrant-5',
         pagePath: '/public/dashboard.php',
       );
-      expect(otherUserDir, isNull, reason: 'capturing for admin-1 must never create anything visible under a different user_id');
+      expect(
+        otherUserDir,
+        isNull,
+        reason: 'capturing for admin-1 must never create anything visible under a different user_id',
+      );
     });
   });
 }

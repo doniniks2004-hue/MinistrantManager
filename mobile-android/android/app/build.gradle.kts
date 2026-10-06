@@ -63,14 +63,18 @@ extensions.configure<ApplicationExtension> {
 
     buildTypes {
         release {
-            // Falls back to debug signing when no key.properties exists
-            // (e.g. `flutter build apk --debug` / CI's non-release runs),
-            // so the app still builds out of the box for testing.
-            signingConfig = if (rootProject.file("key.properties").exists()) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
+            // A release task cannot silently fall back to the debug key.
+            if (gradle.startParameter.taskNames.any { it.contains("release", ignoreCase = true) }) {
+                check(rootProject.file("key.properties").exists()) {
+                    "Release signing requires android/key.properties and a valid keystore."
+                }
+                val config = signingConfigs.getByName("release")
+                check(config.storeFile?.isFile == true && !config.storePassword.isNullOrEmpty() &&
+                    !config.keyAlias.isNullOrEmpty() && !config.keyPassword.isNullOrEmpty()) {
+                    "Release signing configuration is incomplete."
+                }
             }
+            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")

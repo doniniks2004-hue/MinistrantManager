@@ -1,16 +1,29 @@
 import 'dart:math';
+
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+
+import '../network/parish_server_url.dart';
 
 /// Wraps flutter_secure_storage (Android Keystore / iOS Keychain).
 /// This is the ONLY place device_token, installation_id, and the resolved
 /// parish server_url are persisted. Never write these to SharedPreferences,
 /// plain files, or logs (spec §21, §4).
 class SecureStorageService {
+  int _sessionGeneration = 0;
+  int get sessionGeneration => _sessionGeneration;
+  Future<void> _credentialMutation = Future<void>.value();
+
+  Future<void> _mutateCredentials(Future<void> Function() action) {
+    final operation = _credentialMutation.then((_) => action());
+    _credentialMutation = operation.catchError((_) {});
+    return operation;
+  }
+
   SecureStorageService()
-      : _storage = const FlutterSecureStorage(
-          aOptions: AndroidOptions(encryptedSharedPreferences: true),
-          iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
-        );
+    : _storage = const FlutterSecureStorage(
+        aOptions: AndroidOptions(encryptedSharedPreferences: true),
+        iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
+      );
 
   final FlutterSecureStorage _storage;
 
@@ -32,14 +45,24 @@ class SecureStorageService {
   static const _kCurrentUserRoleId = 'current_user_role_id';
 
   Future<String?> get installationId => _storage.read(key: _kInstallationId);
-  Future<void> setInstallationId(String value) => _storage.write(key: _kInstallationId, value: value);
+  Future<void> setInstallationId(String value) =>
+      _storage.write(key: _kInstallationId, value: value);
 
   Future<String?> get deviceToken => _storage.read(key: _kDeviceToken);
-  Future<void> setDeviceToken(String value) => _storage.write(key: _kDeviceToken, value: value);
+  Future<void> setDeviceToken(String value) =>
+      _storage.write(key: _kDeviceToken, value: value);
 
   Future<String?> get parishId => _storage.read(key: _kParishId);
   Future<String?> get parishSlug => _storage.read(key: _kParishSlug);
-  Future<String?> get serverUrl => _storage.read(key: _kServerUrl);
+  Future<String?> get serverUrl async {
+    final raw = await _storage.read(key: _kServerUrl);
+    if (raw != null && raw.toLowerCase().startsWith('https://https://')) {
+      final normalized = normalizeParishServerUrl(raw);
+      await _storage.write(key: _kServerUrl, value: normalized);
+      return normalized;
+    }
+    return raw;
+  }
 
   Future<String?> get mobileUserToken => _storage.read(key: _kMobileUserToken);
 
@@ -48,7 +71,8 @@ class SecureStorageService {
     return raw != null ? int.tryParse(raw) : null;
   }
 
-  Future<String?> get currentUserFullName => _storage.read(key: _kCurrentUserFullName);
+  Future<String?> get currentUserFullName =>
+      _storage.read(key: _kCurrentUserFullName);
 
   /// Hybrid dashboard milestone, review round point 22: the role_id the
   /// dashboard uses for its DISPLAY-only module filter
@@ -76,19 +100,30 @@ class SecureStorageService {
   /// session" (fails closed). The old order (token first) could leave
   /// "token present, no user_id" after an interruption, which is exactly
   /// the half-written state `hasUserSession` must never treat as valid.
-  Future<void> setUserSession({required String token, required int userId, String? fullName, int? roleId}) async {
-    await _storage.write(key: _kCurrentUserId, value: userId.toString());
-    if (fullName != null) {
-      await _storage.write(key: _kCurrentUserFullName, value: fullName);
-    } else {
-      await _storage.delete(key: _kCurrentUserFullName);
-    }
-    if (roleId != null) {
-      await _storage.write(key: _kCurrentUserRoleId, value: roleId.toString());
-    } else {
-      await _storage.delete(key: _kCurrentUserRoleId);
-    }
-    await _storage.write(key: _kMobileUserToken, value: token);
+  Future<void> setUserSession({
+    required String token,
+    required int userId,
+    String? fullName,
+    int? roleId,
+  }) {
+    _sessionGeneration++;
+    return _mutateCredentials(() async {
+      await _storage.write(key: _kCurrentUserId, value: userId.toString());
+      if (fullName != null) {
+        await _storage.write(key: _kCurrentUserFullName, value: fullName);
+      } else {
+        await _storage.delete(key: _kCurrentUserFullName);
+      }
+      if (roleId != null) {
+        await _storage.write(
+          key: _kCurrentUserRoleId,
+          value: roleId.toString(),
+        );
+      } else {
+        await _storage.delete(key: _kCurrentUserRoleId);
+      }
+      await _storage.write(key: _kMobileUserToken, value: token);
+    });
   }
 
   /// Explicit logout OR the parish API rejecting the current
@@ -96,16 +131,19 @@ class SecureStorageService {
   /// problem, never a device problem). Deliberately leaves installation_id,
   /// device_token, parish_id/slug/server_url completely untouched — logout
   /// (or a session 401) never requires re-scanning the activation QR.
-  Future<void> clearUserSession() async {
-    await _storage.delete(key: _kMobileUserToken);
-    await _storage.delete(key: _kCurrentUserId);
-    await _storage.delete(key: _kCurrentUserFullName);
-    await _storage.delete(key: _kCurrentUserRoleId);
-    // P10: the legacy PHP "remember me" continuity token (see its own
-    // field docblock) is issued per-user, at login — a stale one must
-    // never survive this specific user's session ending, same as every
-    // other credential cleared above.
-    await _storage.delete(key: _kLegacyRememberToken);
+  Future<void> clearUserSession() {
+    _sessionGeneration++;
+    return _mutateCredentials(() async {
+      await _storage.delete(key: _kMobileUserToken);
+      await _storage.delete(key: _kCurrentUserId);
+      await _storage.delete(key: _kCurrentUserFullName);
+      await _storage.delete(key: _kCurrentUserRoleId);
+      // P10: the legacy PHP "remember me" continuity token (see its own
+      // field docblock) is issued per-user, at login — a stale one must
+      // never survive this specific user's session ending, same as every
+      // other credential cleared above.
+      await _storage.delete(key: _kLegacyRememberToken);
+    });
   }
 
   Future<void> savedActivation({
@@ -127,11 +165,11 @@ class SecureStorageService {
   /// Also clears the user session — a revoked/disabled device can't have
   /// a meaningfully valid signed-in user either.
   Future<void> clearActivation() async {
+    await clearUserSession();
     await _storage.delete(key: _kParishId);
     await _storage.delete(key: _kParishSlug);
     await _storage.delete(key: _kServerUrl);
     await _storage.delete(key: _kDeviceToken);
-    await clearUserSession();
   }
 
   Future<bool> get isActivated async => (await deviceToken) != null;
@@ -163,7 +201,8 @@ class SecureStorageService {
   /// file from a backup or crash dump is permanently unreadable. The next
   /// `getOrCreateDbEncryptionKey()` call (on next activation) generates a
   /// genuinely NEW key, never reuses this one.
-  Future<void> deleteDbEncryptionKey() => _storage.delete(key: _kDbEncryptionKey);
+  Future<void> deleteDbEncryptionKey() =>
+      _storage.delete(key: _kDbEncryptionKey);
 
   static const _kSnapshotEncryptionKey = 'snapshot_encryption_key';
 
@@ -206,7 +245,8 @@ class SecureStorageService {
   /// (whenever this device is next activated, for whatever parish)
   /// generates a genuinely NEW key, never reuses this one — matching
   /// `deleteDbEncryptionKey()`'s own exact reasoning.
-  Future<void> deleteSnapshotEncryptionKey() => _storage.delete(key: _kSnapshotEncryptionKey);
+  Future<void> deleteSnapshotEncryptionKey() =>
+      _storage.delete(key: _kSnapshotEncryptionKey);
 
   static const _kLegacyRememberToken = 'legacy_remember_token';
 
@@ -228,9 +268,17 @@ class SecureStorageService {
   /// outside this round's scope — the server-side consumption mechanism
   /// is pre-existing, separately-built PHP logic this mobile project
   /// doesn't own and doesn't yet have a client-side use for.
-  Future<void> setLegacyRememberToken(String token) => _storage.write(key: _kLegacyRememberToken, value: token);
+  Future<void> setLegacyRememberToken(String token) {
+    final generation = _sessionGeneration;
+    return _mutateCredentials(() async {
+      if (generation != _sessionGeneration) return;
+      await _storage.write(key: _kLegacyRememberToken, value: token);
+    });
+  }
 
-  Future<String?> get legacyRememberToken => _storage.read(key: _kLegacyRememberToken);
+  Future<String?> get legacyRememberToken =>
+      _storage.read(key: _kLegacyRememberToken);
 
-  Future<void> deleteLegacyRememberToken() => _storage.delete(key: _kLegacyRememberToken);
+  Future<void> deleteLegacyRememberToken() =>
+      _mutateCredentials(() => _storage.delete(key: _kLegacyRememberToken));
 }

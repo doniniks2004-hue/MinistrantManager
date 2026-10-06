@@ -1,4 +1,4 @@
-import 'package:path/path.dart' as p;
+import 'page_identity.dart';
 
 import 'page_resource_downloader.dart';
 import 'snapshot_store.dart';
@@ -60,15 +60,22 @@ class SnapshotCaptureService {
     required Uri serverBaseUrl,
     required String targetPath,
     required String renderedHtml,
+    int? expectedGeneration,
   }) async {
-    final path = p.normalize(targetPath);
+    final captureGeneration = expectedGeneration ?? store.generation;
+    final path = snapshotPagePath(Uri.parse(targetPath));
+    if (path == null) return;
     final pageUrl = serverBaseUrl.resolve(path);
-    final captured = await downloader.capture(pageUrl: pageUrl, renderedHtml: renderedHtml);
+    final captured = await downloader.capture(
+      pageUrl: pageUrl,
+      renderedHtml: renderedHtml,
+    );
     await store.writeSnapshot(
       parishId: parishId,
       userId: userId,
       pagePath: path,
       html: captured.html,
+      expectedGeneration: captureGeneration,
       assets: captured.assets,
     );
   }

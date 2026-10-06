@@ -43,6 +43,10 @@ jobs:
         working-directory: .
         run: php mobileapi-core-deployment/tests/installer_structure_test.php
 
+      - name: Test routing updates, rollback entries and mysqlnd independence
+        working-directory: .
+        run: php mobileapi-core-deployment/tests/routing_config_test.php
+
       - name: Build universal parish installer ZIP
         working-directory: .
         run: |

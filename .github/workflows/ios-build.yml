@@ -5,6 +5,11 @@ on:
     branches: [main, develop]
   pull_request:
   workflow_dispatch:
+    inputs:
+      production:
+        description: 'Require complete production signing (fail if missing)'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -30,7 +35,7 @@ jobs:
           flutter-version: '3.47.3'
           channel: 'stable'
 
-      - run: flutter pub get
+      - run: flutter pub get --enforce-lockfile
       - name: Generate branded splash screens
         run: dart run flutter_native_splash:create
       - run: dart run build_runner build --delete-conflicting-outputs
@@ -46,6 +51,10 @@ jobs:
           done
           if [ "$configured" -ne 0 ] && [ "$configured" -ne 4 ]; then
             echo "iOS release signing is only partially configured. Set all four APPLE_* secrets or none of them."
+            exit 1
+          fi
+          if [ "${{ inputs.production }}" = "true" ] && [ "$configured" -ne 4 ]; then
+            echo "Production build requires complete signing secrets."
             exit 1
           fi
 

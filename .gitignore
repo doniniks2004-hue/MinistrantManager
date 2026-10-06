@@ -9,6 +9,9 @@
 **/.flutter-plugins-dependencies
 **/.packages
 **/pubspec.lock
+!mobile-android/pubspec.lock
+!mobile-ios/pubspec.lock
+**/*.g.dart
 
 # IDE
 .idea/

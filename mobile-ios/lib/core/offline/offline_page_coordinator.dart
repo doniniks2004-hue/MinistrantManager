@@ -1,4 +1,9 @@
-import 'package:path/path.dart' as p;
+import 'dart:async';
+
+import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
+
+import 'page_identity.dart';
 
 import '../../features/webview/webview_handoff_service.dart';
 import 'connectivity_probe.dart';
@@ -38,9 +43,12 @@ class OfflinePageCoordinator {
     required this.snapshotStore,
     required this.localServer,
     required this.handoffService,
+    this.onlineTimeout = const Duration(milliseconds: 1500),
   });
 
   final ConnectivityProbe connectivityProbe;
+  final Duration onlineTimeout;
+  Future<void> _captureQueue = Future<void>.value();
   final SnapshotCaptureService captureService;
   final SnapshotStore snapshotStore;
   final LocalSnapshotServer localServer;
@@ -60,41 +68,54 @@ class OfflinePageCoordinator {
     required String parishId,
     required String userId,
     required String targetPath,
+    bool forceOffline = false,
   }) async {
-    final path = p.normalize(targetPath);
-    final serverUrlString = await handoffService.secureStorage.serverUrl;
-
-    final reachable = serverUrlString != null && await connectivityProbe.canReach(Uri.parse(serverUrlString).resolve(path));
-    if (reachable) {
+    final path = snapshotPagePath(Uri.parse(targetPath));
+    if (path == null) return const PageLoadOfflineNoSnapshot();
+    String? diagnosticMessage;
+    if (!forceOffline) {
       try {
-        final handoffUrl = await handoffService.requestHandoffUrl(path);
+        final handoffUrl = await handoffService
+            .requestHandoffUrl(path)
+            .timeout(onlineTimeout);
         return PageLoadOnline(url: handoffUrl, targetPath: path);
-      } catch (_) {
-        // The ticket-mint call itself failed despite the server being
-        // reachable a moment ago (flaky connection, auth hiccup, ...) —
-        // fall through to the offline branch below rather than
-        // propagating this to the caller.
+      } catch (e) {
+        // No URLs, response bodies, tickets, or exception messages.
+        if (kDebugMode) {
+          diagnosticMessage = e is DioException
+              ? 'handoff: ${e.type.name}; HTTP ${e.response?.statusCode ?? "none"}'
+              : 'handoff: ${e.runtimeType}';
+          debugPrint(diagnosticMessage);
+        }
       }
     }
 
-    final manifest = await snapshotStore.readManifestFor(parishId: parishId, userId: userId, pagePath: path);
+    final manifest = await snapshotStore.readManifestFor(
+      parishId: parishId,
+      userId: userId,
+      pagePath: path,
+    );
     if (manifest == null) {
-      return const PageLoadOfflineNoSnapshot();
+      return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage);
     }
 
-    final pageDir = await snapshotStore.getPageDirectoryIfReady(parishId: parishId, userId: userId, pagePath: path);
+    final pageDir = await snapshotStore.getPageDirectoryIfReady(
+      parishId: parishId,
+      userId: userId,
+      pagePath: path,
+    );
     if (pageDir == null) {
       // A manifest existed a moment ago but the directory is gone now
       // (e.g. a concurrent clearForUser/clearForParish mid-check) —
       // treat exactly like "no snapshot", never crash on the race.
-      return const PageLoadOfflineNoSnapshot();
+      return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage);
     }
 
-    final port = await localServer.start();
+    await localServer.start();
     localServer.rootDirectory = pageDir;
 
     return PageLoadOffline(
-      url: Uri.parse('http://127.0.0.1:$port/snapshot.html'),
+      url: localServer.urlFor('/snapshot.html'),
       capturedAt: manifest.capturedAt,
     );
   }
@@ -118,8 +139,10 @@ class OfflinePageCoordinator {
     required String targetPath,
     required String renderedHtml,
   }) {
-    () async {
+    final generation = snapshotStore.generation;
+    _captureQueue = _captureQueue.then((_) async {
       try {
+        if (snapshotStore.generation != generation) return;
         final serverUrlString = await handoffService.secureStorage.serverUrl;
         if (serverUrlString == null) return;
         await captureService.captureAndSave(
@@ -128,11 +151,12 @@ class OfflinePageCoordinator {
           serverBaseUrl: Uri.parse(serverUrlString),
           targetPath: targetPath,
           renderedHtml: renderedHtml,
+          expectedGeneration: generation,
         );
       } catch (_) {
-        // Best-effort — see this method's own docblock.
+        // A failed capture leaves the previous snapshot intact.
       }
-    }();
+    });
   }
 }
 
@@ -168,7 +192,15 @@ class PageLoadOffline extends PageLoadPlan {
 /// should show an explanatory empty state rather than attempting to
 /// load anything.
 class PageLoadOfflineNoSnapshot extends PageLoadPlan {
-  const PageLoadOfflineNoSnapshot();
+  const PageLoadOfflineNoSnapshot({this.diagnosticMessage});
+
+  /// K12 diagnostic round 3: why the online attempt (if one was even
+  /// made) failed — null when this page was never actually attempted
+  /// online at all (shouldn't normally happen given plan() always tries
+  /// the handoff first, but kept nullable rather than assuming). Shown
+  /// directly on screen by the caller, specifically so this doesn't
+  /// depend on logcat being readable on the real device at all.
+  final String? diagnosticMessage;
 }
 
 /// "OFFLINE • ostatnia synchronizacja: HH:MM" — review round P7: "Jedyny

@@ -1,35 +1,44 @@
+import 'dart:async';
+
+import 'package:dio/dio.dart';
+
 import '../../core/network/api_client.dart';
 import '../../core/secure/secure_storage_service.dart';
 
-/// Hybrid dashboard milestone (review round, point 18). Requests a
-/// short-lived, single-use ticket from the parish backend and builds the
-/// URL a WebView navigates to — mobile_user_token itself NEVER appears
-/// in this URL, in any JS, or in the WebView at all; only the ticket
-/// does, and the ticket authorizes exactly one page load.
+/// Short-lived tickets never enter logs or offline storage.
 class WebviewHandoffService {
   WebviewHandoffService({required this.api, required this.secureStorage});
-
   final ApiClient api;
   final SecureStorageService secureStorage;
 
-  /// [path] MUST be one of the paths the server itself advertised via a
-  /// `webview` module descriptor — the backend independently re-validates
-  /// this against its own allowlist regardless, but there is no reason
-  /// to ever ask for a path this client didn't get from the server.
-  ///
-  /// Throws on any failure (network, auth, invalid path) — the caller
-  /// (LegacyModuleScreen) is expected to show its own error/retry state
-  /// rather than this service inventing one.
   Future<Uri> requestHandoffUrl(String path) async {
-    final dio = await api.parish();
-    final resp = await dio.post('/mobile/webview/handoff', data: {'path': path});
-    final ticket = resp.data['ticket'] as String;
-
-    final serverUrl = await secureStorage.serverUrl;
-    if (serverUrl == null) {
-      throw StateError('No server_url — device not activated.');
+    final cancel = CancelToken();
+    final deadline = Timer(
+      const Duration(milliseconds: 1400),
+      () => cancel.cancel('handoff deadline'),
+    );
+    try {
+      final serverUrl = await secureStorage.serverUrl;
+      if (serverUrl == null) throw StateError('Device not activated.');
+      final dio = await api.parish();
+      final resp = await dio.post(
+        '/mobile/webview/handoff',
+        data: {'path': Uri.parse(path).path},
+        cancelToken: cancel,
+        options: Options(
+          sendTimeout: const Duration(milliseconds: 1400),
+          receiveTimeout: const Duration(milliseconds: 1400),
+        ),
+      );
+      final ticket = resp.data['ticket'] as String;
+      if (!RegExp(r'^[a-fA-F0-9]{64}$').hasMatch(ticket)) {
+        throw const FormatException('Invalid handoff response.');
+      }
+      return Uri.parse(serverUrl)
+          .resolve('/public/mobile_handoff.php')
+          .replace(queryParameters: {'ticket': ticket});
+    } finally {
+      deadline.cancel();
     }
-
-    return Uri.parse('$serverUrl/public/mobile_handoff.php').replace(queryParameters: {'ticket': ticket});
   }
 }

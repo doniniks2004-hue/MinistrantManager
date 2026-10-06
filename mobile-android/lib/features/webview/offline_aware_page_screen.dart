@@ -1,31 +1,14 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 import '../../core/offline/offline_page_coordinator.dart';
+import '../../core/offline/page_identity.dart';
 
-/// Offline-architecture milestone, P6 (P10: real-Szarlej fixes —
-/// targetPath/handoffUrl separation, MinistrantBridge). Connects every
-/// piece built in P2-P5 to an actual `WebViewController`:
-///
-/// ```
-/// ONLINE:  PHP -> WebView -> render -> SnapshotCaptureService -> ... -> SnapshotStore
-/// OFFLINE: brak internetu -> LocalSnapshotServer -> 127.0.0.1 -> WebView -> ostatni snapshot
-/// ```
-///
-/// Honest limit, stated plainly rather than glossed over: this class is
-/// the one genuinely untestable piece of the whole offline architecture
-/// built so far — `flutter test` has no WebView platform channel at
-/// all, so nothing that actually touches [WebViewController] can be
-/// exercised here the way every other file in `core/offline/` has been
-/// (real sockets, real temp directories, real HTTP servers). All of the
-/// DECISION logic this screen depends on — [OfflinePageCoordinator.plan],
-/// the online/offline branch, the capture trigger, the banner text — IS
-/// fully tested (offline_page_coordinator_test.dart); this file is
-/// deliberately as thin as possible specifically so the untested
-/// surface is as small as it can be. Real device/CI verification is
-/// what actually confirms this file itself.
+/// Hosts the real PHP page. Offline replays saved views, without writes.
 class OfflineAwarePageScreen extends StatefulWidget {
   const OfflineAwarePageScreen({
     super.key,
@@ -35,25 +18,17 @@ class OfflineAwarePageScreen extends StatefulWidget {
     required this.parishId,
     required this.userId,
     required this.coordinator,
+    this.onLogout,
+    this.forceOffline = false,
   });
-
   final String title;
-
-  /// The page's own identity — e.g. `/public/dashboard.php` — NEVER a
-  /// handoff URL (see [OfflinePageCoordinator]'s own class docblock for
-  /// why that distinction is load-bearing, a real finding against the
-  /// actual Szarlej installation).
   final String targetPath;
-
-  /// Same role as LegacyModuleScreen's own `allowedHost` — the real
-  /// parish host (e.g. `szarlej.ministrant.eu`), checked by
-  /// [_decideNavigation] while online.
   final String allowedHost;
-
   final String parishId;
   final String userId;
   final OfflinePageCoordinator coordinator;
-
+  final Future<void> Function()? onLogout;
+  final bool forceOffline;
   @override
   State<OfflineAwarePageScreen> createState() => _OfflineAwarePageScreenState();
 }
@@ -61,313 +36,392 @@ class OfflineAwarePageScreen extends StatefulWidget {
 enum _LoadState { loading, ready, error, noSnapshot }
 
 class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
-  static const _captureChannelName = 'MMPageCapture';
-
-  /// P10 finding: the real, already-deployed Szarlej PHP (footer.php)
-  /// already expects a native bridge object under this exact name —
-  /// `window.MinistrantBridge.debugPing(...)` /
-  /// `.saveRememberToken(...)` / `.onScroll(...)` — wrapped in its own
-  /// try/catch, so nothing breaks today without it, but three real
-  /// features (diagnostic ping, legacy "remember me" continuity, a
-  /// Facebook-style collapsing header on scroll) simply don't fire.
-  /// webview_flutter's own channel abstraction only ever gives the page
-  /// a single `postMessage(String)` method on `window.<channelName>` —
-  /// never multiple named methods the way a raw native bridge would —
-  /// so [_bridgeShimScript] wraps that one raw channel into the
-  /// multi-method shape the PHP already calls.
-  static const _bridgeChannelName = 'MinistrantBridge';
-
-  static const _bridgeShimScript = '''
+  static const _captureChannel = 'MMPageCapture';
+  static const _bridgeChannel = 'MinistrantBridge';
+  static const _bridgeShim = '''
 (function() {
-  if (!window.$_bridgeChannelName || window.$_bridgeChannelName.__mmShimmed) return;
-  var raw = window.$_bridgeChannelName;
-  window.$_bridgeChannelName = {
+  if (!window.MinistrantBridge || window.MinistrantBridge.__mmShimmed) return;
+  var raw = window.MinistrantBridge;
+  window.MinistrantBridge = {
     __mmShimmed: true,
-    debugPing: function(page) {
-      raw.postMessage(JSON.stringify({type: 'debug_ping', page: page}));
-    },
+    debugPing: function() {}, onScroll: function() {},
     saveRememberToken: function(token) {
       raw.postMessage(JSON.stringify({type: 'remember_token', token: token}));
-    },
-    onScroll: function(direction) {
-      raw.postMessage(JSON.stringify({type: 'scroll', direction: direction}));
     }
   };
 })();
 ''';
-
   late final WebViewController _controller;
   _LoadState _state = _LoadState.loading;
-  String? _errorMessage;
-  String? _offlineBannerText;
-
-  /// Set once [widget.coordinator.plan] actually returns — governs both
-  /// whether a finished page load should trigger a background capture
-  /// AND which host [_decideNavigation] allows, so it is never left at
-  /// a stale default while a plan is in flight.
-  bool _isOnlineMode = true;
-
-  /// P10: driven by the legacy page's own scroll-direction bridge
-  /// messages — review round: a native-feeling collapsing top bar, the
-  /// SAME cosmetic behavior footer.php's own (previously unconnected)
-  /// JS already describes ("jak w Facebooku"). Purely visual; never
-  /// affects navigation, capture, or the online/offline decision.
-  bool _appBarVisible = true;
+  bool _online = true;
+  bool _loggingOut = false;
+  String? _banner;
+  late String _currentPath;
+  Timer? _navigationDeadline;
+  Timer? _captureTimer;
+  int _loadGeneration = 0;
+  String? _afterHandoffPath;
+  final Set<String> _failedDocuments = {};
 
   @override
   void initState() {
     super.initState();
+    _currentPath = widget.targetPath;
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..addJavaScriptChannel(_captureChannelName, onMessageReceived: _onCaptureMessage)
-      ..addJavaScriptChannel(_bridgeChannelName, onMessageReceived: _onBridgeMessage)
+      ..addJavaScriptChannel(_captureChannel, onMessageReceived: _onCapture)
+      ..addJavaScriptChannel(_bridgeChannel, onMessageReceived: _onBridge)
       ..setNavigationDelegate(
         NavigationDelegate(
-          onPageStarted: (_) => _controller.runJavaScript(_bridgeShimScript),
-          onPageFinished: _onPageFinished,
-          onWebResourceError: (error) => setState(() {
-            _state = _LoadState.error;
-            _errorMessage = error.description;
-          }),
-          onNavigationRequest: (request) => _decideNavigation(request.url),
+          onPageStarted: _onStarted,
+          onHttpError: (error) {
+            final uri = error.request?.uri;
+            if (!mounted || !_online || uri == null || !_trusted(uri)) return;
+            final path = snapshotPagePath(uri);
+            if (path != _currentPath &&
+                uri.path != '/public/mobile_handoff.php')
+              return;
+            _failedDocuments.add(uri.toString());
+            unawaited(_loadPage(forceOffline: true));
+          },
+          onPageFinished: _onFinished,
+          onWebResourceError: (e) {
+            if (!mounted || _loggingOut || e.isForMainFrame != true) return;
+            _navigationDeadline?.cancel();
+            if (_online) {
+              unawaited(_loadPage(forceOffline: true));
+            } else {
+              setState(() => _state = _LoadState.error);
+            }
+          },
+          onNavigationRequest: _navigate,
         ),
       );
-    _loadPage();
+    unawaited(_loadPage(forceOffline: widget.forceOffline));
   }
 
-  void _onCaptureMessage(JavaScriptMessage message) {
-    // Never fired for an offline snapshot replay in practice (only the
-    // ONLINE branch below ever asks the page for its own HTML) — this
-    // guard is defense in depth, not the primary mechanism.
-    if (!_isOnlineMode) return;
-    widget.coordinator.captureInBackground(
-      parishId: widget.parishId,
-      userId: widget.userId,
-      targetPath: widget.targetPath,
-      renderedHtml: message.message,
+  @override
+  void didUpdateWidget(covariant OfflineAwarePageScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.forceOffline != widget.forceOffline) {
+      unawaited(_loadPage(forceOffline: widget.forceOffline));
+    }
+  }
+
+  @override
+  void dispose() {
+    _loadGeneration++;
+    _navigationDeadline?.cancel();
+    _captureTimer?.cancel();
+    super.dispose();
+  }
+
+  bool _trusted(Uri uri) =>
+      uri.scheme == 'https' &&
+      uri.host == widget.allowedHost &&
+      uri.port == 443 &&
+      uri.userInfo.isEmpty;
+
+  void _onCapture(JavaScriptMessage message) {
+    if (!_online || _loggingOut || !mounted) return;
+    try {
+      final data = jsonDecode(message.message) as Map<String, dynamic>;
+      final uri = Uri.parse(data['url'] as String);
+      final path = snapshotPagePath(uri);
+      if (!_trusted(uri) || path == null || path != _currentPath) return;
+      widget.coordinator.captureInBackground(
+        parishId: widget.parishId,
+        userId: widget.userId,
+        targetPath: path,
+        renderedHtml: data['html'] as String,
+      );
+    } catch (_) {
+      // Ignore malformed or stale messages.
+    }
+  }
+
+  void _onBridge(JavaScriptMessage message) {
+    if (!_online || _loggingOut || !mounted) return;
+    try {
+      final data = jsonDecode(message.message) as Map<String, dynamic>;
+      if (data['type'] == 'remember_token' && data['token'] is String) {
+        unawaited(
+          widget.coordinator.handoffService.secureStorage
+              .setLegacyRememberToken(data['token'] as String)
+              .catchError((_) {}),
+        );
+      }
+    } catch (_) {}
+  }
+
+  void _startDeadline() {
+    if (_navigationDeadline != null) return;
+    _navigationDeadline = Timer(const Duration(milliseconds: 1500), () {
+      if (mounted && _online && !_loggingOut)
+        unawaited(_loadPage(forceOffline: true));
+    });
+  }
+
+  void _onStarted(String url) {
+    if (!mounted || _loggingOut) return;
+    _captureTimer?.cancel();
+    final uri = Uri.tryParse(url);
+    if (_online && uri != null && _trusted(uri)) {
+      _failedDocuments.remove(uri.toString());
+      final path = snapshotPagePath(uri);
+      if (path != null && _afterHandoffPath == null) _currentPath = path;
+      _navigationDeadline ??= Timer(const Duration(milliseconds: 1500), () {
+        if (mounted && _online) unawaited(_loadPage(forceOffline: true));
+      });
+    }
+    unawaited(_controller.runJavaScript(_bridgeShim).catchError((_) {}));
+  }
+
+  void _onFinished(String url) {
+    if (!mounted || _loggingOut) return;
+    final uri = Uri.tryParse(url);
+    if (uri == null ||
+        (_online
+            ? !_trusted(uri)
+            : !widget.coordinator.localServer.ownsUrl(uri)))
+      return;
+    if (_failedDocuments.contains(uri.toString())) return;
+    if (_online && _afterHandoffPath != null && snapshotPagePath(uri) != null) {
+      final target = _afterHandoffPath!;
+      _afterHandoffPath = null;
+      if (snapshotPagePath(uri) != target) {
+        _currentPath = target;
+        unawaited(
+          _controller.loadRequest(
+            Uri.parse('https://${widget.allowedHost}').resolve(target),
+          ),
+        );
+        return;
+      }
+    }
+    _navigationDeadline?.cancel();
+    _navigationDeadline = null;
+    // A login redirect means the PHP session expired; never cache it.
+    if (_online && uri.pathSegments.lastOrNull?.toLowerCase() == 'login.php') {
+      unawaited(_logout());
+      return;
+    }
+    setState(() => _state = _LoadState.ready);
+    if (!_online) {
+      unawaited(
+        _controller
+            .runJavaScript(r"""
+        document.querySelectorAll('form input,form textarea,form select,form button').forEach(function(e) {
+          e.disabled = true; e.title = 'Dostępne po połączeniu z internetem';
+        });
+        document.addEventListener('submit', function(e) {
+          e.preventDefault(); e.stopImmediatePropagation();
+        }, true);
+      """)
+            .catchError((_) {}),
+      );
+    }
+    if (_online) {
+      final path = snapshotPagePath(uri);
+      if (path == null) return;
+      _currentPath = path;
+      _capture();
+      // Capture again after typical async DOM updates; navigation cancels this.
+      _captureTimer = Timer(const Duration(milliseconds: 750), _capture);
+    }
+  }
+
+  void _capture() {
+    if (!mounted || !_online || _loggingOut) return;
+    unawaited(
+      _controller
+          .runJavaScript('''
+$_captureChannel.postMessage(JSON.stringify({
+  url: location.href, html: document.documentElement.outerHTML
+}));
+''')
+          .catchError((_) {}),
     );
   }
 
-  /// P10: dispatches the three message types footer.php's own JS already
-  /// sends through the shimmed bridge (see [_bridgeShimScript]). Never
-  /// lets a malformed or unexpected message crash the page — this
-  /// bridge is a convenience layer for the legacy PHP's own existing
-  /// features, not something any security decision in this app depends
-  /// on.
-  void _onBridgeMessage(JavaScriptMessage message) {
-    try {
-      final data = jsonDecode(message.message) as Map<String, dynamic>;
-      switch (data['type'] as String?) {
-        case 'remember_token':
-          // Review round: "remember_token może być przekazany do
-          // istniejącego bezpiecznego storage, a nie wrzucony do
-          // zwykłego cache WebView" — flutter_secure_storage, never the
-          // WebView's own cookie jar/cache. This app does not yet have
-          // a client-side use for the token (the legacy PHP's own
-          // consumption mechanism is separate, pre-existing server-side
-          // logic this project doesn't own) — storing it securely is
-          // this round's complete scope.
-          final token = data['token'] as String?;
-          if (token != null) {
-            // Unawaited by design (this is a synchronous bridge
-            // callback) — but the surrounding try/catch above is also
-            // synchronous and would never see a LATER async failure, so
-            // this needs its own handler rather than relying on that.
-            widget.coordinator.handoffService.secureStorage.setLegacyRememberToken(token).catchError((_) {});
-          }
-          break;
-        case 'scroll':
-          final direction = data['direction'] as String?;
-          final shouldShow = direction != 'down';
-          if (shouldShow != _appBarVisible && mounted) {
-            setState(() => _appBarVisible = shouldShow);
-          }
-          break;
-        case 'debug_ping':
-          // No app-side action — purely a liveness signal from the
-          // page's own diagnostic script.
-          break;
-      }
-    } catch (_) {
-      // Malformed/unexpected bridge message — never let it crash the
-      // page, see this method's own docblock.
-    }
-  }
-
-  void _onPageFinished(String url) {
-    if (mounted) setState(() => _state = _LoadState.ready);
-    if (_isOnlineMode) {
-      // Review round §6: "Cały wyrenderowany DOM" — outerHTML of the
-      // root element, not the server's original response body, so
-      // anything the page's own JS did to the DOM before this fires is
-      // captured too.
-      _controller.runJavaScript('$_captureChannelName.postMessage(document.documentElement.outerHTML);');
-    }
-  }
-
-  NavigationDecision _decideNavigation(String url) {
-    final uri = Uri.tryParse(url);
+  NavigationDecision _navigate(NavigationRequest request) {
+    if (_loggingOut) return NavigationDecision.prevent;
+    final uri = Uri.tryParse(request.url);
     if (uri == null) return NavigationDecision.prevent;
-
-    if (_isOnlineMode) {
-      // Same rule as LegacyModuleScreen's own allowlist — HTTPS only, on
-      // the actual page's own host. A different host is opened in the
-      // system browser rather than silently blocked, matching that
-      // screen's existing behavior for a legitimate outbound link.
-      if (uri.scheme == 'https' && uri.host == widget.allowedHost) {
+    if (_trusted(uri)) {
+      if (isLogoutPath(uri)) {
+        unawaited(_logout());
+        return NavigationDecision.prevent;
+      }
+      if (_online) {
+        final path = snapshotPagePath(uri);
+        if (request.isMainFrame && path != null && _afterHandoffPath == null) {
+          _currentPath = path;
+          _startDeadline();
+        }
         return NavigationDecision.navigate;
+      }
+      if (request.isMainFrame) {
+        final path = snapshotPagePath(uri);
+        if (path != null) {
+          _currentPath = path;
+          unawaited(_loadPage(forceOffline: true));
+        }
       }
       return NavigationDecision.prevent;
     }
-
-    // Offline: the ONLY legitimate destination is the local snapshot
-    // server itself (127.0.0.1, http, on whatever port LocalSnapshotServer
-    // is currently bound to) — never a real external host, even an
-    // https one, since there is no live PHP session to safely hand off
-    // to while offline.
-    if (uri.scheme == 'http' && uri.host == '127.0.0.1') {
+    if (!_online && widget.coordinator.localServer.ownsUrl(uri))
       return NavigationDecision.navigate;
+    if (_online &&
+        request.isMainFrame &&
+        const {'https', 'http', 'mailto', 'tel'}.contains(uri.scheme)) {
+      unawaited(
+        launchUrl(
+          uri,
+          mode: LaunchMode.externalApplication,
+        ).catchError((_) => false),
+      );
     }
     return NavigationDecision.prevent;
   }
 
-  Future<void> _loadPage() async {
+  Future<void> _logout() async {
+    if (_loggingOut || widget.onLogout == null) return;
+    _loggingOut = true;
+    _loadGeneration++;
+    _navigationDeadline?.cancel();
+    _captureTimer?.cancel();
     if (mounted) setState(() => _state = _LoadState.loading);
-
-    final plan = await widget.coordinator.plan(
-      parishId: widget.parishId,
-      userId: widget.userId,
-      targetPath: widget.targetPath,
-    );
-
-    if (!mounted) return;
-
-    switch (plan) {
-      case PageLoadOnline():
-        _isOnlineMode = true;
-        setState(() => _offlineBannerText = null);
-        // plan.url is the one-time handoff URL — navigation ONLY, never
-        // stored, never used to resolve anything (see
-        // OfflinePageCoordinator's own class docblock).
-        await _controller.loadRequest(plan.url);
-        break;
-      case PageLoadOffline():
-        _isOnlineMode = false;
-        setState(() => _offlineBannerText = formatOfflineBannerText(plan.capturedAt));
-        await _controller.loadRequest(plan.url);
-        break;
-      case PageLoadOfflineNoSnapshot():
-        _isOnlineMode = false;
-        setState(() => _state = _LoadState.noSnapshot);
-    }
+    widget.coordinator.localServer.rootDirectory = null;
+    try {
+      await _controller.loadHtmlString('<html><body></body></html>');
+      await _controller.clearCache();
+      await _controller.clearLocalStorage();
+    } catch (_) {}
+    await widget.onLogout!();
   }
 
-  Future<bool> _handleBack() async {
-    if (await _controller.canGoBack()) {
-      await _controller.goBack();
-      return false; // stay on this screen, WebView handled its own back
+  Future<void> _loadPage({bool forceOffline = false}) async {
+    final generation = ++_loadGeneration;
+    _navigationDeadline?.cancel();
+    _navigationDeadline = null;
+    _captureTimer?.cancel();
+    if (!mounted || _loggingOut) return;
+    setState(() => _state = _LoadState.loading);
+    try {
+      if (!forceOffline) {
+        _online = true;
+        _startDeadline();
+      }
+      final plan = await widget.coordinator.plan(
+        parishId: widget.parishId,
+        userId: widget.userId,
+        targetPath: _currentPath,
+        forceOffline: forceOffline,
+      );
+      if (!mounted || _loggingOut || generation != _loadGeneration) return;
+      switch (plan) {
+        case PageLoadOnline():
+          _online = true;
+          _afterHandoffPath = Uri.parse(_currentPath).hasQuery
+              ? _currentPath
+              : null;
+          _banner = null;
+          await _controller.loadRequest(plan.url);
+        case PageLoadOffline():
+          _online = false;
+          _afterHandoffPath = null;
+          _banner = formatOfflineBannerText(plan.capturedAt);
+          await _controller.loadRequest(plan.url);
+        case PageLoadOfflineNoSnapshot():
+          _online = false;
+          setState(() => _state = _LoadState.noSnapshot);
+      }
+    } catch (_) {
+      if (mounted && generation == _loadGeneration)
+        setState(() => _state = _LoadState.error);
     }
-    return true; // let the screen pop
   }
 
   @override
-  Widget build(BuildContext context) {
-    return PopScope(
-      canPop: false,
-      onPopInvokedWithResult: (didPop, _) async {
-        if (didPop) return;
-        final shouldPop = await _handleBack();
-        if (shouldPop && context.mounted) {
-          Navigator.of(context).pop();
-        }
-      },
-      child: Scaffold(
-        body: Column(
+  Widget build(BuildContext context) => PopScope(
+    canPop: false,
+    onPopInvokedWithResult: (didPop, _) async {
+      if (didPop) return;
+      if (_online && await _controller.canGoBack()) {
+        _startDeadline();
+        await _controller.goBack();
+      } else if (_currentPath != widget.targetPath) {
+        _currentPath = widget.targetPath;
+        await _loadPage(forceOffline: !_online);
+      } else if (context.mounted && Navigator.of(context).canPop()) {
+        Navigator.of(context).pop();
+      }
+    },
+    child: Scaffold(
+      body: SafeArea(
+        child: Column(
           children: [
-            // P10: a native-feeling collapsing top bar — purely visual,
-            // see _appBarVisible's own docblock. Deliberately a simple
-            // show/hide rather than an animated height: AppBar assumes
-            // a fixed internal layout, and forcing it through a
-            // shrinking height mid-transition risks a real overflow
-            // error on-device for a purely cosmetic feature — not worth
-            // that risk for something this minor.
-            if (_appBarVisible)
-              AppBar(
-                title: Text(widget.title),
-                actions: [
-                  if (_state == _LoadState.ready)
-                    IconButton(icon: const Icon(Icons.refresh), onPressed: _loadPage),
-                ],
-              ),
-            // Review round P7: "Jedyny dodatkowy element aplikacji" — one
-            // thin banner line, nothing else about the page's own look
-            // changes between online and offline.
-            if (_offlineBannerText != null)
+            if (_banner != null)
               Container(
-                width: double.infinity,
                 color: Colors.orange.shade100,
-                padding: const EdgeInsets.symmetric(vertical: 6),
-                child: Text(
-                  _offlineBannerText!,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        '$_banner • tylko podgląd',
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: 'Spróbuj połączyć',
+                      icon: const Icon(Icons.refresh),
+                      onPressed: () => _loadPage(),
+                    ),
+                  ],
                 ),
               ),
-            Expanded(child: _buildBody()),
+            Expanded(
+              child: _state == _LoadState.ready
+                  ? WebViewWidget(controller: _controller)
+                  : _state == _LoadState.loading
+                  ? const Center(child: CircularProgressIndicator())
+                  : Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.wifi_off, size: 48),
+                            const SizedBox(height: 16),
+                            Text(
+                              _state == _LoadState.noSnapshot
+                                  ? 'Brak zapisanej wersji tej strony. Otwórz ją przy połączeniu z internetem.'
+                                  : 'Nie udało się otworzyć strony.',
+                              textAlign: TextAlign.center,
+                            ),
+                            const SizedBox(height: 16),
+                            FilledButton(
+                              onPressed: () => _loadPage(),
+                              child: const Text('SPRÓBUJ PONOWNIE'),
+                            ),
+                            if (_currentPath != widget.targetPath)
+                              TextButton(
+                                onPressed: () {
+                                  _currentPath = widget.targetPath;
+                                  unawaited(_loadPage(forceOffline: !_online));
+                                },
+                                child: const Text('WRÓĆ DO PANELU'),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+            ),
           ],
         ),
       ),
-    );
-  }
-
-  Widget _buildBody() {
-    switch (_state) {
-      case _LoadState.noSnapshot:
-        return const _MessageState(
-          icon: Icons.wifi_off,
-          message: 'Brak zapisanej wersji tej strony. Połącz się z internetem, aby ją pobrać.',
-        );
-      case _LoadState.error:
-        return _MessageState(
-          icon: Icons.error_outline,
-          message: _errorMessage ?? 'Nie udało się załadować strony.',
-          actionLabel: 'SPRÓBUJ PONOWNIE',
-          onAction: _loadPage,
-        );
-      case _LoadState.loading:
-        return const Center(child: CircularProgressIndicator());
-      case _LoadState.ready:
-        return WebViewWidget(controller: _controller);
-    }
-  }
-}
-
-class _MessageState extends StatelessWidget {
-  const _MessageState({required this.icon, required this.message, this.actionLabel, this.onAction});
-
-  final IconData icon;
-  final String message;
-  final String? actionLabel;
-  final VoidCallback? onAction;
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 48, color: Colors.grey),
-            const SizedBox(height: 16),
-            Text(message, textAlign: TextAlign.center),
-            if (actionLabel != null && onAction != null) ...[
-              const SizedBox(height: 20),
-              FilledButton(onPressed: onAction, child: Text(actionLabel!)),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
+    ),
+  );
 }

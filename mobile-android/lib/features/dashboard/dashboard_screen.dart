@@ -179,6 +179,7 @@ class DashboardScreen extends StatelessWidget {
               parishId: parishId,
               userId: userId.toString(),
               coordinator: offlinePageCoordinator,
+              forceOffline: !isOnline,
             ),
           ));
         }

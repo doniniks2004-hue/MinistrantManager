@@ -30,13 +30,31 @@ import 'package:html/parser.dart' as html_parser;
 /// CDN is never guaranteed reachable later, so depending on it for an
 /// offline-capable snapshot would be self-defeating.
 class PageResourceDownloader {
-  PageResourceDownloader({HttpClient? httpClient}) : _httpClient = httpClient ?? HttpClient();
+  PageResourceDownloader({HttpClient? httpClient})
+    : _httpClient = httpClient ?? HttpClient();
+  final HttpClient _httpClient;
+  Future<CapturedPage> capture({
+    required Uri pageUrl,
+    required String renderedHtml,
+  }) =>
+      _ResourceCapture(httpClient: _httpClient)
+          .capture(pageUrl: pageUrl, renderedHtml: renderedHtml);
+}
+
+class _ResourceCapture {
+  _ResourceCapture({HttpClient? httpClient})
+    : _httpClient = httpClient ?? HttpClient();
 
   final HttpClient _httpClient;
 
-  static final RegExp _cssUrlPattern = RegExp(r'url\(\s*([^)]+?)\s*\)', caseSensitive: false);
-  static final RegExp _cssImportPattern =
-      RegExp(r'@import\s+(?:url\()?["\x27]?([^"\x27)]+)["\x27]?\)?', caseSensitive: false);
+  static final RegExp _cssUrlPattern = RegExp(
+    r'url\(\s*([^)]+?)\s*\)',
+    caseSensitive: false,
+  );
+  static final RegExp _cssImportPattern = RegExp(
+    r'@import\s+(?:url\()?["\x27]?([^"\x27)]+)["\x27]?\)?',
+    caseSensitive: false,
+  );
 
   /// Every resource fetched so far in the current [capture] call —
   /// key -> bytes, the exact shape [SnapshotStore.writeSnapshot] wants.
@@ -44,12 +62,15 @@ class PageResourceDownloader {
   /// different pages.
   late Map<String, List<int>> _assets;
   late Set<String> _cssAlreadyProcessed;
-  late String _currentHost;
+  late Uri _currentPage;
 
-  Future<CapturedPage> capture({required Uri pageUrl, required String renderedHtml}) async {
+  Future<CapturedPage> capture({
+    required Uri pageUrl,
+    required String renderedHtml,
+  }) async {
     _assets = <String, List<int>>{};
     _cssAlreadyProcessed = <String>{};
-    _currentHost = pageUrl.host;
+    _currentPage = pageUrl;
 
     final document = html_parser.parse(renderedHtml);
 
@@ -122,6 +143,17 @@ class PageResourceDownloader {
       styleTag.append(dom.Text(rewritten));
     }
 
+    // Preserve real page identities for native offline navigation.
+    for (final anchor in document.querySelectorAll('a[href]')) {
+      final value = anchor.attributes['href']!;
+      if (value.startsWith('#')) continue;
+      final resolved = _resolve(pageUrl, value);
+      if (resolved != null && resolved.host == pageUrl.host)
+        anchor.attributes['href'] = resolved.toString();
+    }
+    for (final input in document.querySelectorAll('input[type="password"]')) {
+      input.attributes.remove('value');
+    }
     return CapturedPage(html: document.outerHtml, assets: _assets);
   }
 
@@ -132,7 +164,9 @@ class PageResourceDownloader {
   /// renders, just without that one resource, same as a browser
   /// showing a broken image rather than failing the whole page).
   Future<String?> _fetchAndStore(Uri resourceUrl) async {
-    if (resourceUrl.host != _currentHost) {
+    if (resourceUrl.scheme != _currentPage.scheme ||
+        resourceUrl.host != _currentPage.host ||
+        resourceUrl.port != _currentPage.port) {
       return null;
     }
     final key = _keyFor(resourceUrl);
@@ -159,7 +193,11 @@ class PageResourceDownloader {
     final cssText = utf8.decode(bytes, allowMalformed: true);
     if (!cssText.contains('url(') && !cssText.contains('@import')) return;
 
-    final rewritten = await _rewriteCssUrls(cssText, cssUrl, recurseIntoImports: true);
+    final rewritten = await _rewriteCssUrls(
+      cssText,
+      cssUrl,
+      recurseIntoImports: true,
+    );
     _assets[key] = utf8.encode(rewritten);
   }
 
@@ -174,7 +212,11 @@ class PageResourceDownloader {
   /// [_processCssAsset] on an actual stylesheet — a `style=""` attribute
   /// or inline `<style>` block can't legally contain `@import` at all,
   /// so there's nothing to recurse into there.
-  Future<String> _rewriteCssUrls(String cssText, Uri baseUrl, {bool recurseIntoImports = false}) async {
+  Future<String> _rewriteCssUrls(
+    String cssText,
+    Uri baseUrl, {
+    bool recurseIntoImports = false,
+  }) async {
     var result = cssText;
 
     // Review round fix (real bug, caught by CI): the ORIGINAL site's own
@@ -202,14 +244,19 @@ class PageResourceDownloader {
         await _processCssAsset(key, resolved);
       }
       alreadyRewrittenByImportPass.add('/assets/$key');
-      result = result.replaceRange(match.start, match.end, '@import url(/assets/$key)');
+      result = result.replaceRange(
+        match.start,
+        match.end,
+        '@import url(/assets/$key)',
+      );
     }
 
     final urlMatches = _cssUrlPattern.allMatches(result).toList();
     for (final match in urlMatches.reversed) {
       var rawUrl = match.group(1)!.trim();
       rawUrl = _stripQuotes(rawUrl);
-      if (rawUrl.startsWith('data:')) continue; // already self-contained, nothing to fetch
+      if (rawUrl.startsWith('data:'))
+        continue; // already self-contained, nothing to fetch
       if (alreadyRewrittenByImportPass.contains(rawUrl)) continue;
       final resolved = _resolve(baseUrl, rawUrl);
       if (resolved == null) continue;
@@ -228,7 +275,9 @@ class PageResourceDownloader {
       final trimmed = part.trim();
       if (trimmed.isEmpty) continue;
       final spaceIndex = trimmed.indexOf(RegExp(r'\s'));
-      final urlPart = spaceIndex == -1 ? trimmed : trimmed.substring(0, spaceIndex);
+      final urlPart = spaceIndex == -1
+          ? trimmed
+          : trimmed.substring(0, spaceIndex);
       final descriptor = spaceIndex == -1 ? '' : trimmed.substring(spaceIndex);
       final resolved = _resolve(pageUrl, urlPart);
       if (resolved == null) {
@@ -242,7 +291,9 @@ class PageResourceDownloader {
   }
 
   Uri? _resolve(Uri base, String reference) {
-    if (reference.startsWith('data:') || reference.startsWith('javascript:') || reference.startsWith('#')) {
+    if (reference.startsWith('data:') ||
+        reference.startsWith('javascript:') ||
+        reference.startsWith('#')) {
       return null;
     }
     try {
@@ -254,7 +305,8 @@ class PageResourceDownloader {
 
   String _stripQuotes(String value) {
     if (value.length >= 2 &&
-        (value.startsWith('"') && value.endsWith('"') || value.startsWith("'") && value.endsWith("'"))) {
+        (value.startsWith('"') && value.endsWith('"') ||
+            value.startsWith("'") && value.endsWith("'"))) {
       return value.substring(1, value.length - 1);
     }
     return value;
@@ -268,30 +320,34 @@ class PageResourceDownloader {
   /// the file — the two sides of this contract are deliberately defined
   /// together, in this one method, rather than duplicated.
   String _keyFor(Uri resourceUrl) {
-    final path = resourceUrl.path.startsWith('/') ? resourceUrl.path.substring(1) : resourceUrl.path;
+    final path = resourceUrl.path.startsWith('/')
+        ? resourceUrl.path.substring(1)
+        : resourceUrl.path;
     return path.isEmpty ? 'index' : path;
   }
 
   Future<List<int>?> _fetch(Uri url) async {
+    HttpClientRequest? pending;
     try {
-      final request = await _httpClient.getUrl(url);
-      final response = await request.close();
-      if (response.statusCode != 200) {
-        await response.drain<void>();
-        return null;
-      }
-      final bytes = <int>[];
-      await for (final chunk in response) {
-        bytes.addAll(chunk);
-      }
-      return bytes;
+      return await (() async {
+        final request = await _httpClient.getUrl(url);
+        pending = request;
+        request.followRedirects = false;
+        final response = await request.close();
+        if (response.statusCode != 200) {
+          await response.drain<void>();
+          return null;
+        }
+        final bytes = <int>[];
+        await for (final chunk in response) {
+          bytes.addAll(chunk);
+          if (bytes.length > 10 * 1024 * 1024)
+            throw const FormatException('Snapshot asset too large.');
+        }
+        return bytes;
+      })().timeout(const Duration(seconds: 3));
     } catch (_) {
-      // Unreachable resource (404, timeout, DNS, ...) — the caller
-      // leaves the original reference in place rather than rewriting to
-      // a local path that would never resolve to anything; the page
-      // still renders, just without that one resource, same as a
-      // browser would show a broken image rather than fail the whole
-      // page load.
+      pending?.abort();
       return null;
     }
   }

@@ -34,10 +34,21 @@ void main() {
 
   setUp(() async {
     tempDir = await Directory.systemTemp.createTemp('snapshot_server_test_');
-    await writeEncryptedFile('${tempDir.path}/dashboard.php', utf8.encode('<html><body>Dashboard</body></html>'));
-    await writeEncryptedFile('${tempDir.path}/style.css', utf8.encode('body { color: red; }'));
+    await writeEncryptedFile(
+      '${tempDir.path}/dashboard.php',
+      utf8.encode('<html><body>Dashboard</body></html>'),
+    );
+    await writeEncryptedFile(
+      '${tempDir.path}/style.css',
+      utf8.encode('body { color: red; }'),
+    );
     await Directory('${tempDir.path}/assets/img').create(recursive: true);
-    await writeEncryptedFile('${tempDir.path}/assets/img/logo.png', [0x89, 0x50, 0x4E, 0x47]);
+    await writeEncryptedFile('${tempDir.path}/assets/img/logo.png', [
+      0x89,
+      0x50,
+      0x4E,
+      0x47,
+    ]);
 
     server = LocalSnapshotServer(encryptor: testEncryptor);
     port = await server.start();
@@ -50,17 +61,37 @@ void main() {
   });
 
   Future<HttpClientResponse> request(String method, String path) async {
-    final req = await client.openUrl(method, Uri.parse('http://127.0.0.1:$port$path'));
+    final req = await client.openUrl(method, server.urlFor(path));
     return req.close();
   }
 
   group('LocalSnapshotServer', () {
-    test('serves an existing file, DECRYPTED, with 200 and the right content', () async {
-      final resp = await request('GET', '/dashboard.php');
-      expect(resp.statusCode, 200);
-      final body = await utf8.decoder.bind(resp).join();
-      expect(body, '<html><body>Dashboard</body></html>');
+    test('a request without the session secret is rejected', () async {
+      final req = await client.getUrl(
+        Uri.parse('http://127.0.0.1:$port/dashboard.php'),
+      );
+      final response = await req.close();
+      expect(response.statusCode, 404);
+      await response.drain<void>();
     });
+
+    test('switching roots invalidates an already issued URL', () async {
+      final oldUrl = server.urlFor('/dashboard.php');
+      server.rootDirectory = tempDir;
+      final response = await (await client.getUrl(oldUrl)).close();
+      expect(response.statusCode, 404);
+      await response.drain<void>();
+    });
+
+    test(
+      'serves an existing file, DECRYPTED, with 200 and the right content',
+      () async {
+        final resp = await request('GET', '/dashboard.php');
+        expect(resp.statusCode, 200);
+        final body = await utf8.decoder.bind(resp).join();
+        expect(body, '<html><body>Dashboard</body></html>');
+      },
+    );
 
     test('sets the correct MIME type per extension', () async {
       final html = await request('GET', '/dashboard.php');
@@ -76,30 +107,36 @@ void main() {
     test('serves nested paths correctly, decrypted back to the exact original bytes', () async {
       final resp = await request('GET', '/assets/img/logo.png');
       expect(resp.statusCode, 200);
-      final bytes = await resp.fold<List<int>>([], (acc, chunk) => acc..addAll(chunk));
+      final bytes = await resp.fold<List<int>>(
+        [],
+        (acc, chunk) => acc..addAll(chunk),
+      );
       expect(bytes, [0x89, 0x50, 0x4E, 0x47]);
     });
 
-    test('HEAD returns headers (with the DECRYPTED content length) but no body', () async {
-      final resp = await request('HEAD', '/dashboard.php');
-      expect(resp.statusCode, 200);
-      expect(resp.headers.contentLength, '<html><body>Dashboard</body></html>'.length);
-      final body = await utf8.decoder.bind(resp).join();
-      expect(body, isEmpty);
-    });
+    test(
+      'HEAD returns headers (with the DECRYPTED content length) but no body',
+      () async {
+        final resp = await request('HEAD', '/dashboard.php');
+        expect(resp.statusCode, 200);
+        expect(
+          resp.headers.contentLength,
+          '<html><body>Dashboard</body></html>'.length,
+        );
+        final body = await utf8.decoder.bind(resp).join();
+        expect(body, isEmpty);
+      },
+    );
 
     test('404 for a file that genuinely does not exist', () async {
       final resp = await request('GET', '/does-not-exist.php');
       expect(resp.statusCode, 404);
     });
 
-    test(
-      'review round security requirement: path traversal is rejected as a plain 404, never a distinct error that would confirm the path was understood',
-      () async {
-        final resp = await request('GET', '/../../../../etc/passwd');
-        expect(resp.statusCode, 404);
-      },
-    );
+    test('review round security requirement: path traversal is rejected as a plain 404, never a distinct error that would confirm the path was understood', () async {
+      final resp = await request('GET', '/../../../../etc/passwd');
+      expect(resp.statusCode, 404);
+    });
 
     test('requesting the root directory itself (no path) is 404, never a directory listing', () async {
       final resp = await request('GET', '/');
@@ -117,37 +154,50 @@ void main() {
       expect(resp.statusCode, 404);
     });
 
+    test('rootDirectory is re-read per request — switching it (e.g. on user/parish switch) takes effect immediately, no restart needed', () async {
+      final otherDir = await Directory.systemTemp.createTemp(
+        'snapshot_server_test_other_',
+      );
+      await writeEncryptedFile(
+        '${otherDir.path}/dashboard.php',
+        utf8.encode('<html><body>Other user</body></html>'),
+      );
+
+      server.rootDirectory = otherDir;
+      final resp = await request('GET', '/dashboard.php');
+      final body = await utf8.decoder.bind(resp).join();
+      expect(
+        body,
+        '<html><body>Other user</body></html>',
+        reason: 'must serve the NEW root, not the old tempDir content',
+      );
+
+      await otherDir.delete(recursive: true);
+    });
+
     test(
-      'rootDirectory is re-read per request — switching it (e.g. on user/parish switch) takes effect immediately, no restart needed',
+      'calling start() twice returns the same port rather than binding again',
       () async {
-        final otherDir = await Directory.systemTemp.createTemp('snapshot_server_test_other_');
-        await writeEncryptedFile('${otherDir.path}/dashboard.php', utf8.encode('<html><body>Other user</body></html>'));
-
-        server.rootDirectory = otherDir;
-        final resp = await request('GET', '/dashboard.php');
-        final body = await utf8.decoder.bind(resp).join();
-        expect(body, '<html><body>Other user</body></html>', reason: 'must serve the NEW root, not the old tempDir content');
-
-        await otherDir.delete(recursive: true);
+        final secondPort = await server.start();
+        expect(secondPort, port);
       },
     );
-
-    test('calling start() twice returns the same port rather than binding again', () async {
-      final secondPort = await server.start();
-      expect(secondPort, port);
-    });
 
     test('after stop(), the port is no longer accepting connections', () async {
       await server.stop();
       expect(server.isRunning, isFalse);
       await expectLater(
-        client.openUrl('GET', Uri.parse('http://127.0.0.1:$port/dashboard.php')).then((r) => r.close()),
+        client
+            .openUrl('GET', Uri.parse('http://127.0.0.1:$port/dashboard.php'))
+            .then((r) => r.close()),
         throwsA(isA<SocketException>()),
       );
     });
 
     test('a file that fails to decrypt (e.g. corrupted or genuinely not encrypted) is served as 500, never garbage bytes', () async {
-      await File('${tempDir.path}/corrupted.html').writeAsBytes(utf8.encode('this is plain text, not a valid encrypted payload'));
+      await File('${tempDir.path}/corrupted.html').writeAsBytes(
+        utf8.encode('this is plain text, not a valid encrypted payload'),
+      );
       final resp = await request('GET', '/corrupted.html');
       expect(resp.statusCode, 500);
     });
