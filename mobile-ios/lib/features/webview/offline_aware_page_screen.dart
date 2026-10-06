@@ -51,8 +51,27 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
   };
 })();
 ''';
+  /// Budget for a PHP page to finish rendering ONCE a handoff ticket
+  /// exists (and for later in-session navigations). Deliberately separate
+  /// from — and much longer than — the connect budget in
+  /// OfflinePageCoordinator.onlineTimeout: that one answers "is there a
+  /// working connection at all" and must stay short so a truly offline
+  /// phone reaches its saved view fast; this one only decides when a
+  /// reachable-but-slow page is given up on. Before they were split, one
+  /// 1.5 s timer started BEFORE the ticket request and also covered the
+  /// page load, so a ticket that took 1.4 s left the page ~100 ms.
+  /// Tunable — verify on a real device on a slow mobile connection.
+  static const _pageRenderBudget = Duration(seconds: 8);
+
+  /// How long the LOCAL snapshot may take to produce onPageFinished (or a
+  /// handled error) before the screen stops waiting and says so. A
+  /// loopback page normally loads in well under a second; this is a
+  /// failure detector, never a target.
+  static const _offlineRenderBudget = Duration(seconds: 2);
+
   late final WebViewController _controller;
   _LoadState _state = _LoadState.loading;
+  String? _errorText;
   bool _online = true;
   bool _loggingOut = false;
   String? _banner;
@@ -76,7 +95,27 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
           onPageStarted: _onStarted,
           onHttpError: (error) {
             final uri = error.request?.uri;
-            if (!mounted || !_online || uri == null || !_trusted(uri)) return;
+            if (!mounted || _loggingOut || uri == null) return;
+            if (!_online) {
+              // LocalSnapshotServer answers 5xx when a stored file cannot
+              // be decrypted (corrupt cache / lost key). Without this the
+              // WebView just renders an empty error body and the screen
+              // reports "ready" over a blank page.
+              if (_state == _LoadState.loading &&
+                  widget.coordinator.localServer.ownsUrl(uri) &&
+                  uri.path.endsWith('/snapshot.html')) {
+                _navigationDeadline?.cancel();
+                _navigationDeadline = null;
+                _failedDocuments.add(uri.toString());
+                setState(() {
+                  _state = _LoadState.error;
+                  _errorText =
+                      'Zapisana kopia strony jest uszkodzona. Otwórz ją ponownie przy połączeniu z internetem.';
+                });
+              }
+              return;
+            }
+            if (!_trusted(uri)) return;
             final path = snapshotPagePath(uri);
             if (path != _currentPath &&
                 uri.path != '/public/mobile_handoff.php')
@@ -91,7 +130,10 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
             if (_online) {
               unawaited(_loadPage(forceOffline: true));
             } else {
-              setState(() => _state = _LoadState.error);
+              setState(() {
+                _state = _LoadState.error;
+                _errorText = 'Nie udało się otworzyć zapisanej kopii strony.';
+              });
             }
           },
           onNavigationRequest: _navigate,
@@ -156,9 +198,31 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
 
   void _startDeadline() {
     if (_navigationDeadline != null) return;
-    _navigationDeadline = Timer(const Duration(milliseconds: 1500), () {
-      if (mounted && _online && !_loggingOut)
+    _navigationDeadline = Timer(_pageRenderBudget, () {
+      if (mounted && _online && !_loggingOut) {
         unawaited(_loadPage(forceOffline: true));
+      }
+    });
+  }
+
+  /// Offline counterpart of [_startDeadline]. The online path was
+  /// bounded; this one was not — if the local page never produced
+  /// onPageFinished (or an error the delegate handles) the screen sat on
+  /// the spinner forever. Guarded by [generation] so a timer from an
+  /// earlier load can never flip a newer load into the error state.
+  void _armOfflineDeadline(int generation) {
+    _navigationDeadline?.cancel();
+    _navigationDeadline = Timer(_offlineRenderBudget, () {
+      if (!mounted ||
+          _loggingOut ||
+          generation != _loadGeneration ||
+          _state != _LoadState.loading) {
+        return;
+      }
+      setState(() {
+        _state = _LoadState.error;
+        _errorText = 'Zapisana kopia strony nie otworzyła się. Spróbuj ponownie.';
+      });
     });
   }
 
@@ -170,9 +234,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
       _failedDocuments.remove(uri.toString());
       final path = snapshotPagePath(uri);
       if (path != null && _afterHandoffPath == null) _currentPath = path;
-      _navigationDeadline ??= Timer(const Duration(milliseconds: 1500), () {
-        if (mounted && _online) unawaited(_loadPage(forceOffline: true));
-      });
+      _startDeadline();
     }
     unawaited(_controller.runJavaScript(_bridgeShim).catchError((_) {}));
   }
@@ -309,10 +371,10 @@ $_captureChannel.postMessage(JSON.stringify({
     if (!mounted || _loggingOut) return;
     setState(() => _state = _LoadState.loading);
     try {
-      if (!forceOffline) {
-        _online = true;
-        _startDeadline();
-      }
+      // No page deadline here on purpose: plan() is itself bounded
+      // (handoff by onlineTimeout, local view by offlinePlanTimeout), and
+      // the page-render budget must only start once a ticket exists.
+      if (!forceOffline) _online = true;
       final plan = await widget.coordinator.plan(
         parishId: widget.parishId,
         userId: widget.userId,
@@ -327,14 +389,23 @@ $_captureChannel.postMessage(JSON.stringify({
               ? _currentPath
               : null;
           _banner = null;
+          _errorText = null;
+          _startDeadline();
           await _controller.loadRequest(plan.url);
         case PageLoadOffline():
           _online = false;
           _afterHandoffPath = null;
           _banner = formatOfflineBannerText(plan.capturedAt);
+          _errorText = null;
+          // A previous attempt at this very URL may have been marked
+          // failed (corrupt copy); the entry must not swallow the
+          // onPageFinished of a legitimate retry.
+          _failedDocuments.removeWhere((u) => u.startsWith('http://'));
+          _armOfflineDeadline(generation);
           await _controller.loadRequest(plan.url);
         case PageLoadOfflineNoSnapshot():
           _online = false;
+          _errorText = null;
           setState(() => _state = _LoadState.noSnapshot);
       }
     } catch (_) {
@@ -383,41 +454,59 @@ $_captureChannel.postMessage(JSON.stringify({
                 ),
               ),
             Expanded(
-              child: _state == _LoadState.ready
-                  ? WebViewWidget(controller: _controller)
-                  : _state == _LoadState.loading
-                  ? const Center(child: CircularProgressIndicator())
-                  : Center(
-                      child: Padding(
-                        padding: const EdgeInsets.all(24),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Icon(Icons.wifi_off, size: 48),
-                            const SizedBox(height: 16),
-                            Text(
-                              _state == _LoadState.noSnapshot
-                                  ? 'Brak zapisanej wersji tej strony. Otwórz ją przy połączeniu z internetem.'
-                                  : 'Nie udało się otworzyć strony.',
-                              textAlign: TextAlign.center,
-                            ),
-                            const SizedBox(height: 16),
-                            FilledButton(
-                              onPressed: () => _loadPage(),
-                              child: const Text('SPRÓBUJ PONOWNIE'),
-                            ),
-                            if (_currentPath != widget.targetPath)
-                              TextButton(
-                                onPressed: () {
-                                  _currentPath = widget.targetPath;
-                                  unawaited(_loadPage(forceOffline: !_online));
-                                },
-                                child: const Text('WRÓĆ DO PANELU'),
+              // The WebView is ALWAYS part of the tree (it used to be added
+              // only once onPageFinished had set `ready`, i.e. the page
+              // had to finish loading in a view that did not exist yet).
+              // Loading / no-snapshot / error are an opaque overlay on top,
+              // so a rebuild can never tear the platform view down in the
+              // middle of a navigation.
+              child: Stack(
+                children: [
+                  WebViewWidget(controller: _controller),
+                  if (_state != _LoadState.ready)
+                    Positioned.fill(
+                      child: ColoredBox(
+                        color: Theme.of(context).colorScheme.surface,
+                        child: _state == _LoadState.loading
+                            ? const Center(child: CircularProgressIndicator())
+                            : Center(
+                                child: Padding(
+                                  padding: const EdgeInsets.all(24),
+                                  child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      const Icon(Icons.wifi_off, size: 48),
+                                      const SizedBox(height: 16),
+                                      Text(
+                                        _state == _LoadState.noSnapshot
+                                            ? 'Brak zapisanej wersji tej strony. Otwórz ją przy połączeniu z internetem.'
+                                            : (_errorText ??
+                                                  'Nie udało się otworzyć strony.'),
+                                        textAlign: TextAlign.center,
+                                      ),
+                                      const SizedBox(height: 16),
+                                      FilledButton(
+                                        onPressed: () => _loadPage(),
+                                        child: const Text('SPRÓBUJ PONOWNIE'),
+                                      ),
+                                      if (_currentPath != widget.targetPath)
+                                        TextButton(
+                                          onPressed: () {
+                                            _currentPath = widget.targetPath;
+                                            unawaited(
+                                              _loadPage(forceOffline: !_online),
+                                            );
+                                          },
+                                          child: const Text('WRÓĆ DO PANELU'),
+                                        ),
+                                    ],
+                                  ),
+                                ),
                               ),
-                          ],
-                        ),
                       ),
                     ),
+                ],
+              ),
             ),
           ],
         ),

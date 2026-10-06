@@ -11,6 +11,7 @@ import 'package:ministrant_manager/core/offline/offline_page_coordinator.dart';
 import 'package:ministrant_manager/core/offline/page_resource_downloader.dart';
 import 'package:ministrant_manager/core/offline/snapshot_capture_service.dart';
 import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
+import 'package:ministrant_manager/core/offline/snapshot_manifest.dart';
 import 'package:ministrant_manager/core/offline/snapshot_store.dart';
 import 'package:ministrant_manager/core/secure/secure_storage_service.dart';
 import 'package:ministrant_manager/features/webview/webview_handoff_service.dart';
@@ -36,6 +37,31 @@ class _FakeHandoffService extends WebviewHandoffService {
     if (hang) return Completer<Uri>().future;
     if (errorToThrow != null) throw errorToThrow!;
     return handoffUrlToReturn!;
+  }
+}
+
+/// Lets a test hold ONE page's local planning step open (until [gate]
+/// completes — or forever, if the test never completes it) while other
+/// pages plan normally. Everything else is the real SnapshotStore.
+class _GatedStore extends SnapshotStore {
+  _GatedStore(Directory root)
+    : super(encryptor: _testEncryptor, rootOverride: root);
+
+  String? gatedPath;
+  final Completer<void> gate = Completer<void>();
+
+  @override
+  Future<SnapshotManifest?> readManifestFor({
+    required String parishId,
+    required String userId,
+    required String pagePath,
+  }) async {
+    if (pagePath == gatedPath) await gate.future;
+    return super.readManifestFor(
+      parishId: parishId,
+      userId: userId,
+      pagePath: pagePath,
+    );
   }
 }
 
@@ -231,6 +257,85 @@ void main() {
       expect(plan, isA<PageLoadOfflineNoSnapshot>());
       expect(clock.elapsedMilliseconds, lessThan(500));
       expect(handoff.calls, 1);
+    });
+
+    test('a stuck local planning step has its own deadline', () async {
+      final gated = _GatedStore(tempRoot)..gatedPath = '/public/dashboard.php';
+      final handoff = _FakeHandoffService(SecureStorageService())
+        ..errorToThrow = Exception('down');
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: gated,
+        localServer: localServer,
+        handoffService: handoff,
+        offlinePlanTimeout: const Duration(milliseconds: 100),
+      );
+      final clock = Stopwatch()..start();
+      final plan = await coordinator.plan(
+        parishId: 'p',
+        userId: 'u',
+        targetPath: '/public/dashboard.php',
+      );
+      expect(plan, isA<PageLoadOfflineNoSnapshot>());
+      expect(clock.elapsedMilliseconds, lessThan(1000));
+    });
+
+    test('a superseded local plan never repoints the shared server', () async {
+      final gated = _GatedStore(tempRoot);
+      await gated.writeSnapshot(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/dashboard.php',
+        html: '<html>Dashboard</html>',
+        assets: {},
+      );
+      await gated.writeSnapshot(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/ranking.php',
+        html: '<html>Ranking</html>',
+        assets: {},
+      );
+      gated.gatedPath = '/public/dashboard.php';
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: gated,
+        localServer: localServer,
+        handoffService: _FakeHandoffService(SecureStorageService()),
+      );
+
+      // The dashboard plan is held open at the gate; a NEWER plan for
+      // another page runs to completion first.
+      final slow = coordinator.plan(
+        parishId: 'p',
+        userId: 'u',
+        targetPath: '/public/dashboard.php',
+        forceOffline: true,
+      );
+      final fast = await coordinator.plan(
+        parishId: 'p',
+        userId: 'u',
+        targetPath: '/public/ranking.php',
+        forceOffline: true,
+      );
+      expect(fast, isA<PageLoadOffline>());
+      final rankingDir = await gated.getPageDirectoryIfReady(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/ranking.php',
+      );
+      expect(localServer.rootDirectory?.path, rankingDir!.path);
+
+      gated.gate.complete();
+      final late = await slow;
+      expect(late, isA<PageLoadOfflineNoSnapshot>());
+      expect(
+        localServer.rootDirectory?.path,
+        rankingDir.path,
+        reason: 'the older, slower plan must not repoint the server',
+      );
     });
 
     test('a reachable page plans to load online via a freshly-minted handoff URL, never targetPath itself', () async {

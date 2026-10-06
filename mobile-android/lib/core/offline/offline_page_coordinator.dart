@@ -44,10 +44,30 @@ class OfflinePageCoordinator {
     required this.localServer,
     required this.handoffService,
     this.onlineTimeout = const Duration(milliseconds: 1500),
+    this.offlinePlanTimeout = const Duration(milliseconds: 1500),
   });
 
   final ConnectivityProbe connectivityProbe;
+
+  /// Budget for the CONNECT phase only: minting the handoff ticket. It
+  /// deliberately does NOT cover rendering the PHP page afterwards — the
+  /// screen owns a separate, longer budget for that, started only once a
+  /// ticket actually exists (a slow-but-working server must not be
+  /// mistaken for "no network" just because the ticket took a while).
   final Duration onlineTimeout;
+
+  /// Budget for building the LOCAL view (manifest, directory, starting
+  /// the loopback server). Normally a few milliseconds; this exists so a
+  /// stuck filesystem/server step can never leave the screen waiting
+  /// forever on plan() itself.
+  final Duration offlinePlanTimeout;
+
+  /// Bumped at the start of every plan(). A plan that was superseded
+  /// while it was still running (timed out, or a newer page was
+  /// requested) must never repoint the shared loopback server at ITS
+  /// page when it finally finishes — [LocalSnapshotServer.rootDirectory]
+  /// is a single mutable slot shared by every load.
+  int _planGeneration = 0;
   Future<void> _captureQueue = Future<void>.value();
   final SnapshotCaptureService captureService;
   final SnapshotStore snapshotStore;
@@ -70,6 +90,7 @@ class OfflinePageCoordinator {
     required String targetPath,
     bool forceOffline = false,
   }) async {
+    final generation = ++_planGeneration;
     final path = snapshotPagePath(Uri.parse(targetPath));
     if (path == null) return const PageLoadOfflineNoSnapshot();
     String? diagnosticMessage;
@@ -90,6 +111,27 @@ class OfflinePageCoordinator {
       }
     }
 
+    return _planOffline(
+      generation: generation,
+      parishId: parishId,
+      userId: userId,
+      path: path,
+      diagnosticMessage: diagnosticMessage,
+    ).timeout(
+      offlinePlanTimeout,
+      onTimeout: () => PageLoadOfflineNoSnapshot(
+        diagnosticMessage: kDebugMode ? 'offline plan timed out' : null,
+      ),
+    );
+  }
+
+  Future<PageLoadPlan> _planOffline({
+    required int generation,
+    required String parishId,
+    required String userId,
+    required String path,
+    required String? diagnosticMessage,
+  }) async {
     final manifest = await snapshotStore.readManifestFor(
       parishId: parishId,
       userId: userId,
@@ -112,6 +154,13 @@ class OfflinePageCoordinator {
     }
 
     await localServer.start();
+    // Superseded while we were awaiting (timed out, or a newer plan()
+    // started): do NOT touch the shared server slot. The caller already
+    // discards stale plans, but by then this assignment would have
+    // pointed the server at the wrong page.
+    if (generation != _planGeneration) {
+      return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage);
+    }
     localServer.rootDirectory = pageDir;
 
     return PageLoadOffline(
