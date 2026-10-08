@@ -615,13 +615,29 @@ void main() {
 
       test('a defect in this app (TypeError) is never presented as the server refusing', () async {
         await saveDashboard();
+        // Produced the way they occur for real, not by constructing them.
+        Object failedCast() {
+          try {
+            final Object? value = 5;
+            return value as String;
+          } catch (e) {
+            return e;
+          }
+        }
+
+        Object missingMethod() {
+          try {
+            final dynamic value = 5;
+            return value.noSuchMethodHere();
+          } catch (e) {
+            return e;
+          }
+        }
+
         for (final error in <Object>[
-          TypeError(),
+          failedCast(),
+          missingMethod(),
           StateError('not activated'),
-          NoSuchMethodError.withInvocation(
-            Object(),
-            Invocation.method(#foo, const []),
-          ),
         ]) {
           final result = await plan(coordinatorFailingWith(error));
           expect(result, isA<PageLoadOffline>(), reason: '${error.runtimeType}');
