@@ -9,12 +9,14 @@ import 'core/deeplink/deep_link_service.dart';
 import 'core/network/api_client.dart';
 import 'core/secure/secure_storage_service.dart';
 import 'core/startup/app_services.dart';
+import 'core/util/startup_trace.dart';
 import 'features/activation/activation_screen.dart';
 import 'features/home/home_screen.dart';
 import 'features/preflight/preflight_gate.dart';
 import 'features/startup/startup_error_screen.dart';
 
 void main() {
+  StartupTrace.mark('main');
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const MinistrantManagerApp());
 }
@@ -133,6 +135,8 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
         _isActivated = data.activated;
         _services = data.services;
       });
+      StartupTrace.mark('app_ready');
+      if (data.activated) unawaited(_prewarmParishClient());
     } on TimeoutException {
       if (!mounted || generation != _startupGeneration) return;
       // Abandon this attempt: bump the generation so that if it ever does
@@ -161,26 +165,54 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
     // clobber the good value the activation flow already sent once the
     // first heartbeat fires. Neither lookup is worth failing startup over:
     // each falls back to the previous value.
-    var appVersion = _appVersion;
-    var osVersion = _osVersion;
-    try {
-      appVersion = (await PackageInfo.fromPlatform()).version;
-    } catch (_) {}
-    try {
-      osVersion = await _resolveOsVersion();
-    } catch (_) {}
+    //
+    // The two lookups start now and run WHILE the activation state is read
+    // and the services are built (they were three sequential platform
+    // round-trips ahead of anything else). Neither can throw.
+    final versionLookup = _lookup(
+      () async => (await PackageInfo.fromPlatform()).version,
+      _appVersion,
+    );
+    final osLookup = _lookup(_resolveOsVersion, _osVersion);
 
     // These two are not optional: without the activation state and the
-    // database there is no app to show.
+    // database there is no app to show. Sequential on purpose: a storage
+    // that cannot be read must stop here, before a database is opened.
     final activated = await _secureStorage.isActivated;
+    StartupTrace.mark('activation_read');
     final services = await widget.buildServices(_secureStorage, _api);
+    StartupTrace.mark('services_built');
 
     return _StartupData(
-      appVersion: appVersion,
-      osVersion: osVersion,
+      appVersion: await versionLookup,
+      osVersion: await osLookup,
       activated: activated,
       services: services,
     );
+  }
+
+  /// [lookup]'s result, or [fallback] if it throws. For values the app can
+  /// carry on without; never for anything that gates access.
+  Future<T> _lookup<T>(Future<T> Function() lookup, T fallback) async {
+    try {
+      return await lookup();
+    } catch (_) {
+      return fallback;
+    }
+  }
+
+  /// Builds the parish API client (three keystore reads and an HTTP client)
+  /// ahead of time. Without this the first handoff paid for those reads
+  /// INSIDE its 1.4 s network limit, so on a cold start a slow keystore
+  /// could make the request "time out" before it was even sent: a false
+  /// OFFLINE with a working network. Any failure (no user signed in yet)
+  /// is expected and ignored; the client is rebuilt on demand, and every
+  /// change of token already discards it (resetParishClient).
+  Future<void> _prewarmParishClient() async {
+    try {
+      await _api.parish();
+      StartupTrace.mark('parish_client_ready');
+    } catch (_) {}
   }
 
   Future<String> _resolveOsVersion() async {

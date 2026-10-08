@@ -103,7 +103,7 @@ jobs:
             -alias "$ANDROID_KEY_ALIAS" >/dev/null
 
       - name: Build debug APK (always)
-        run: flutter build apk --debug
+        run: flutter build apk --debug --dart-define=GIT_SHA=${{ github.sha }}
 
       - name: Validate release AAB with ephemeral CI key (when production signing is absent)
         if: ${{ env.HAS_ANDROID_KEYSTORE == 'false' && env.HAS_ANDROID_STORE_PASSWORD == 'false' && env.HAS_ANDROID_KEY_ALIAS == 'false' && env.HAS_ANDROID_KEY_PASSWORD == 'false' }}
@@ -134,13 +134,28 @@ jobs:
       - name: Build release APK + AAB (only if keystore secrets are configured)
         if: ${{ env.HAS_ANDROID_KEYSTORE == 'true' && env.HAS_ANDROID_STORE_PASSWORD == 'true' && env.HAS_ANDROID_KEY_ALIAS == 'true' && env.HAS_ANDROID_KEY_PASSWORD == 'true' }}
         run: |
-          flutter build apk --release
-          flutter build appbundle --release
+          flutter build apk --release --dart-define=GIT_SHA=${{ github.sha }}
+          flutter build appbundle --release --dart-define=GIT_SHA=${{ github.sha }}
+
+      - name: Record which commit these files were built from
+        # The commit is also compiled into the app (device settings -> "Wersja
+        # aplikacji"); this file lets it be checked BEFORE installing.
+        run: |
+          cd build/app/outputs/flutter-apk
+          {
+            echo "commit: ${{ github.sha }}"
+            echo "ref:    ${{ github.ref_name }}"
+            echo "run:    ${{ github.run_id }}"
+            echo
+            sha256sum *.apk
+          } > BUILD-INFO.txt
+          cat BUILD-INFO.txt
 
       - uses: actions/upload-artifact@v4
         with:
           name: android-build-outputs
           path: |
             mobile-android/build/app/outputs/flutter-apk/*.apk
+            mobile-android/build/app/outputs/flutter-apk/BUILD-INFO.txt
             mobile-android/build/app/outputs/bundle/release/*.aab
           if-no-files-found: warn

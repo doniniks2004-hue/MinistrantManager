@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import '../database/app_database.dart';
 import '../network/api_client.dart';
 import '../offline/connectivity_probe.dart';
@@ -74,6 +76,14 @@ Future<AppServices> buildAppServices(
   final dbKey = await secureStorage.getOrCreateDbEncryptionKey();
   final db = AppDatabase(dbKey);
   try {
+    // The database is opened lazily, on the first query, and opening it
+    // (a background isolate plus key derivation) is the slowest step before
+    // the first screen can decide anything. Start it NOW so it runs while
+    // the rest of the services are built and the home screen reads its
+    // state, instead of beginning only when that first query is made. A
+    // failure is deliberately not raised here: the same open is awaited by
+    // the first real query, which reports it where it can be handled.
+    unawaited(db.ensureSyncMetadata().then<void>((_) {}, onError: (_) {}));
     // Offline-architecture milestone, P8.2: resolved fresh on every call,
     // exactly like dbKey above — after a revoke-triggered crypto-erase,
     // RevocationHandler has already deleted the OLD snapshot encryption
