@@ -745,7 +745,11 @@ $_captureChannel.postMessage(JSON.stringify({
           _afterHandoffPath = _currentPath != widget.targetPath
               ? _currentPath
               : null;
-          _banner = null;
+          // With a setState: the live page is being requested NOW, so the
+          // OFFLINE label must go now, not at the next rebuild — which used
+          // to be the end of the page load, leaving "OFFLINE" over a page
+          // that was loading from the server.
+          setState(() => _banner = null);
           _errorText = null;
           // A ticket exists: the server answered, so this is no longer
           // "is the network there" but "is the page slow" — it gets its
