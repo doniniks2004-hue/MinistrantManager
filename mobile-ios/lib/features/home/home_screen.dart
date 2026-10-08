@@ -71,6 +71,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   int? _userId;
   String? _parishId;
   String? _serverUrl;
+
+  /// True once the identifiers above have been read from local storage for
+  /// the CURRENT session (reset when a login completes, since the values
+  /// from before it no longer apply). Separates "still being read" — a
+  /// spinner is right — from "read, and something is missing" — which is an
+  /// error the user must be able to act on, not a spinner.
+  bool _identityRead = false;
+
+  /// The very first local read failed, so nothing is known about this
+  /// device's state. There is no cached state to fall back on; without this
+  /// flag the screen stayed on its first-frame spinner indefinitely.
+  bool _stateLoadFailed = false;
   bool _syncInProgress = false;
   int _sessionGeneration = 0;
   Timer? _leaseTimer;
@@ -91,6 +103,42 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               )),
     );
   }
+
+  /// A state the user can act on, instead of a spinner that never ends.
+  /// The app bar keeps the device-settings entry (including "change
+  /// parish"), the one way out when the stored device data itself is bad.
+  Scaffold _problemScaffold({
+    required String message,
+    bool showLogout = false,
+  }) =>
+      Scaffold(
+        appBar: _deviceSettingsBar(),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.error_outline, size: 48, color: Colors.red),
+                const SizedBox(height: 16),
+                Text(message, textAlign: TextAlign.center),
+                const SizedBox(height: 20),
+                FilledButton(
+                  onPressed: _bootstrapThenSync,
+                  child: const Text('SPRÓBUJ PONOWNIE'),
+                ),
+                if (showLogout) ...[
+                  const SizedBox(height: 8),
+                  OutlinedButton(
+                    onPressed: _onLogout,
+                    child: const Text('WYLOGUJ'),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      );
 
   AppBar _deviceSettingsBar() => AppBar(
         title: const Text('Ministrant Manager'),
@@ -153,14 +201,49 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  /// Always assigned together, and always from storage: marks the
+  /// identifiers as read so the build can tell "missing" from "loading".
+  void _applyIdentity({
+    required bool hasUserSession,
+    int? userId,
+    String? parishId,
+    String? serverUrl,
+  }) {
+    _hasUserSession = hasUserSession;
+    _userId = userId;
+    _parishId = parishId;
+    _serverUrl = serverUrl;
+    _identityRead = true;
+  }
+
+  /// The host of the stored server URL, or null if there is no URL or it has
+  /// no host. `Uri.parse(url).host` on a malformed value used to throw
+  /// inside build().
+  String? get _serverHost {
+    final url = _serverUrl;
+    if (url == null) return null;
+    final host = Uri.tryParse(url)?.host;
+    return (host == null || host.isEmpty) ? null : host;
+  }
+
   Future<void> _bootstrapThenSync() async {
     if (_syncInProgress) return;
     _syncInProgress = true;
     final generation = _sessionGeneration;
+    if (_stateLoadFailed && mounted) {
+      setState(() => _stateLoadFailed = false);
+    }
     try {
       await _refreshState(generation);
     } catch (_) {
       // Preserve the locally validated lease state on malformed responses.
+      // But if nothing has been established locally yet there is no state
+      // to preserve, and silently returning leaves the spinner up forever.
+      if (mounted &&
+          generation == _sessionGeneration &&
+          _hasUserSession == null) {
+        setState(() => _stateLoadFailed = true);
+      }
     } finally {
       _syncInProgress = false;
       if (mounted && generation != _sessionGeneration)
@@ -196,10 +279,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _authState = localWithinLease
           ? DeviceAuthState.offlineWithinLease
           : DeviceAuthState.offlineLeaseExpired;
-      _hasUserSession = localHasUserSession;
-      _userId = localUserId;
-      _parishId = localParishId;
-      _serverUrl = localServerUrl;
+      _applyIdentity(
+        hasUserSession: localHasUserSession,
+        userId: localUserId,
+        parishId: localParishId,
+        serverUrl: localServerUrl,
+      );
     });
 
     // Global config and device authorization are independent; a config timeout
@@ -269,10 +354,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         : null;
     if (!mounted || generation != _sessionGeneration) return;
     setState(() {
-      _hasUserSession = hasUserSession;
-      _userId = earlyUserId;
-      _parishId = earlyParishId;
-      _serverUrl = earlyServerUrl;
+      _applyIdentity(
+        hasUserSession: hasUserSession,
+        userId: earlyUserId,
+        parishId: earlyParishId,
+        serverUrl: earlyServerUrl,
+      );
     });
     unawaited(
       configFuture.then((config) {
@@ -327,10 +414,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (!mounted || generation != _sessionGeneration) return;
     setState(() {
-      _hasUserSession = hasUserSession;
-      _userId = userId;
-      _parishId = parishId;
-      _serverUrl = serverUrl;
+      _applyIdentity(
+        hasUserSession: hasUserSession,
+        userId: userId,
+        parishId: parishId,
+        serverUrl: serverUrl,
+      );
     });
   }
 
@@ -347,7 +436,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   void _onLoggedIn() {
     _sessionGeneration++;
-    setState(() => _hasUserSession = true);
+    setState(() {
+      _hasUserSession = true;
+      _identityRead = false;
+    });
     _bootstrapThenSync();
   }
 
@@ -492,6 +584,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       );
     }
 
+    if (_stateLoadFailed) {
+      return _problemScaffold(
+        message:
+            'Nie udało się odczytać danych aplikacji z urządzenia.\nSpróbuj ponownie.',
+      );
+    }
+
     if (_hasUserSession == null) {
       // Still checking (first frame) — device-level checks above already
       // completed by the time we'd reach here in practice, but guard
@@ -507,15 +606,28 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       );
     }
 
-    if (_userId == null || _parishId == null || _serverUrl == null) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    final host = _serverHost;
+    if (_userId == null || _parishId == null || host == null) {
+      // Still being read: a spinner is right. Already read and something
+      // is missing or unusable: it will not fix itself, so say so and
+      // offer the ways out instead of spinning forever.
+      if (!_identityRead) {
+        return const Scaffold(
+          body: Center(child: CircularProgressIndicator()),
+        );
+      }
+      return _problemScaffold(
+        message:
+            'Brakuje danych potrzebnych do otwarcia strony (parafia lub adres serwera).\nWyloguj się i zaloguj ponownie albo zmień parafię w ustawieniach urządzenia.',
+        showLogout: true,
+      );
     }
 
     return OfflineAwarePageScreen(
       key: ValueKey('$_parishId:$_userId'),
       title: 'Ministrant Manager',
       targetPath: '/public/dashboard.php',
-      allowedHost: Uri.parse(_serverUrl!).host,
+      allowedHost: host,
       parishId: _parishId!,
       userId: _userId!.toString(),
       coordinator: widget.offlinePageCoordinator,
