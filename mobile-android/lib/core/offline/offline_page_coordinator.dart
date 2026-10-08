@@ -99,6 +99,7 @@ class OfflinePageCoordinator {
     final path = snapshotPagePath(Uri.parse(targetPath));
     if (path == null) return const PageLoadOfflineNoSnapshot();
     String? diagnosticMessage;
+    var offlineReason = OfflineReason.noNetwork;
     if (!forceOffline) {
       try {
         final handoffUrl = await handoffService
@@ -106,6 +107,7 @@ class OfflinePageCoordinator {
             .timeout(onlineTimeout);
         return PageLoadOnline(url: handoffUrl, targetPath: path);
       } catch (e) {
+        final failure = HandoffFailure.of(e);
         // No URLs, response bodies, tickets, or exception messages.
         if (kDebugMode) {
           diagnosticMessage = e is DioException
@@ -113,10 +115,27 @@ class OfflinePageCoordinator {
               : 'handoff: ${e.runtimeType}';
           debugPrint(diagnosticMessage);
         }
+        if (failure.kind == HandoffFailureKind.rejected) {
+          // The server ANSWERED and said no. That is not "no network":
+          // falling back to a snapshot under an OFFLINE banner would tell
+          // the user their connection is broken when it is working, and
+          // would hide a problem (a rejected path, an expired session)
+          // that retrying the snapshot can never fix.
+          return PageLoadServerError(
+            statusCode: failure.statusCode,
+            errorCode: failure.errorCode,
+            path: Uri.parse(path).path,
+            hasSnapshot: await _hasSnapshot(parishId, userId, path),
+          );
+        }
+        if (failure.kind == HandoffFailureKind.serverUnavailable) {
+          offlineReason = OfflineReason.serverUnavailable;
+        }
       }
     }
 
     return _planOffline(
+      reason: offlineReason,
       ticket: ticket,
       parishId: parishId,
       userId: userId,
@@ -136,7 +155,19 @@ class OfflinePageCoordinator {
   bool _isStale(_PlanTicket ticket) =>
       ticket.expired || ticket.generation != _planGeneration;
 
+  Future<bool> _hasSnapshot(String parishId, String userId, String path) async {
+    try {
+      final manifest = await snapshotStore
+          .readManifestFor(parishId: parishId, userId: userId, pagePath: path)
+          .timeout(offlinePlanTimeout);
+      return manifest != null;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<PageLoadPlan> _planOffline({
+    required OfflineReason reason,
     required _PlanTicket ticket,
     required String parishId,
     required String userId,
@@ -179,6 +210,7 @@ class OfflinePageCoordinator {
     return PageLoadOffline(
       url: localServer.urlFor('/snapshot.html'),
       capturedAt: manifest.capturedAt,
+      reason: reason,
     );
   }
 
@@ -253,9 +285,108 @@ class PageLoadOnline extends PageLoadPlan {
 /// right (parish, user, page) snapshot directory; [capturedAt] is for
 /// the "OFFLINE • ostatnia synchronizacja: HH:MM" banner.
 class PageLoadOffline extends PageLoadPlan {
-  const PageLoadOffline({required this.url, required this.capturedAt});
+  const PageLoadOffline({
+    required this.url,
+    required this.capturedAt,
+    this.reason = OfflineReason.noNetwork,
+  });
   final Uri url;
   final DateTime capturedAt;
+
+  /// Why a snapshot is shown instead of the live page — drives the banner
+  /// wording, so a server outage is not reported as "no network".
+  final OfflineReason reason;
+}
+
+enum OfflineReason {
+  /// The request never got an answer (no connection, DNS, timeout).
+  noNetwork,
+
+  /// The server answered with a transient failure (5xx, 408, 429).
+  serverUnavailable,
+}
+
+/// The server answered the handoff and refused it for a reason a snapshot
+/// cannot fix (4xx other than 408/429, or a reply that is not a handoff
+/// reply at all). Carries ONLY sanitized facts, safe to show on screen in a
+/// release build: the HTTP status, the server's short machine error code
+/// if it has the expected shape, and the page path without its query.
+/// Never a response body, message, URL, ticket or token.
+class PageLoadServerError extends PageLoadPlan {
+  const PageLoadServerError({
+    required this.statusCode,
+    required this.errorCode,
+    required this.path,
+    required this.hasSnapshot,
+  });
+
+  /// Null when the reply was not an HTTP error at all but was unusable.
+  final int? statusCode;
+  final String? errorCode;
+  final String path;
+
+  /// A saved copy of this exact page exists, so the screen can offer it
+  /// explicitly instead of silently pretending to be offline.
+  final bool hasSnapshot;
+}
+
+enum HandoffFailureKind {
+  /// No answer from the server: connection, DNS, TLS, timeout, or a local
+  /// precondition (e.g. not activated). Falling back to a snapshot is right.
+  transport,
+
+  /// The server answered with a transient failure (5xx, 408, 429).
+  serverUnavailable,
+
+  /// The server answered and refused, or answered something unusable.
+  rejected,
+}
+
+class HandoffFailure {
+  const HandoffFailure._(this.kind, this.statusCode, this.errorCode);
+
+  final HandoffFailureKind kind;
+  final int? statusCode;
+  final String? errorCode;
+
+  static final _codeShape = RegExp(r'^[a-z][a-z0-9_]{0,47}$');
+
+  /// Sorts any error thrown by the handoff request into what it means for
+  /// the user. [error] is whatever requestHandoffUrl threw.
+  static HandoffFailure of(Object error) {
+    if (error is DioException) {
+      final response = error.response;
+      if (response == null) {
+        return const HandoffFailure._(HandoffFailureKind.transport, null, null);
+      }
+      final status = response.statusCode;
+      final data = response.data;
+      final raw = data is Map ? data['error'] : null;
+      // Only a short machine code is kept; anything else the server sent
+      // (a message, markup, a longer string) is dropped.
+      final code = raw is String && _codeShape.hasMatch(raw) ? raw : null;
+      final transient =
+          status == null || status >= 500 || status == 408 || status == 429;
+      return HandoffFailure._(
+        transient
+            ? HandoffFailureKind.serverUnavailable
+            : HandoffFailureKind.rejected,
+        status,
+        code,
+      );
+    }
+    // The request returned, but not a handoff reply (e.g. an HTML page
+    // where JSON was expected): the server answered, so this is not the
+    // network, and a saved copy will not make it go away.
+    if (error is FormatException || error is TypeError || error is NoSuchMethodError) {
+      return const HandoffFailure._(
+        HandoffFailureKind.rejected,
+        null,
+        'invalid_response',
+      );
+    }
+    return const HandoffFailure._(HandoffFailureKind.transport, null, null);
+  }
 }
 
 /// Offline AND no snapshot exists yet for this exact page — the caller
@@ -277,9 +408,15 @@ class PageLoadOfflineNoSnapshot extends PageLoadPlan {
 /// dodatkowy element aplikacji" beyond the real PHP page itself. Local
 /// time, zero-padded, nothing more elaborate — this is explicitly NOT a
 /// redesign of anything, just the one allowed banner line.
-String formatOfflineBannerText(DateTime capturedAt) {
+String formatOfflineBannerText(
+  DateTime capturedAt, {
+  OfflineReason reason = OfflineReason.noNetwork,
+}) {
   final local = capturedAt.toLocal();
   final hh = local.hour.toString().padLeft(2, '0');
   final mm = local.minute.toString().padLeft(2, '0');
-  return 'OFFLINE • ostatnia synchronizacja: $hh:$mm';
+  final label = reason == OfflineReason.serverUnavailable
+      ? 'SERWER NIEDOSTĘPNY'
+      : 'OFFLINE';
+  return '$label • ostatnia synchronizacja: $hh:$mm';
 }

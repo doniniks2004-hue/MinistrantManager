@@ -35,6 +35,24 @@ class OfflineAwarePageScreen extends StatefulWidget {
 
 enum _LoadState { loading, ready, error, noSnapshot }
 
+/// What the user sees when the server refused to open a page. Built only
+/// from the sanitized fields of [PageLoadServerError]. The second line is
+/// for whoever is helping the user: status, the server's machine code, and
+/// the page path (no query, no ids).
+String describeServerError(PageLoadServerError e) {
+  final lead = switch (e.statusCode) {
+    401 => 'Sesja wygasła lub została odrzucona przez serwer.',
+    403 => 'Serwer odmówił dostępu do tej strony.',
+    _ => 'Połączenie z serwerem działa, ale serwer nie otworzył tej strony.',
+  };
+  final detail = [
+    if (e.statusCode != null) 'HTTP ${e.statusCode}',
+    if (e.errorCode != null) e.errorCode!,
+    e.path,
+  ].join(' · ');
+  return '$lead\n$detail';
+}
+
 class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
   static const _captureChannel = 'MMPageCapture';
   static const _bridgeChannel = 'MinistrantBridge';
@@ -108,6 +126,12 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen> {
   late final WebViewController _controller;
   _LoadState _state = _LoadState.loading;
   String? _errorText;
+
+  /// Set while the error state on screen is "the server answered and
+  /// refused" (as opposed to a local failure). Drives the extra actions and
+  /// the icon: a Wi-Fi-off icon over a message about a working connection
+  /// would contradict itself.
+  PageLoadServerError? _serverError;
   bool _online = true;
   bool _loggingOut = false;
   String? _banner;
@@ -431,6 +455,7 @@ $_captureChannel.postMessage(JSON.stringify({
     // From here on any offline navigation that was still pending belongs
     // to an abandoned load.
     _offlineLoadUrl = null;
+    _serverError = null;
     _totalDeadline?.cancel();
     _totalDeadline = Timer(
       _offlineTotalBudget,
@@ -471,7 +496,10 @@ $_captureChannel.postMessage(JSON.stringify({
         case PageLoadOffline():
           _online = false;
           _afterHandoffPath = null;
-          _banner = formatOfflineBannerText(plan.capturedAt);
+          _banner = formatOfflineBannerText(
+            plan.capturedAt,
+            reason: plan.reason,
+          );
           _errorText = null;
           // A previous attempt at this very URL may have been marked
           // failed (corrupt copy); the entry must not swallow the
@@ -483,6 +511,21 @@ $_captureChannel.postMessage(JSON.stringify({
           _online = false;
           _errorText = null;
           setState(() => _state = _LoadState.noSnapshot);
+        case PageLoadServerError():
+          // The server answered, so this is neither "offline" nor a load
+          // still in progress: stop every pending wait and say what the
+          // server said (sanitized), with the ways out.
+          _online = false;
+          _afterHandoffPath = null;
+          _banner = null;
+          _offlineLoadUrl = null;
+          _navigationDeadline?.cancel();
+          _navigationDeadline = null;
+          _totalDeadline?.cancel();
+          _totalDeadline = null;
+          _serverError = plan;
+          _errorText = describeServerError(plan);
+          setState(() => _state = _LoadState.error);
       }
     } catch (_) {
       if (mounted && generation == _loadGeneration)
@@ -551,7 +594,12 @@ $_captureChannel.postMessage(JSON.stringify({
                                   child: Column(
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
-                                      const Icon(Icons.wifi_off, size: 48),
+                                      Icon(
+                                        _serverError != null
+                                            ? Icons.error_outline
+                                            : Icons.wifi_off,
+                                        size: 48,
+                                      ),
                                       const SizedBox(height: 16),
                                       Text(
                                         _state == _LoadState.noSnapshot
@@ -565,6 +613,22 @@ $_captureChannel.postMessage(JSON.stringify({
                                         onPressed: () => _loadPage(),
                                         child: const Text('SPRÓBUJ PONOWNIE'),
                                       ),
+                                      if (_serverError?.hasSnapshot ?? false)
+                                        OutlinedButton(
+                                          onPressed: () => unawaited(
+                                            _loadPage(forceOffline: true),
+                                          ),
+                                          child: const Text(
+                                            'OTWÓRZ ZAPISANĄ KOPIĘ',
+                                          ),
+                                        ),
+                                      if (_serverError?.statusCode == 401 &&
+                                          widget.onLogout != null)
+                                        OutlinedButton(
+                                          onPressed: () =>
+                                              unawaited(widget.onLogout!()),
+                                          child: const Text('ZALOGUJ PONOWNIE'),
+                                        ),
                                       if (_currentPath != widget.targetPath)
                                         TextButton(
                                           onPressed: () {

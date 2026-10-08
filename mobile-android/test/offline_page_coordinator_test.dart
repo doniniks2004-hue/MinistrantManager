@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:dio/dio.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ministrant_manager/core/network/api_client.dart';
@@ -38,6 +39,19 @@ class _FakeHandoffService extends WebviewHandoffService {
     if (errorToThrow != null) throw errorToThrow!;
     return handoffUrlToReturn!;
   }
+}
+
+DioException _httpError(int status, [Object? data]) {
+  final request = RequestOptions(path: '/mobile/webview/handoff');
+  return DioException(
+    requestOptions: request,
+    type: DioExceptionType.badResponse,
+    response: Response<Object?>(
+      requestOptions: request,
+      statusCode: status,
+      data: data,
+    ),
+  );
 }
 
 /// Lets a test hold individual pages' local planning steps open (until
@@ -494,6 +508,160 @@ void main() {
       } finally {
         HttpOverrides.global = previousHttpOverrides;
       }
+    });
+
+    group('handoff failure classes', () {
+      OfflinePageCoordinator coordinatorFailingWith(Object error) {
+        final handoff = _FakeHandoffService(SecureStorageService())
+          ..errorToThrow = error;
+        return OfflinePageCoordinator(
+          connectivityProbe: ConnectivityProbe(),
+          captureService: captureService,
+          snapshotStore: store,
+          localServer: localServer,
+          handoffService: handoff,
+        );
+      }
+
+      // The snapshot key includes the query, so tests that expect a saved
+      // copy use the plain path; the query-stripping test passes its own.
+      Future<PageLoadPlan> plan(
+        OfflinePageCoordinator c, {
+        String target = '/public/dashboard.php',
+      }) => c.plan(parishId: 'p', userId: 'u', targetPath: target);
+
+      Future<void> saveDashboard() => store.writeSnapshot(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/dashboard.php',
+        html: '<html>Saved</html>',
+        assets: {},
+      );
+
+      test('a server that ANSWERED 400 is a server error, not "offline" - the refused path and code survive', () async {
+        final result = await plan(
+          coordinatorFailingWith(
+            _httpError(400, {
+              'error': 'invalid_path',
+              'message': 'Nieznana lub niedozwolona ścieżka modułu.',
+            }),
+          ),
+          target: '/public/dashboard.php?month=10',
+        );
+
+        expect(result, isA<PageLoadServerError>());
+        final error = result as PageLoadServerError;
+        expect(error.statusCode, 400);
+        expect(error.errorCode, 'invalid_path');
+        // The page path only: no query (it can carry filters/ids).
+        expect(error.path, '/public/dashboard.php');
+        expect(error.hasSnapshot, isFalse);
+        expect(localServer.isRunning, isFalse, reason: 'no snapshot was served');
+      });
+
+      test('with a saved copy it is STILL a server error, and says a copy exists', () async {
+        await saveDashboard();
+        final result = await plan(
+          coordinatorFailingWith(_httpError(400, {'error': 'invalid_path'})),
+        );
+
+        expect(result, isA<PageLoadServerError>());
+        expect((result as PageLoadServerError).hasSnapshot, isTrue);
+      });
+
+      test('401 and 403 are server errors that keep their status', () async {
+        for (final status in [401, 403, 404, 422]) {
+          final result = await plan(coordinatorFailingWith(_httpError(status)));
+          expect(result, isA<PageLoadServerError>(), reason: '$status');
+          expect((result as PageLoadServerError).statusCode, status);
+        }
+      });
+
+      test('only a short machine code is kept - never a message, markup or a long string', () async {
+        for (final hostile in <Object?>[
+          '<script>alert(1)</script>',
+          'Ticket abc123 for user 42',
+          'a' * 100,
+          'Invalid_Path',
+          '',
+          42,
+          null,
+        ]) {
+          final result = await plan(
+            coordinatorFailingWith(
+              _httpError(400, {
+                'error': hostile,
+                'message': 'secret message that must not surface',
+              }),
+            ),
+          ) as PageLoadServerError;
+          expect(result.errorCode, isNull, reason: '$hostile');
+          expect(result.statusCode, 400);
+        }
+        // A body that is not JSON at all (an HTML error page).
+        final html = await plan(
+          coordinatorFailingWith(_httpError(400, '<html>Bad gateway</html>')),
+        ) as PageLoadServerError;
+        expect(html.errorCode, isNull);
+      });
+
+      test('a reply that is not a handoff reply at all is a server error, not "offline"', () async {
+        final result = await plan(
+          coordinatorFailingWith(const FormatException('Invalid handoff response.')),
+        ) as PageLoadServerError;
+        expect(result.statusCode, isNull);
+        expect(result.errorCode, 'invalid_response');
+      });
+
+      test('5xx / 408 / 429 fall back to the saved copy, labelled as a server problem', () async {
+        await saveDashboard();
+        for (final status in [500, 502, 503, 408, 429]) {
+          final result = await plan(coordinatorFailingWith(_httpError(status)));
+          expect(result, isA<PageLoadOffline>(), reason: '$status');
+          expect(
+            (result as PageLoadOffline).reason,
+            OfflineReason.serverUnavailable,
+            reason: '$status',
+          );
+        }
+      });
+
+      test('5xx with no saved copy is the ordinary "no saved copy" state', () async {
+        final result = await plan(coordinatorFailingWith(_httpError(503)));
+        expect(result, isA<PageLoadOfflineNoSnapshot>());
+      });
+
+      test('no answer at all (connection, timeout, socket) is "no network"', () async {
+        await saveDashboard();
+        final request = RequestOptions(path: '/mobile/webview/handoff');
+        for (final error in <Object>[
+          DioException(requestOptions: request, type: DioExceptionType.connectionError),
+          DioException(requestOptions: request, type: DioExceptionType.connectionTimeout),
+          DioException(requestOptions: request, type: DioExceptionType.cancel),
+          TimeoutException('handoff'),
+          const SocketException('Failed host lookup'),
+        ]) {
+          final result = await plan(coordinatorFailingWith(error));
+          expect(result, isA<PageLoadOffline>(), reason: '$error');
+          expect(
+            (result as PageLoadOffline).reason,
+            OfflineReason.noNetwork,
+            reason: '$error',
+          );
+        }
+      });
+
+      test('the banner says SERWER NIEDOSTĘPNY for a server problem and OFFLINE otherwise', () {
+        final captured = DateTime.utc(2026, 10, 1, 8, 42);
+        expect(
+          formatOfflineBannerText(captured, reason: OfflineReason.serverUnavailable),
+          startsWith('SERWER NIEDOSTĘPNY • ostatnia synchronizacja: '),
+        );
+        expect(
+          formatOfflineBannerText(captured),
+          startsWith('OFFLINE • ostatnia synchronizacja: '),
+        );
+      });
     });
 
     test('a reachable page plans to load online via a freshly-minted handoff URL, never targetPath itself', () async {
