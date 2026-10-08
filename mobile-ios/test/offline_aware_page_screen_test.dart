@@ -213,7 +213,10 @@ PageLoadOffline _offlinePlan([Uri? url]) => PageLoadOffline(
 PageLoadOnline _onlinePlan() =>
     PageLoadOnline(url: _ticketUrl, targetPath: '/public/dashboard.php');
 
-Widget _host(OfflinePageCoordinator coordinator) => MaterialApp(
+Widget _host(
+  OfflinePageCoordinator coordinator, {
+  Future<void> Function()? onLogout,
+}) => MaterialApp(
   home: OfflineAwarePageScreen(
     title: 'Panel',
     targetPath: '/public/dashboard.php',
@@ -221,7 +224,19 @@ Widget _host(OfflinePageCoordinator coordinator) => MaterialApp(
     parishId: 'p',
     userId: 'u',
     coordinator: coordinator,
+    onLogout: onLogout,
   ),
+);
+
+PageLoadServerError _serverError(
+  int? status, {
+  String? code = 'invalid_path',
+  bool hasSnapshot = false,
+}) => PageLoadServerError(
+  statusCode: status,
+  errorCode: code,
+  path: '/public/dashboard.php',
+  hasSnapshot: hasSnapshot,
 );
 
 Future<PageLoadPlan> _after(Duration delay, PageLoadPlan plan) async {
@@ -456,6 +471,117 @@ void main() {
       expect(find.textContaining('Brak zapisanej wersji'), findsOneWidget);
     },
   );
+
+  testWidgets(
+    'a server that answered shows what it said - not the offline screen, and nothing keeps running',
+    (tester) async {
+      final coordinator = _ScriptedCoordinator(
+        (_) async => _serverError(400),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await tester.pump(const Duration(milliseconds: 1));
+
+      expect(find.byType(spinner), findsNothing);
+      expect(
+        find.textContaining('Połączenie z serwerem działa'),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('HTTP 400 · invalid_path · /public/dashboard.php'),
+        findsOneWidget,
+      );
+      // A Wi-Fi-off icon and an OFFLINE banner would contradict the message.
+      expect(find.byIcon(Icons.wifi_off), findsNothing);
+      expect(find.byIcon(Icons.error_outline), findsOneWidget);
+      expect(find.textContaining('OFFLINE'), findsNothing);
+      expect(platform.controllers.single.loaded, isEmpty);
+      expect(find.text('OTWÓRZ ZAPISANĄ KOPIĘ'), findsNothing);
+      expect(find.text('ZALOGUJ PONOWNIE'), findsNothing);
+
+      // No deadline from the abandoned wait may flip this later.
+      await tester.pump(const Duration(seconds: 10));
+      expect(find.textContaining('nie otworzyła się na czas'), findsNothing);
+      expect(find.textContaining('Połączenie z serwerem działa'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'with a saved copy the user can open it explicitly, labelled OFFLINE only then',
+    (tester) async {
+      final coordinator = _ScriptedCoordinator(
+        (forceOffline) async =>
+            forceOffline ? _offlinePlan() : _serverError(400, hasSnapshot: true),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await tester.pump(const Duration(milliseconds: 1));
+      expect(find.text('OTWÓRZ ZAPISANĄ KOPIĘ'), findsOneWidget);
+      expect(find.textContaining('OFFLINE'), findsNothing);
+
+      await tester.tap(find.text('OTWÓRZ ZAPISANĄ KOPIĘ'));
+      await tester.pump(const Duration(milliseconds: 1));
+
+      expect(platform.controllers.single.loaded, [_localUrl]);
+      expect(find.textContaining('OFFLINE • ostatnia synchronizacja'), findsOneWidget);
+      expect(find.textContaining('Połączenie z serwerem działa'), findsNothing);
+    },
+  );
+
+  testWidgets('401 offers signing in again and says the session was refused', (
+    tester,
+  ) async {
+    var logouts = 0;
+    final coordinator = _ScriptedCoordinator(
+      (_) async => _serverError(401, code: null),
+    );
+    await tester.pumpWidget(
+      _host(
+        coordinator,
+        onLogout: () async {
+          logouts++;
+        },
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 1));
+
+    expect(find.textContaining('Sesja wygasła'), findsOneWidget);
+    expect(find.textContaining('HTTP 401 · /public/dashboard.php'), findsOneWidget);
+
+    await tester.tap(find.text('ZALOGUJ PONOWNIE'));
+    await tester.pump();
+    expect(logouts, 1);
+  });
+
+  testWidgets('403 says access was refused', (tester) async {
+    final coordinator = _ScriptedCoordinator(
+      (_) async => _serverError(403, code: 'forbidden'),
+    );
+    await tester.pumpWidget(_host(coordinator));
+    await tester.pump(const Duration(milliseconds: 1));
+
+    expect(find.textContaining('odmówił dostępu'), findsOneWidget);
+    expect(find.text('ZALOGUJ PONOWNIE'), findsNothing);
+  });
+
+  testWidgets('a saved copy shown because the SERVER was unavailable is labelled as such', (
+    tester,
+  ) async {
+    final coordinator = _ScriptedCoordinator(
+      (_) async => PageLoadOffline(
+        url: _localUrl,
+        capturedAt: DateTime.utc(2026, 10, 1, 8),
+        reason: OfflineReason.serverUnavailable,
+      ),
+    );
+    await tester.pumpWidget(_host(coordinator));
+    await tester.pump(const Duration(milliseconds: 1));
+    // The banner is part of the loaded page's screen, so it appears when the
+    // saved copy has finished loading — exactly as in the real flow.
+    platform.delegates.single.onPageFinished!(_localUrl.toString());
+    await tester.pump(const Duration(milliseconds: 1));
+
+    expect(find.textContaining('SERWER NIEDOSTĘPNY • ostatnia synchronizacja'), findsOneWidget);
+    expect(find.textContaining('OFFLINE •'), findsNothing);
+  });
 
   testWidgets('a page that finishes in time removes the overlay and the deadline', (
     tester,

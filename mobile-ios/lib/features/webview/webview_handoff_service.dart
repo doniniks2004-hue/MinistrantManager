@@ -30,8 +30,13 @@ class WebviewHandoffService {
           receiveTimeout: const Duration(milliseconds: 1400),
         ),
       );
-      final ticket = resp.data['ticket'] as String;
-      if (!RegExp(r'^[a-fA-F0-9]{64}$').hasMatch(ticket)) {
+      // Whatever shape the reply has, "the server answered but not with a
+      // handoff" is ONE signal (FormatException) — the coordinator relies
+      // on it to tell that apart from a failure in this app's own code,
+      // which must never be reported as the server's fault.
+      final data = resp.data;
+      final ticket = data is Map ? data['ticket'] : null;
+      if (ticket is! String || !RegExp(r'^[a-fA-F0-9]{64}$').hasMatch(ticket)) {
         throw const FormatException('Invalid handoff response.');
       }
       return Uri.parse(serverUrl)
