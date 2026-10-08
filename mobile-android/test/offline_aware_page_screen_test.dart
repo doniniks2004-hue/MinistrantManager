@@ -574,11 +574,13 @@ void main() {
     );
     await tester.pumpWidget(_host(coordinator));
     await tester.pump(const Duration(milliseconds: 1));
+    // The banner is part of the loaded page's screen, so it appears when the
+    // saved copy has finished loading — exactly as in the real flow.
+    platform.delegates.single.onPageFinished!(_localUrl.toString());
+    await tester.pump(const Duration(milliseconds: 1));
 
     expect(find.textContaining('SERWER NIEDOSTĘPNY • ostatnia synchronizacja'), findsOneWidget);
     expect(find.textContaining('OFFLINE •'), findsNothing);
-
-    await tester.pump(const Duration(seconds: 3)); // let the load deadline pass
   });
 
   testWidgets('a page that finishes in time removes the overlay and the deadline', (
