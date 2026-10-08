@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ministrant_manager/core/deeplink/deep_link_service.dart';
 import 'package:ministrant_manager/core/startup/app_services.dart';
 import 'package:ministrant_manager/main.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
 /// Startup failure paths of MinistrantManagerApp. Before these existed, any
 /// throw in _init() (secure storage, opening the encrypted database,
@@ -32,6 +33,16 @@ void main() {
 
   setUp(() {
     TestWidgetsFlutterBinding.ensureInitialized();
+    // PackageInfo asks the platform. In testWidgets (fake clock) a call to a
+    // channel nobody answers never completes, so startup would hang on its
+    // very first step; give it its answer.
+    PackageInfo.setMockInitialValues(
+      appName: 'Ministrant Manager',
+      packageName: 'eu.ministrant.manager',
+      version: '1.0.0',
+      buildNumber: '1',
+      buildSignature: '',
+    );
     failStorage = false;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(_secureStorage, (call) async {
@@ -69,7 +80,6 @@ void main() {
     expect(find.text('StateError'), findsOneWidget);
     expect(find.textContaining('cannot open database'), findsNothing);
     expect(find.text('SPRÓBUJ PONOWNIE'), findsOneWidget);
-    // PackageInfo is unavailable in tests; that must not have blocked startup.
     expect(builds, 1);
   });
 
