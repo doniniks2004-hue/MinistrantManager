@@ -80,10 +80,19 @@ class OfflinePageCoordinator {
   /// itself — the caller takes the returned [PageLoadPlan] and performs
   /// the actual `loadRequest` (the one genuinely WebView-specific step
   /// left).
+  /// [targetPath] is the page being opened — its identity for the saved
+  /// copy. [handoffPath] is the page a handoff TICKET is requested for; it
+  /// defaults to [targetPath]. The screen passes the entry page here, because
+  /// the server only issues tickets for the modules in its registry, and
+  /// the panel links to real pages that are not in it (schedule, points...):
+  /// a ticket for those is refused with 400 invalid_path although the user
+  /// is perfectly allowed to view them. The session the ticket creates is
+  /// what lets the page itself open; the page enforces its own access.
   Future<PageLoadPlan> plan({
     required String parishId,
     required String userId,
     required String targetPath,
+    String? handoffPath,
     bool forceOffline = false,
   }) async {
     // A plan that is no longer wanted — superseded by a newer one, OR
@@ -98,12 +107,16 @@ class OfflinePageCoordinator {
     final ticket = _PlanTicket(++_planGeneration);
     final path = snapshotPagePath(Uri.parse(targetPath));
     if (path == null) return const PageLoadOfflineNoSnapshot();
+    // The path a ticket is requested for; falls back to the page itself.
+    final entryPath =
+        (handoffPath == null ? null : snapshotPagePath(Uri.parse(handoffPath))) ??
+        path;
     String? diagnosticMessage;
     var offlineReason = OfflineReason.noNetwork;
     if (!forceOffline) {
       try {
         final handoffUrl = await handoffService
-            .requestHandoffUrl(path)
+            .requestHandoffUrl(entryPath)
             .timeout(onlineTimeout);
         return PageLoadOnline(url: handoffUrl, targetPath: path);
       } catch (e) {
@@ -124,7 +137,10 @@ class OfflinePageCoordinator {
           return PageLoadServerError(
             statusCode: failure.statusCode,
             errorCode: failure.errorCode,
-            path: Uri.parse(path).path,
+            // What was actually asked of the server, so the message names
+            // the path the server refused rather than the page the user
+            // was heading to.
+            path: Uri.parse(entryPath).path,
             hasSnapshot: await _hasSnapshot(parishId, userId, path),
           );
         }

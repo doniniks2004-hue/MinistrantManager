@@ -521,6 +521,101 @@ void main() {
       }
     });
 
+    group('a ticket is requested for the entry page, not for the page being opened', () {
+      late _FakeHandoffService handoff;
+      late OfflinePageCoordinator coordinator;
+
+      setUp(() {
+        handoff = _FakeHandoffService(SecureStorageService())
+          ..handoffUrlToReturn = Uri.parse(
+            'https://szarlej.ministrant.eu/public/mobile_handoff.php?ticket=t',
+          );
+        coordinator = OfflinePageCoordinator(
+          connectivityProbe: ConnectivityProbe(),
+          captureService: captureService,
+          snapshotStore: store,
+          localServer: localServer,
+          handoffService: handoff,
+        );
+      });
+
+      test('the server is asked about the entry page; the plan is for the page the user is opening', () async {
+        final plan = await coordinator.plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/schedule.php?month=11',
+          handoffPath: '/public/dashboard.php',
+        );
+
+        // schedule.php is linked from the panel but not in the server's
+        // handoff allowlist; asking for a ticket for it is a 400.
+        expect(handoff.lastPath, '/public/dashboard.php');
+        expect(plan, isA<PageLoadOnline>());
+        expect((plan as PageLoadOnline).targetPath, '/public/schedule.php?month=11');
+      });
+
+      test('without handoffPath the page itself is requested, as before', () async {
+        await coordinator.plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/ranking.php',
+        );
+        expect(handoff.lastPath, '/public/ranking.php');
+      });
+
+      test('an unusable handoffPath falls back to the page itself instead of failing', () async {
+        await coordinator.plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/ranking.php',
+          handoffPath: '/public/login.php',
+        );
+        expect(handoff.lastPath, '/public/ranking.php');
+      });
+
+      test('offline, the copy of the page being opened is used - not the entry page\'s', () async {
+        for (final page in ['/public/dashboard.php', '/public/schedule.php']) {
+          await store.writeSnapshot(
+            parishId: 'p',
+            userId: 'u',
+            pagePath: page,
+            html: '<html>$page</html>',
+            assets: {},
+          );
+        }
+        handoff.errorToThrow = TimeoutException('down');
+
+        final plan = await coordinator.plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/schedule.php',
+          handoffPath: '/public/dashboard.php',
+        );
+
+        expect(plan, isA<PageLoadOffline>());
+        final scheduleDir = await store.getPageDirectoryIfReady(
+          parishId: 'p',
+          userId: 'u',
+          pagePath: '/public/schedule.php',
+        );
+        expect(localServer.rootDirectory?.path, scheduleDir!.path);
+      });
+
+      test('a refusal names the path that was actually requested', () async {
+        handoff.errorToThrow = _httpError(400, {'error': 'invalid_path'});
+
+        final plan = await coordinator.plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/schedule.php',
+          handoffPath: '/public/dashboard.php',
+        );
+
+        expect(plan, isA<PageLoadServerError>());
+        expect((plan as PageLoadServerError).path, '/public/dashboard.php');
+      });
+    });
+
     group('probeOnline (background check that the connection is back)', () {
       late _FakeHandoffService handoff;
       late OfflinePageCoordinator coordinator;

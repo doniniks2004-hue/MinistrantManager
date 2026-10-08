@@ -221,14 +221,19 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
     return probeScript(probeCalls);
   }
 
+  /// (page being opened, page a ticket was requested for) per plan() call.
+  final planRequests = <(String, String?)>[];
+
   @override
   Future<PageLoadPlan> plan({
     required String parishId,
     required String userId,
     required String targetPath,
+    String? handoffPath,
     bool forceOffline = false,
   }) {
     planCalls++;
+    planRequests.add((targetPath, handoffPath));
     return script(forceOffline);
   }
 }
@@ -987,6 +992,53 @@ void main() {
       expect(find.byType(spinner), findsNothing);
       expect(coordinator.probeCalls, 20, reason: 'the pace never degraded');
       expect(platform.controllers.single.loaded.length, 1 + 20 * 2);
+    });
+
+    testWidgets('refreshing a module page asks for a ticket for the ENTRY page and returns to the module', (
+      tester,
+    ) async {
+      final scheduleUrl = Uri.parse('https://szarlej.ministrant.eu/public/schedule.php');
+      final coordinator = _ScriptedCoordinator(
+        (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+      platform.delegates.single.onPageFinished!(dashboardUrl);
+      await ms(tester, 10);
+
+      // The user opens a page the server has no handoff entry for.
+      await platform.delegates.single.onNavigationRequest!(
+        NavigationRequest(url: scheduleUrl.toString(), isMainFrame: true),
+      );
+      platform.delegates.single.onPageFinished!(scheduleUrl.toString());
+      await ms(tester, 10);
+
+      // The connection drops and later the user refreshes.
+      platform.delegates.single.onWebResourceError!(
+        const WebResourceError(
+          errorCode: -2,
+          description: 'net::ERR_INTERNET_DISCONNECTED',
+          isForMainFrame: true,
+        ),
+      );
+      await ms(tester, 10);
+      platform.delegates.single.onPageFinished!(_localUrl.toString());
+      await ms(tester, 10);
+
+      await tester.tap(find.byTooltip('Spróbuj połączyć'));
+      await ms(tester, 10);
+
+      expect(
+        coordinator.planRequests.last,
+        ('/public/schedule.php', '/public/dashboard.php'),
+        reason: 'the ticket is for the entry page; the page being refreshed is the target',
+      );
+      expect(platform.controllers.single.loaded.last, _ticketUrl);
+
+      // The ticket lands on the entry page; the module the user was on follows.
+      platform.delegates.single.onPageFinished!(dashboardUrl);
+      await ms(tester, 10);
+      expect(platform.controllers.single.loaded.last, scheduleUrl);
     });
 
     testWidgets('a refusal when opening the page is not a reason to ask again', (

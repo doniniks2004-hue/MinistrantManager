@@ -684,20 +684,19 @@ $_captureChannel.postMessage(JSON.stringify({
         parishId: widget.parishId,
         userId: widget.userId,
         targetPath: _currentPath,
+        // Always through the entry page — see OfflinePageCoordinator.plan.
+        handoffPath: widget.targetPath,
         forceOffline: forceOffline,
       );
       if (!mounted || _loggingOut || generation != _loadGeneration) return;
       switch (plan) {
         case PageLoadOnline():
           _online = true;
-          // The page's own address is opened after the handoff when it has a
-          // query (the handoff request carries the path only), and ALSO when
-          // the ticket was obtained for the entry page rather than for the
-          // page being returned to: the entry page is the one the server is
-          // known to hand off to, whatever the user had navigated to.
-          _afterHandoffPath =
-              (Uri.parse(_currentPath).hasQuery ||
-                  (prepared != null && _currentPath != widget.targetPath))
+          // The ticket is always for the entry page (the one the server is
+          // known to hand off to), so any other page the user is on —
+          // with or without a query — is opened right after the handoff
+          // lands, using the session the ticket just created.
+          _afterHandoffPath = _currentPath != widget.targetPath
               ? _currentPath
               : null;
           _banner = null;
