@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+import '../../core/util/startup_trace.dart';
 import '../../core/offline/offline_page_coordinator.dart';
 import '../../core/offline/page_identity.dart';
 
@@ -417,6 +418,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
       return;
     }
     setState(() => _state = _LoadState.ready);
+    StartupTrace.mark(_online ? 'page_ready_online' : 'page_ready_offline');
     if (!_online) {
       unawaited(
         _controller
@@ -680,6 +682,7 @@ $_captureChannel.postMessage(JSON.stringify({
       // plan returns: otherwise an online page the screen just gave up on
       // could still finish inside that window and flip the screen back.
       _online = !forceOffline;
+      StartupTrace.mark('plan_start');
       final PageLoadPlan plan = prepared ?? await widget.coordinator.plan(
         parishId: widget.parishId,
         userId: widget.userId,
@@ -689,6 +692,7 @@ $_captureChannel.postMessage(JSON.stringify({
         forceOffline: forceOffline,
       );
       if (!mounted || _loggingOut || generation != _loadGeneration) return;
+      StartupTrace.mark('plan_done');
       switch (plan) {
         case PageLoadOnline():
           _online = true;

@@ -10,6 +10,7 @@ import '../auth/user_session_service.dart';
 import '../config/config_service.dart';
 import '../device_settings/device_settings_screen.dart';
 import '../../core/offline/offline_page_coordinator.dart';
+import '../../core/util/startup_trace.dart';
 import '../revocation/revocation_handler.dart';
 import '../webview/offline_aware_page_screen.dart';
 
@@ -201,6 +202,41 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  /// The signed-in user's identifiers, read from the keystore. The reads are
+  /// independent, so they run together instead of one after another (five
+  /// sequential keystore round-trips stood between launch and the first
+  /// screen); nothing is read for a user who is not signed in.
+  Future<({bool hasUserSession, int? userId, String? parishId, String? serverUrl})>
+  _readIdentity() async {
+    final hasSession =
+        await widget.userSessionService.secureStorage.hasUserSession;
+    if (!hasSession) {
+      return (hasUserSession: false, userId: null, parishId: null, serverUrl: null);
+    }
+    final ids = await _readIdentityValues();
+    return (
+      hasUserSession: true,
+      userId: ids.userId,
+      parishId: ids.parishId,
+      serverUrl: ids.serverUrl,
+    );
+  }
+
+  Future<({int? userId, String? parishId, String? serverUrl})>
+  _readIdentityValues() async {
+    final storage = widget.userSessionService.secureStorage;
+    final values = await Future.wait<Object?>([
+      storage.currentUserId,
+      storage.parishId,
+      storage.serverUrl,
+    ]);
+    return (
+      userId: values[0] as int?,
+      parishId: values[1] as String?,
+      serverUrl: values[2] as String?,
+    );
+  }
+
   /// Always assigned together, and always from storage: marks the
   /// identifiers as read so the build can tell "missing" from "loading".
   void _applyIdentity({
@@ -214,6 +250,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _parishId = parishId;
     _serverUrl = serverUrl;
     _identityRead = true;
+    StartupTrace.mark('identity_read');
   }
 
   /// The host of the stored server URL, or null if there is no URL or it has
@@ -257,18 +294,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // must be available even to a screen that's about to show a blocking
     // UPDATE_REQUIRED/maintenance state.
     // OFFLINE-FIRST: establish the local UI state before ANY network request.
-    final localHasUserSession =
-        await widget.userSessionService.secureStorage.hasUserSession;
-    final localUserId = localHasUserSession
-        ? await widget.userSessionService.secureStorage.currentUserId
-        : null;
-    final localParishId = localHasUserSession
-        ? await widget.userSessionService.secureStorage.parishId
-        : null;
-    final localServerUrl = localHasUserSession
-        ? await widget.userSessionService.secureStorage.serverUrl
-        : null;
-    final localMeta = await widget.db.ensureSyncMetadata();
+    // The keystore reads and the database open are independent: start both,
+    // then wait for both. (`ignore` so that if one fails before the other is
+    // awaited, the second one's error is not reported as unhandled; the
+    // awaits below still throw it.)
+    final identityRead = _readIdentity()..ignore();
+    final metaRead = widget.db.ensureSyncMetadata()..ignore();
+    final localIdentity = await identityRead;
+    final localMeta = await metaRead;
+    final localHasUserSession = localIdentity.hasUserSession;
+    final localUserId = localIdentity.userId;
+    final localParishId = localIdentity.parishId;
+    final localServerUrl = localIdentity.serverUrl;
     final localWithinLease = widget.syncEngine.offlineLease.isWithinLease(
       localMeta.lastAuthorizationCheck,
       leaseHours: localMeta.offlineLeaseHours,
@@ -340,18 +377,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // Is a USER actually signed in on this device? Checked regardless of
     // online/offline device state (offlineWithinLease still shows the
     // login screen if no one's signed in yet).
-    final hasUserSession =
-        await widget.userSessionService.secureStorage.hasUserSession;
-
-    final earlyUserId = hasUserSession
-        ? await widget.userSessionService.secureStorage.currentUserId
-        : null;
-    final earlyParishId = hasUserSession
-        ? await widget.userSessionService.secureStorage.parishId
-        : null;
-    final earlyServerUrl = hasUserSession
-        ? await widget.userSessionService.secureStorage.serverUrl
-        : null;
+    final earlyIdentity = await _readIdentity();
+    final hasUserSession = earlyIdentity.hasUserSession;
+    final earlyUserId = earlyIdentity.userId;
+    final earlyParishId = earlyIdentity.parishId;
+    final earlyServerUrl = earlyIdentity.serverUrl;
     if (!mounted || generation != _sessionGeneration) return;
     setState(() {
       _applyIdentity(
@@ -402,15 +432,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     }
 
-    final userId = hasUserSession
-        ? await widget.userSessionService.secureStorage.currentUserId
-        : null;
-    final parishId = hasUserSession
-        ? await widget.userSessionService.secureStorage.parishId
-        : null;
-    final serverUrl = hasUserSession
-        ? await widget.userSessionService.secureStorage.serverUrl
-        : null;
+    final finalIds = hasUserSession
+        ? await _readIdentityValues()
+        : (userId: null, parishId: null, serverUrl: null);
+    final userId = finalIds.userId;
+    final parishId = finalIds.parishId;
+    final serverUrl = finalIds.serverUrl;
 
     if (!mounted || generation != _sessionGeneration) return;
     setState(() {

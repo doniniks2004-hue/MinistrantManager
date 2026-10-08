@@ -88,9 +88,10 @@ class SecureStorageService {
     // ordered so this can't happen going forward, but a value already on
     // disk from before this fix could still be in that state) must never
     // read as "there is a session" with a null user id.
-    final token = await mobileUserToken;
-    final userId = await currentUserId;
-    return token != null && userId != null;
+    // Both reads go through the platform keystore; there is no reason for
+    // the second to wait for the first.
+    final values = await Future.wait<Object?>([mobileUserToken, currentUserId]);
+    return values[0] != null && values[1] != null;
   }
 
   /// Called right after a successful `/session/login`. Review round fix:
