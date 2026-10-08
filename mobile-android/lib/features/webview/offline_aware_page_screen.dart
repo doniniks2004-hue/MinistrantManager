@@ -440,6 +440,11 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
       _currentPath = path;
       _capture();
       // Capture again after typical async DOM updates; navigation cancels this.
+      // Cancel any earlier one first: only the LAST reference is cancelled
+      // on dispose, so an overwritten timer would otherwise outlive the
+      // screen. (_onStarted usually cancels it, but nothing guarantees a
+      // start event between two finishes.)
+      _captureTimer?.cancel();
       _captureTimer = Timer(const Duration(milliseconds: 750), _capture);
     }
   }
