@@ -94,6 +94,7 @@ class OfflinePageCoordinator {
     required String targetPath,
     String? handoffPath,
     bool forceOffline = false,
+    OfflineReason offlineReason = OfflineReason.noNetwork,
   }) async {
     // A plan that is no longer wanted — superseded by a newer one, OR
     // expired by its own deadline — must never repoint the shared
@@ -112,7 +113,10 @@ class OfflinePageCoordinator {
         (handoffPath == null ? null : snapshotPagePath(Uri.parse(handoffPath))) ??
         path;
     String? diagnosticMessage;
-    var offlineReason = OfflineReason.noNetwork;
+    // Why a saved copy would be shown. For a forced fallback the CALLER
+    // knows (its own page took too long; the server sent an error page);
+    // for a failed handoff it is worked out below from what came back.
+    var reason = offlineReason;
     if (!forceOffline) {
       try {
         final handoffUrl = await handoffService
@@ -144,14 +148,16 @@ class OfflinePageCoordinator {
             hasSnapshot: await _hasSnapshot(parishId, userId, path),
           );
         }
-        if (failure.kind == HandoffFailureKind.serverUnavailable) {
-          offlineReason = OfflineReason.serverUnavailable;
-        }
+        // Always set from what actually came back: a stale reason handed in
+        // by the caller must not survive a fresh failure of another kind.
+        reason = failure.kind == HandoffFailureKind.serverUnavailable
+            ? OfflineReason.serverUnavailable
+            : OfflineReason.noNetwork;
       }
     }
 
     return _planOffline(
-      reason: offlineReason,
+      reason: reason,
       ticket: ticket,
       parishId: parishId,
       userId: userId,
@@ -379,6 +385,11 @@ enum OfflineReason {
 
   /// The server answered with a transient failure (5xx, 408, 429).
   serverUnavailable,
+
+  /// The server is reachable but the page did not finish in time. Not a
+  /// missing network, and not an error: a label of its own so the user is
+  /// not told they are offline while the server is answering.
+  slowServer,
 }
 
 /// The server answered the handoff and refused it for a reason a snapshot
@@ -518,8 +529,10 @@ String formatOfflineBannerText(
   final local = capturedAt.toLocal();
   final hh = local.hour.toString().padLeft(2, '0');
   final mm = local.minute.toString().padLeft(2, '0');
-  final label = reason == OfflineReason.serverUnavailable
-      ? 'SERWER NIEDOSTĘPNY'
-      : 'OFFLINE';
+  final label = switch (reason) {
+    OfflineReason.noNetwork => 'OFFLINE',
+    OfflineReason.serverUnavailable => 'SERWER NIEDOSTĘPNY',
+    OfflineReason.slowServer => 'SERWER ODPOWIADA ZBYT WOLNO',
+  };
   return '$label • ostatnia synchronizacja: $hh:$mm';
 }

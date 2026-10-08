@@ -122,6 +122,7 @@ class _FakeDelegate extends PlatformNavigationDelegate {
   PageEventCallback? onPageFinished;
   NavigationRequestCallback? onNavigationRequest;
   WebResourceErrorCallback? onWebResourceError;
+  HttpResponseErrorCallback? onHttpError;
 
   @override
   Future<void> setOnNavigationRequest(
@@ -139,7 +140,9 @@ class _FakeDelegate extends PlatformNavigationDelegate {
   }
 
   @override
-  Future<void> setOnHttpError(HttpResponseErrorCallback onHttpError) async {}
+  Future<void> setOnHttpError(HttpResponseErrorCallback onHttpError) async {
+    this.onHttpError = onHttpError;
+  }
 
   @override
   Future<void> setOnWebResourceError(
@@ -223,6 +226,7 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
 
   /// (page being opened, page a ticket was requested for) per plan() call.
   final planRequests = <(String, String?)>[];
+  final planReasons = <OfflineReason>[];
 
   @override
   Future<PageLoadPlan> plan({
@@ -231,10 +235,22 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
     required String targetPath,
     String? handoffPath,
     bool forceOffline = false,
+    OfflineReason offlineReason = OfflineReason.noNetwork,
   }) {
     planCalls++;
     planRequests.add((targetPath, handoffPath));
-    return script(forceOffline);
+    planReasons.add(offlineReason);
+    // Like the real coordinator: a forced fallback carries the reason the
+    // caller gave, so the screen's own bookkeeping of it can be observed.
+    return script(forceOffline).then(
+      (plan) => plan is PageLoadOffline && forceOffline
+          ? PageLoadOffline(
+              url: plan.url,
+              capturedAt: plan.capturedAt,
+              reason: offlineReason,
+            )
+          : plan,
+    );
   }
 }
 
@@ -1039,6 +1055,127 @@ void main() {
       platform.delegates.single.onPageFinished!(dashboardUrl);
       await ms(tester, 10);
       expect(platform.controllers.single.loaded.last, scheduleUrl);
+    });
+
+    testWidgets('an expired PHP session is renewed silently; sign-out only if the renewal does not help', (
+      tester,
+    ) async {
+      var logouts = 0;
+      final scheduleUrl = Uri.parse('https://szarlej.ministrant.eu/public/schedule.php');
+      const loginUrl = 'https://szarlej.ministrant.eu/public/login.php';
+      final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
+      await tester.pumpWidget(
+        _host(
+          coordinator,
+          onLogout: () async {
+            logouts++;
+          },
+        ),
+      );
+      await ms(tester, 10);
+      platform.delegates.single.onPageFinished!(dashboardUrl);
+      await ms(tester, 10);
+      await platform.delegates.single.onNavigationRequest!(
+        NavigationRequest(url: scheduleUrl.toString(), isMainFrame: true),
+      );
+      platform.delegates.single.onPageFinished!(scheduleUrl.toString());
+      await ms(tester, 10);
+      expect(coordinator.planCalls, 1);
+
+      // The PHP session ended: the page the user asked for lands on login.
+      platform.delegates.single.onPageFinished!(loginUrl);
+      await ms(tester, 10);
+
+      expect(logouts, 0, reason: 'the mobile sign-in is still valid');
+      expect(coordinator.planCalls, 2, reason: 'a new session was requested');
+      expect(
+        coordinator.planRequests.last,
+        ('/public/schedule.php', '/public/dashboard.php'),
+        reason: 'and it returns to the page the user was on, not the login page',
+      );
+
+      // The new session works: landing, then the page itself.
+      platform.delegates.single.onPageFinished!(dashboardUrl);
+      await ms(tester, 10);
+      expect(platform.controllers.single.loaded.last, scheduleUrl);
+      platform.delegates.single.onPageFinished!(scheduleUrl.toString());
+      await ms(tester, 10);
+      expect(find.byType(spinner), findsNothing);
+
+      // A later expiry is renewed again (the allowance is per expiry)...
+      platform.delegates.single.onPageFinished!(loginUrl);
+      await ms(tester, 10);
+      expect(coordinator.planCalls, 3);
+      expect(logouts, 0);
+
+      // ...but login straight after a renewal means it did not help.
+      platform.delegates.single.onPageFinished!(loginUrl);
+      await ms(tester, 10);
+      expect(logouts, 1);
+    });
+
+    testWidgets('a page that is merely slow is not reported as OFFLINE', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator(
+        (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10); // ticket obtained; the page never finishes
+
+      await ms(tester, 8100); // the 8 s page budget runs out
+
+      expect(coordinator.planCalls, 2);
+      expect(coordinator.planReasons.last, OfflineReason.slowServer);
+    });
+
+    testWidgets('a page the server answered with an error is reported as a server problem', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator(
+        (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+
+      platform.delegates.single.onHttpError!(
+        HttpResponseError(
+          request: WebResourceRequest(uri: Uri.parse(dashboardUrl)),
+          response: WebResourceResponse(uri: Uri.parse(dashboardUrl), statusCode: 502),
+        ),
+      );
+      await ms(tester, 10);
+
+      expect(coordinator.planCalls, 2);
+      expect(coordinator.planReasons.last, OfflineReason.serverUnavailable);
+    });
+
+    testWidgets('a real failure to connect is NOT labelled with an earlier, different reason', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator(
+        (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+      await ms(tester, 8100); // a slow-page fallback happens first
+      expect(coordinator.planReasons.last, OfflineReason.slowServer);
+
+      platform.delegates.single.onPageFinished!(_localUrl.toString());
+      await ms(tester, 10);
+      // The user retries; the connection then fails outright.
+      await tester.tap(find.byTooltip('Spróbuj połączyć'));
+      await ms(tester, 10);
+      platform.delegates.single.onWebResourceError!(
+        const WebResourceError(
+          errorCode: -2,
+          description: 'net::ERR_INTERNET_DISCONNECTED',
+          isForMainFrame: true,
+        ),
+      );
+      await ms(tester, 10);
+
+      expect(coordinator.planReasons.last, OfflineReason.noNetwork);
     });
 
     testWidgets('a refusal when opening the page is not a reason to ask again', (

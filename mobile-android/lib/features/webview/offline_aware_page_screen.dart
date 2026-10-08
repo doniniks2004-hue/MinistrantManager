@@ -174,6 +174,15 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
   bool _recoverable = false;
   bool _appInBackground = false;
 
+  /// Why the saved copy on screen is shown (drives the banner wording).
+  /// Carried across offline link taps so they do not reset it.
+  OfflineReason _offlineReason = OfflineReason.noNetwork;
+
+  /// Times in a row the PHP session was found expired and silently renewed.
+  /// One renewal per expiry; a second login page right after it means the
+  /// renewal did not help, and only then is the user signed out.
+  int _sessionRenewals = 0;
+
   /// The server is reachable again but the page holds input the user has not
   /// saved, so the screen did not switch by itself.
   bool _onlineAvailableDeferred = false;
@@ -233,7 +242,12 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
                 uri.path != '/public/mobile_handoff.php')
               return;
             _failedDocuments.add(uri.toString());
-            unawaited(_loadPage(forceOffline: true));
+            unawaited(
+              _loadPage(
+                forceOffline: true,
+                offlineReason: OfflineReason.serverUnavailable,
+              ),
+            );
           },
           onPageFinished: _onFinished,
           onWebResourceError: (e) {
@@ -252,7 +266,14 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
             _totalDeadline?.cancel();
             _totalDeadline = null;
             if (_online) {
-              unawaited(_loadPage(forceOffline: true));
+              // A genuine failure to connect: not the "slow page" or
+              // "server error" an earlier fallback may have been.
+              unawaited(
+                _loadPage(
+                  forceOffline: true,
+                  offlineReason: OfflineReason.noNetwork,
+                ),
+              );
             } else {
               _offlineLoadUrl = null;
               setState(() {
@@ -345,7 +366,9 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     if (_navigationDeadline != null) return;
     _navigationDeadline = Timer(_pageRenderBudget, () {
       if (mounted && _online && !_loggingOut) {
-        unawaited(_loadPage(forceOffline: true));
+        unawaited(
+          _loadPage(forceOffline: true, offlineReason: OfflineReason.slowServer),
+        );
       }
     });
   }
@@ -414,7 +437,18 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     _totalDeadline = null;
     // A login redirect means the PHP session expired; never cache it.
     if (_online && uri.pathSegments.lastOrNull?.toLowerCase() == 'login.php') {
-      unawaited(_logout());
+      // The PHP session ended (the mobile sign-in is separate and, if it
+      // were not valid, the handoff itself would have answered 401). Get a
+      // new PHP session the way the first one was obtained, once, and
+      // return to the page the user was on — _currentPath is not touched by
+      // the login page, which is never recorded as a page. Signing out here
+      // used to throw away a perfectly good sign-in.
+      if (_sessionRenewals < 1) {
+        _sessionRenewals++;
+        unawaited(_loadPage());
+      } else {
+        unawaited(_logout());
+      }
       return;
     }
     setState(() => _state = _LoadState.ready);
@@ -435,6 +469,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     }
     if (_online) {
       _recoveryAttempts = 0;
+      _sessionRenewals = 0;
       final path = snapshotPagePath(uri);
       if (path == null) return;
       _currentPath = path;
@@ -656,6 +691,7 @@ $_captureChannel.postMessage(JSON.stringify({
   Future<void> _loadPage({
     bool forceOffline = false,
     PageLoadOnline? prepared,
+    OfflineReason? offlineReason,
   }) async {
     final generation = ++_loadGeneration;
     _navigationDeadline?.cancel();
@@ -695,6 +731,7 @@ $_captureChannel.postMessage(JSON.stringify({
         // Always through the entry page — see OfflinePageCoordinator.plan.
         handoffPath: widget.targetPath,
         forceOffline: forceOffline,
+        offlineReason: offlineReason ?? _offlineReason,
       );
       if (!mounted || _loggingOut || generation != _loadGeneration) return;
       StartupTrace.mark('plan_done');
@@ -722,6 +759,7 @@ $_captureChannel.postMessage(JSON.stringify({
         case PageLoadOffline():
           _online = false;
           _afterHandoffPath = null;
+          _offlineReason = plan.reason;
           _banner = formatOfflineBannerText(
             plan.capturedAt,
             reason: plan.reason,

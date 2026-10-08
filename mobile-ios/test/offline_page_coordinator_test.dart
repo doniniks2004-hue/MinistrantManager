@@ -902,7 +902,49 @@ void main() {
         }
       });
 
+      test('a forced fallback keeps the reason its caller gives (a slow page is not "offline")', () async {
+        await saveDashboard();
+        final result = await coordinatorFailingWith(Exception('unused')).plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/dashboard.php',
+          forceOffline: true,
+          offlineReason: OfflineReason.slowServer,
+        );
+        expect(result, isA<PageLoadOffline>());
+        expect((result as PageLoadOffline).reason, OfflineReason.slowServer);
+      });
+
+      test('a reason handed in does not survive a fresh failure of another kind', () async {
+        await saveDashboard();
+        final request = RequestOptions(path: '/x');
+        final noAnswer = await coordinatorFailingWith(
+          DioException(requestOptions: request, type: DioExceptionType.connectionError),
+        ).plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/dashboard.php',
+          offlineReason: OfflineReason.slowServer,
+        );
+        expect((noAnswer as PageLoadOffline).reason, OfflineReason.noNetwork);
+
+        final serverDown = await coordinatorFailingWith(_httpError(503)).plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/dashboard.php',
+          offlineReason: OfflineReason.noNetwork,
+        );
+        expect((serverDown as PageLoadOffline).reason, OfflineReason.serverUnavailable);
+      });
+
       test('the banner says SERWER NIEDOSTĘPNY for a server problem and OFFLINE otherwise', () {
+        expect(
+          formatOfflineBannerText(
+            DateTime.utc(2026, 10, 1, 8, 42),
+            reason: OfflineReason.slowServer,
+          ),
+          startsWith('SERWER ODPOWIADA ZBYT WOLNO • ostatnia synchronizacja: '),
+        );
         final captured = DateTime.utc(2026, 10, 1, 8, 42);
         expect(
           formatOfflineBannerText(captured, reason: OfflineReason.serverUnavailable),
