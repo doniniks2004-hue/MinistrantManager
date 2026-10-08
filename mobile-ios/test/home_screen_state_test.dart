@@ -150,6 +150,35 @@ void main() {
   const spinner = CircularProgressIndicator;
   const missingData = 'Brakuje danych potrzebnych do otwarcia strony';
 
+  group('forceOfflineFor: which device states may open the live page', () {
+    // Every state must be decided explicitly: adding one to the enum fails
+    // here until someone chooses.
+    const expected = <DeviceAuthState, bool>{
+      DeviceAuthState.active: false,
+      // Not yet confirmed (start-up) or could not be checked: try live.
+      DeviceAuthState.offlineWithinLease: false,
+      DeviceAuthState.offlineLeaseExpired: true,
+      DeviceAuthState.revoked: true,
+      DeviceAuthState.parishDisabled: true,
+      DeviceAuthState.updateRequired: true,
+      DeviceAuthState.authError: true,
+    };
+
+    test('every state is classified', () {
+      expect(expected.keys.toSet(), DeviceAuthState.values.toSet());
+    });
+
+    for (final entry in expected.entries) {
+      test('${entry.key.name} -> forceOffline ${entry.value}', () {
+        expect(forceOfflineFor(entry.key), entry.value);
+      });
+    }
+
+    test('an unknown state is treated as the strict case', () {
+      expect(forceOfflineFor(null), isTrue);
+    });
+  });
+
   testWidgets('a signed-in user with no parish or server address gets an error with a way out, not a spinner', (
     tester,
   ) async {

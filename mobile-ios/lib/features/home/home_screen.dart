@@ -24,6 +24,26 @@ import '../webview/offline_aware_page_screen.dart';
 /// single source of truth for the post-login UI; native Flutter UI is
 /// intentionally limited to activation, login, device state and the
 /// single allowed offline-status banner.
+/// Whether the page screen must show saved copies ONLY, whatever the network.
+///
+/// Only states in which live data must not be shown force it. Crucially
+/// [DeviceAuthState.offlineWithinLease] does not: it is what the screen holds
+/// from the first frame (taken from local state) until the server has
+/// answered the device check, and also when that check could not be made.
+/// Treating it as "offline" made EVERY cold start begin on a saved copy (or
+/// on "no saved copy" on a first run) and stay there until the check —
+/// which can take 10 s to connect and another 15–20 s to answer — finished,
+/// and then reload the page: a long start and an OFFLINE label with a
+/// working network. Trying the live page is itself the authorization: the
+/// handoff is refused (401/403) for a device the server no longer accepts,
+/// and the device check runs in parallel and wipes a revoked one. If the
+/// server cannot be reached the screen falls back to the saved copy and
+/// keeps trying, exactly as it would after a confirmed `active`.
+@visibleForTesting
+bool forceOfflineFor(DeviceAuthState? state) =>
+    !(state == DeviceAuthState.active ||
+        state == DeviceAuthState.offlineWithinLease);
+
 class HomeScreen extends StatefulWidget {
   const HomeScreen({
     super.key,
@@ -658,7 +678,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       parishId: _parishId!,
       userId: _userId!.toString(),
       coordinator: widget.offlinePageCoordinator,
-      forceOffline: _authState != DeviceAuthState.active,
+      forceOffline: forceOfflineFor(_authState),
       onLogout: _onLogout,
     );
   }
