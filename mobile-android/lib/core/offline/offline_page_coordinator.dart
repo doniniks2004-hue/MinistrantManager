@@ -155,6 +155,65 @@ class OfflinePageCoordinator {
   bool _isStale(_PlanTicket ticket) =>
       ticket.expired || ticket.generation != _planGeneration;
 
+  final _probes = <String, Future<OnlineProbeResult>>{};
+
+  /// Asks, in the background, whether the server can be reached again and
+  /// will open [targetPath]: it requests a handoff ticket, which is both the
+  /// reachability check and the way into the page, so a success needs no
+  /// second request. Used by the screen while it is showing a saved copy.
+  ///
+  /// At most ONE request per path is ever in flight: a call made while one
+  /// is pending gets that same result instead of starting another, so the
+  /// retry loop can never pile up parallel requests however it is driven.
+  /// [timeout] is longer than the one used to open a page — nobody is
+  /// waiting here, and it is what lets a slow server be recognised as
+  /// reachable instead of being mistaken for no network.
+  Future<OnlineProbeResult> probeOnline({
+    required String parishId,
+    required String userId,
+    required String targetPath,
+    Duration timeout = const Duration(seconds: 6),
+  }) {
+    final path = snapshotPagePath(Uri.parse(targetPath));
+    if (path == null) {
+      return Future.value(const OnlineProbeUnavailable());
+    }
+    return _probes[path] ??= _probe(parishId, userId, path, timeout)
+        // Block body on purpose: whenComplete WAITS for a Future returned
+        // by its callback, and Map.remove would return this very Future.
+        .whenComplete(() {
+      _probes.remove(path);
+    });
+  }
+
+  Future<OnlineProbeResult> _probe(
+    String parishId,
+    String userId,
+    String path,
+    Duration timeout,
+  ) async {
+    try {
+      final url = await handoffService
+          .requestHandoffUrl(path, timeout: timeout)
+          .timeout(timeout + const Duration(milliseconds: 500));
+      return OnlineProbeRecovered(PageLoadOnline(url: url, targetPath: path));
+    } catch (e) {
+      final failure = HandoffFailure.of(e);
+      if (failure.kind == HandoffFailureKind.rejected) {
+        return OnlineProbeRejected(
+          PageLoadServerError(
+            statusCode: failure.statusCode,
+            errorCode: failure.errorCode,
+            path: Uri.parse(path).path,
+            hasSnapshot: await _hasSnapshot(parishId, userId, path),
+          ),
+        );
+      }
+      // No answer, or a transient server problem: try again later.
+      return const OnlineProbeUnavailable();
+    }
+  }
+
   Future<bool> _hasSnapshot(String parishId, String userId, String path) async {
     try {
       final manifest = await snapshotStore
@@ -328,6 +387,31 @@ class PageLoadServerError extends PageLoadPlan {
   /// A saved copy of this exact page exists, so the screen can offer it
   /// explicitly instead of silently pretending to be offline.
   final bool hasSnapshot;
+}
+
+/// Outcome of [OfflinePageCoordinator.probeOnline].
+sealed class OnlineProbeResult {
+  const OnlineProbeResult();
+}
+
+/// The server answered and issued a ticket: [plan] opens the page online.
+class OnlineProbeRecovered extends OnlineProbeResult {
+  const OnlineProbeRecovered(this.plan);
+  final PageLoadOnline plan;
+}
+
+/// No usable answer (no network, timeout, transient server problem). The
+/// caller should try again later; nothing here says the user did anything
+/// wrong.
+class OnlineProbeUnavailable extends OnlineProbeResult {
+  const OnlineProbeUnavailable();
+}
+
+/// The server answered and refused. Retrying will not change that, so the
+/// caller should stop and say so, not keep asking.
+class OnlineProbeRejected extends OnlineProbeResult {
+  const OnlineProbeRejected(this.error);
+  final PageLoadServerError error;
 }
 
 enum HandoffFailureKind {

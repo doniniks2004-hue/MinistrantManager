@@ -32,10 +32,21 @@ class _FakeHandoffService extends WebviewHandoffService {
   int calls = 0;
   bool hang = false;
 
+  /// If set, the request stays pending until this completes.
+  Completer<void>? gate;
+  Duration? lastTimeout;
+  String? lastPath;
+
   @override
-  Future<Uri> requestHandoffUrl(String path) async {
+  Future<Uri> requestHandoffUrl(
+    String path, {
+    Duration timeout = WebviewHandoffService.defaultTimeout,
+  }) async {
     calls++;
+    lastTimeout = timeout;
+    lastPath = path;
     if (hang) return Completer<Uri>().future;
+    if (gate != null) await gate!.future;
     if (errorToThrow != null) throw errorToThrow!;
     return handoffUrlToReturn!;
   }
@@ -508,6 +519,120 @@ void main() {
       } finally {
         HttpOverrides.global = previousHttpOverrides;
       }
+    });
+
+    group('probeOnline (background check that the connection is back)', () {
+      late _FakeHandoffService handoff;
+      late OfflinePageCoordinator coordinator;
+
+      setUp(() {
+        handoff = _FakeHandoffService(SecureStorageService());
+        coordinator = OfflinePageCoordinator(
+          connectivityProbe: ConnectivityProbe(),
+          captureService: captureService,
+          snapshotStore: store,
+          localServer: localServer,
+          handoffService: handoff,
+        );
+      });
+
+      Future<OnlineProbeResult> probe({Duration? timeout}) =>
+          coordinator.probeOnline(
+            parishId: 'p',
+            userId: 'u',
+            targetPath: '/public/dashboard.php',
+            timeout: timeout ?? const Duration(seconds: 6),
+          );
+
+      test('a ticket means recovered, and it uses the longer limit, not the opening one', () async {
+        handoff.handoffUrlToReturn = Uri.parse(
+          'https://szarlej.ministrant.eu/public/mobile_handoff.php?ticket=t',
+        );
+        final result = await probe();
+
+        expect(result, isA<OnlineProbeRecovered>());
+        final plan = (result as OnlineProbeRecovered).plan;
+        expect(plan.targetPath, '/public/dashboard.php');
+        expect(handoff.lastTimeout, const Duration(seconds: 6));
+        expect(
+          handoff.lastTimeout,
+          greaterThan(WebviewHandoffService.defaultTimeout),
+          reason: 'a slow server must be told apart from a missing one',
+        );
+      });
+
+      test('no answer and transient server problems mean "try later", never a refusal', () async {
+        final request = RequestOptions(path: '/x');
+        for (final error in <Object>[
+          DioException(requestOptions: request, type: DioExceptionType.connectionError),
+          TimeoutException('slow'),
+          _httpError(503),
+          _httpError(429),
+        ]) {
+          handoff.errorToThrow = error;
+          expect(await probe(), isA<OnlineProbeUnavailable>(), reason: '$error');
+        }
+      });
+
+      test('a refusal is reported as one, with the sanitized facts and whether a copy exists', () async {
+        await store.writeSnapshot(
+          parishId: 'p',
+          userId: 'u',
+          pagePath: '/public/dashboard.php',
+          html: '<html>Saved</html>',
+          assets: {},
+        );
+        handoff.errorToThrow = _httpError(401, {'error': 'session_expired'});
+
+        final result = await probe();
+
+        expect(result, isA<OnlineProbeRejected>());
+        final error = (result as OnlineProbeRejected).error;
+        expect(error.statusCode, 401);
+        expect(error.errorCode, 'session_expired');
+        expect(error.hasSnapshot, isTrue);
+      });
+
+      test('a request that never answers still ends, after the limit', () async {
+        handoff.hang = true;
+        final clock = Stopwatch()..start();
+        final result = await probe(timeout: const Duration(milliseconds: 100));
+        expect(result, isA<OnlineProbeUnavailable>());
+        expect(clock.elapsedMilliseconds, lessThan(1500));
+      });
+
+      test('concurrent checks for the same page share ONE request', () async {
+        handoff.handoffUrlToReturn = Uri.parse(
+          'https://szarlej.ministrant.eu/public/mobile_handoff.php?ticket=t',
+        );
+        handoff.gate = Completer<void>();
+
+        final a = probe();
+        final b = probe();
+        final c = probe();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        expect(handoff.calls, 1, reason: 'three callers, one request');
+
+        handoff.gate!.complete();
+        final results = await Future.wait([a, b, c]);
+        expect(results.every((r) => r is OnlineProbeRecovered), isTrue);
+        expect(handoff.calls, 1);
+
+        // Once it has finished, the next check is a fresh request.
+        handoff.gate = null;
+        await probe();
+        expect(handoff.calls, 2);
+      });
+
+      test('a page the app cannot identify is "unavailable", not a request', () async {
+        final result = await coordinator.probeOnline(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/login.php',
+        );
+        expect(result, isA<OnlineProbeUnavailable>());
+        expect(handoff.calls, 0);
+      });
     });
 
     group('handoff failure classes', () {

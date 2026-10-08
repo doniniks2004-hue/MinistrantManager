@@ -11,12 +11,20 @@ class WebviewHandoffService {
   final ApiClient api;
   final SecureStorageService secureStorage;
 
-  Future<Uri> requestHandoffUrl(String path) async {
+  /// The limit used when opening a page: short on purpose, so a missing
+  /// network is noticed fast and the saved copy appears within 2 s.
+  static const defaultTimeout = Duration(milliseconds: 1400);
+
+  /// [timeout] bounds the whole request. The default is the short opening
+  /// limit; the background check for the connection coming back passes a
+  /// longer one, because there nobody is waiting and a slow server must be
+  /// told apart from a missing one.
+  Future<Uri> requestHandoffUrl(
+    String path, {
+    Duration timeout = defaultTimeout,
+  }) async {
     final cancel = CancelToken();
-    final deadline = Timer(
-      const Duration(milliseconds: 1400),
-      () => cancel.cancel('handoff deadline'),
-    );
+    final deadline = Timer(timeout, () => cancel.cancel('handoff deadline'));
     try {
       final serverUrl = await secureStorage.serverUrl;
       if (serverUrl == null) throw StateError('Device not activated.');
@@ -26,8 +34,8 @@ class WebviewHandoffService {
         data: {'path': Uri.parse(path).path},
         cancelToken: cancel,
         options: Options(
-          sendTimeout: const Duration(milliseconds: 1400),
-          receiveTimeout: const Duration(milliseconds: 1400),
+          sendTimeout: timeout,
+          receiveTimeout: timeout,
         ),
       );
       // Whatever shape the reply has, "the server answered but not with a
