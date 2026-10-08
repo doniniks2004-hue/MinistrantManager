@@ -236,6 +236,14 @@ class OfflinePageCoordinator {
     }
   }
 
+  /// Whether a saved copy of [pagePath] exists for this user. Lets the screen
+  /// offer it when a page itself (not only the handoff) was refused.
+  Future<bool> hasSavedCopy({
+    required String parishId,
+    required String userId,
+    required String pagePath,
+  }) => _hasSnapshot(parishId, userId, pagePath);
+
   Future<bool> _hasSnapshot(String parishId, String userId, String path) async {
     try {
       final manifest = await snapshotStore

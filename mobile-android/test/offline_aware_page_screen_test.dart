@@ -83,8 +83,13 @@ class _FakeController extends PlatformWebViewController {
     loaded.add(params.uri);
   }
 
+  /// Every script the screen ran (to see e.g. that a page capture was asked for).
+  final scripts = <String>[];
+
   @override
-  Future<void> runJavaScript(String javaScript) async {}
+  Future<void> runJavaScript(String javaScript) async {
+    scripts.add(javaScript);
+  }
 
   /// What the "unsaved input" check on the page answers; [jsThrows] makes
   /// the check itself fail.
@@ -212,6 +217,7 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
   final Future<OnlineProbeResult> Function(int call) probeScript;
   int planCalls = 0;
   int probeCalls = 0;
+  final probeTargets = <String>[];
 
   @override
   Future<OnlineProbeResult> probeOnline({
@@ -221,12 +227,23 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
     Duration timeout = const Duration(seconds: 6),
   }) {
     probeCalls++;
+    probeTargets.add(targetPath);
     return probeScript(probeCalls);
   }
 
   /// (page being opened, page a ticket was requested for) per plan() call.
   final planRequests = <(String, String?)>[];
   final planReasons = <OfflineReason>[];
+
+  /// What hasSavedCopy answers (a page the server refused: is there a copy?).
+  bool savedCopy = false;
+
+  @override
+  Future<bool> hasSavedCopy({
+    required String parishId,
+    required String userId,
+    required String pagePath,
+  }) async => savedCopy;
 
   @override
   Future<PageLoadPlan> plan({
@@ -1150,6 +1167,92 @@ void main() {
       expect(coordinator.planReasons.last, OfflineReason.serverUnavailable);
     });
 
+    testWidgets('a page the server REFUSED (4xx) is shown as a refusal, never as offline or a server outage', (
+      tester,
+    ) async {
+      for (final status in [400, 401, 403, 404, 410]) {
+        final coordinator = _ScriptedCoordinator(
+          (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+        );
+        await tester.pumpWidget(_host(coordinator, onLogout: () async {}));
+        await ms(tester, 10);
+
+        platform.delegates.last.onHttpError!(
+          HttpResponseError(
+            request: WebResourceRequest(uri: Uri.parse(dashboardUrl)),
+            response: WebResourceResponse(uri: Uri.parse(dashboardUrl), statusCode: status),
+          ),
+        );
+        await ms(tester, 10);
+
+        expect(find.textContaining('HTTP $status · /public/dashboard.php'), findsOneWidget, reason: '$status');
+        expect(find.textContaining('OFFLINE'), findsNothing, reason: '$status');
+        expect(find.textContaining('SERWER NIEDOSTĘPNY'), findsNothing, reason: '$status');
+        expect(find.byType(spinner), findsNothing, reason: '$status');
+        expect(coordinator.planCalls, 1, reason: 'no fallback plan was made for $status');
+        expect(find.text('SPRÓBUJ PONOWNIE'), findsOneWidget, reason: '$status');
+        expect(find.text('ZALOGUJ PONOWNIE'), status == 401 ? findsOneWidget : findsNothing, reason: '$status');
+
+        // Nothing started earlier may bring the refused page back.
+        await tester.pump(const Duration(seconds: 12));
+        expect(find.textContaining('HTTP $status'), findsOneWidget, reason: 'still shown after $status');
+        await tester.pumpWidget(const SizedBox());
+      }
+    });
+
+    testWidgets('a refused page offers the saved copy when there is one, and only then', (
+      tester,
+    ) async {
+      for (final hasCopy in [false, true]) {
+        final coordinator = _ScriptedCoordinator(
+          (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+        )..savedCopy = hasCopy;
+        await tester.pumpWidget(_host(coordinator));
+        await ms(tester, 10);
+        platform.delegates.last.onHttpError!(
+          HttpResponseError(
+            request: WebResourceRequest(uri: Uri.parse(dashboardUrl)),
+            response: WebResourceResponse(uri: Uri.parse(dashboardUrl), statusCode: 403),
+          ),
+        );
+        await ms(tester, 10);
+
+        expect(
+          find.text('OTWÓRZ ZAPISANĄ KOPIĘ'),
+          hasCopy ? findsOneWidget : findsNothing,
+        );
+        if (hasCopy) {
+          await tester.tap(find.text('OTWÓRZ ZAPISANĄ KOPIĘ'));
+          await ms(tester, 10);
+          expect(platform.controllers.last.loaded.last, _localUrl);
+        }
+        await tester.pumpWidget(const SizedBox());
+      }
+    });
+
+    testWidgets('timeouts and "too many requests" are transient: saved copy, labelled as a server problem', (
+      tester,
+    ) async {
+      for (final status in [408, 429, 500, 503]) {
+        final coordinator = _ScriptedCoordinator(
+          (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+        );
+        await tester.pumpWidget(_host(coordinator));
+        await ms(tester, 10);
+        platform.delegates.last.onHttpError!(
+          HttpResponseError(
+            request: WebResourceRequest(uri: Uri.parse(dashboardUrl)),
+            response: WebResourceResponse(uri: Uri.parse(dashboardUrl), statusCode: status),
+          ),
+        );
+        await ms(tester, 10);
+
+        expect(coordinator.planReasons.last, OfflineReason.serverUnavailable, reason: '$status');
+        expect(find.textContaining('HTTP $status'), findsNothing, reason: '$status');
+        await tester.pumpWidget(const SizedBox());
+      }
+    });
+
     testWidgets('a real failure to connect is NOT labelled with an earlier, different reason', (
       tester,
     ) async {
@@ -1176,6 +1279,149 @@ void main() {
       await ms(tester, 10);
 
       expect(coordinator.planReasons.last, OfflineReason.noNetwork);
+    });
+
+    testWidgets('no navigation, refresh, retry or reconnect ever asks for a ticket for a page outside the registry', (
+      tester,
+    ) async {
+      // Linked from the panel, absent from the server's handoff registry.
+      const pages = [
+        'schedule.php',
+        'points.php',
+        'points-history.php',
+        'gathering-attendance.php',
+      ];
+      final coordinator = _ScriptedCoordinator(
+        (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+      );
+
+      for (final page in pages) {
+        final url = 'https://szarlej.ministrant.eu/public/$page';
+        await tester.pumpWidget(_host(coordinator));
+        await ms(tester, 10);
+        final delegate = platform.delegates.last;
+        delegate.onPageFinished!(dashboardUrl);
+        await ms(tester, 10);
+
+        // Open the page, then lose the connection while on it.
+        await delegate.onNavigationRequest!(
+          NavigationRequest(url: url, isMainFrame: true),
+        );
+        delegate.onPageFinished!(url);
+        await ms(tester, 10);
+        delegate.onWebResourceError!(
+          const WebResourceError(
+            errorCode: -2,
+            description: 'net::ERR_INTERNET_DISCONNECTED',
+            isForMainFrame: true,
+          ),
+        );
+        await ms(tester, 10);
+        delegate.onPageFinished!(_localUrl.toString());
+        await ms(tester, 10);
+
+        // Refresh by hand.
+        await tester.tap(find.byTooltip('Spróbuj połączyć'));
+        await ms(tester, 10);
+        expect(
+          coordinator.planRequests.last,
+          ('/public/$page', '/public/dashboard.php'),
+          reason: 'refresh on $page',
+        );
+        delegate.onPageFinished!(dashboardUrl); // the ticket lands
+        await ms(tester, 10);
+        expect(platform.controllers.last.loaded.last, Uri.parse(url), reason: page);
+        delegate.onPageFinished!(url);
+        await ms(tester, 10);
+
+        // Lose the connection again; the background check must also go
+        // through the entry page.
+        delegate.onWebResourceError!(
+          const WebResourceError(
+            errorCode: -2,
+            description: 'net::ERR_INTERNET_DISCONNECTED',
+            isForMainFrame: true,
+          ),
+        );
+        await ms(tester, 10);
+        delegate.onPageFinished!(_localUrl.toString());
+        await ms(tester, 2100);
+        expect(coordinator.probeTargets.last, '/public/dashboard.php', reason: 'reconnect on $page');
+
+        // A fresh screen for the next page: the same tree would only be
+        // UPDATED, carrying this page over as the current one.
+        await tester.pumpWidget(const SizedBox());
+      }
+
+      expect(
+        coordinator.planRequests.map((r) => r.$2).toSet(),
+        {'/public/dashboard.php'},
+        reason: 'every ticket was requested for the entry page only',
+      );
+      expect(coordinator.probeTargets.toSet(), {'/public/dashboard.php'});
+    });
+
+    testWidgets('refreshing from a saved copy drops the OFFLINE label as soon as the live page is requested', (
+      tester,
+    ) async {
+      var plans = 0;
+      final coordinator = _ScriptedCoordinator(
+        // 1st: the saved copy. 2nd (the refresh): the server takes a moment.
+        (_) => ++plans == 1
+            ? Future.value(_offlinePlan())
+            : _after(const Duration(milliseconds: 300), _onlinePlan()),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await readyOffline(tester, platform);
+      expect(find.textContaining('OFFLINE •'), findsOneWidget);
+
+      await tester.tap(find.byTooltip('Spróbuj połączyć'));
+      await ms(tester, 400); // the ticket has arrived; the page is loading
+
+      expect(platform.controllers.single.loaded.last, _ticketUrl);
+      expect(find.byType(spinner), findsOneWidget, reason: 'the live page has not finished');
+      expect(
+        find.textContaining('OFFLINE'),
+        findsNothing,
+        reason: 'the live page is on its way; the label must not wait for it to finish',
+      );
+    });
+
+    testWidgets('going back online loads the LIVE page and hides the saved copy until it has', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator(
+        (_) async => _offlinePlan(),
+        probe: (_) async => recovered(),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await readyOffline(tester, platform);
+      expect(find.textContaining('OFFLINE •'), findsOneWidget);
+      final controller = platform.controllers.single;
+
+      await ms(tester, 2100);
+      await ms(tester, 10);
+
+      // The live address is requested (the ticket's, which the server turns
+      // into the real page) — not a reload of the saved copy.
+      expect(controller.loaded.last, _ticketUrl);
+      expect(controller.loaded.last, isNot(_localUrl));
+      // Until the live page has finished, the saved copy is not on screen:
+      // a spinner covers it, and the banner no longer claims OFFLINE.
+      expect(find.byType(spinner), findsOneWidget);
+      expect(find.textContaining('OFFLINE'), findsNothing);
+
+      controller.scripts.clear();
+      platform.delegates.single.onPageFinished!(dashboardUrl);
+      await ms(tester, 10);
+      expect(find.byType(spinner), findsNothing);
+      // The page that just loaded is captured, so the saved copy is
+      // REPLACED by this fresh content rather than left stale.
+      expect(
+        controller.scripts.where((s) => s.contains('postMessage')),
+        isNotEmpty,
+        reason: 'the freshly loaded live page must be saved',
+      );
     });
 
     testWidgets('a refusal when opening the page is not a reason to ask again', (
