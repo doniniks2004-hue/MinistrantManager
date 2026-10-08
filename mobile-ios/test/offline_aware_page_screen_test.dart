@@ -235,6 +235,16 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
   final planRequests = <(String, String?)>[];
   final planReasons = <OfflineReason>[];
 
+  /// What hasSavedCopy answers (a page the server refused: is there a copy?).
+  bool savedCopy = false;
+
+  @override
+  Future<bool> hasSavedCopy({
+    required String parishId,
+    required String userId,
+    required String pagePath,
+  }) async => savedCopy;
+
   @override
   Future<PageLoadPlan> plan({
     required String parishId,
@@ -1155,6 +1165,92 @@ void main() {
 
       expect(coordinator.planCalls, 2);
       expect(coordinator.planReasons.last, OfflineReason.serverUnavailable);
+    });
+
+    testWidgets('a page the server REFUSED (4xx) is shown as a refusal, never as offline or a server outage', (
+      tester,
+    ) async {
+      for (final status in [400, 401, 403, 404, 410]) {
+        final coordinator = _ScriptedCoordinator(
+          (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+        );
+        await tester.pumpWidget(_host(coordinator, onLogout: () async {}));
+        await ms(tester, 10);
+
+        platform.delegates.last.onHttpError!(
+          HttpResponseError(
+            request: WebResourceRequest(uri: Uri.parse(dashboardUrl)),
+            response: WebResourceResponse(uri: Uri.parse(dashboardUrl), statusCode: status),
+          ),
+        );
+        await ms(tester, 10);
+
+        expect(find.textContaining('HTTP $status · /public/dashboard.php'), findsOneWidget, reason: '$status');
+        expect(find.textContaining('OFFLINE'), findsNothing, reason: '$status');
+        expect(find.textContaining('SERWER NIEDOSTĘPNY'), findsNothing, reason: '$status');
+        expect(find.byType(spinner), findsNothing, reason: '$status');
+        expect(coordinator.planCalls, 1, reason: 'no fallback plan was made for $status');
+        expect(find.text('SPRÓBUJ PONOWNIE'), findsOneWidget, reason: '$status');
+        expect(find.text('ZALOGUJ PONOWNIE'), status == 401 ? findsOneWidget : findsNothing, reason: '$status');
+
+        // Nothing started earlier may bring the refused page back.
+        await tester.pump(const Duration(seconds: 12));
+        expect(find.textContaining('HTTP $status'), findsOneWidget, reason: 'still shown after $status');
+        await tester.pumpWidget(const SizedBox());
+      }
+    });
+
+    testWidgets('a refused page offers the saved copy when there is one, and only then', (
+      tester,
+    ) async {
+      for (final hasCopy in [false, true]) {
+        final coordinator = _ScriptedCoordinator(
+          (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+        )..savedCopy = hasCopy;
+        await tester.pumpWidget(_host(coordinator));
+        await ms(tester, 10);
+        platform.delegates.last.onHttpError!(
+          HttpResponseError(
+            request: WebResourceRequest(uri: Uri.parse(dashboardUrl)),
+            response: WebResourceResponse(uri: Uri.parse(dashboardUrl), statusCode: 403),
+          ),
+        );
+        await ms(tester, 10);
+
+        expect(
+          find.text('OTWÓRZ ZAPISANĄ KOPIĘ'),
+          hasCopy ? findsOneWidget : findsNothing,
+        );
+        if (hasCopy) {
+          await tester.tap(find.text('OTWÓRZ ZAPISANĄ KOPIĘ'));
+          await ms(tester, 10);
+          expect(platform.controllers.last.loaded.last, _localUrl);
+        }
+        await tester.pumpWidget(const SizedBox());
+      }
+    });
+
+    testWidgets('timeouts and "too many requests" are transient: saved copy, labelled as a server problem', (
+      tester,
+    ) async {
+      for (final status in [408, 429, 500, 503]) {
+        final coordinator = _ScriptedCoordinator(
+          (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+        );
+        await tester.pumpWidget(_host(coordinator));
+        await ms(tester, 10);
+        platform.delegates.last.onHttpError!(
+          HttpResponseError(
+            request: WebResourceRequest(uri: Uri.parse(dashboardUrl)),
+            response: WebResourceResponse(uri: Uri.parse(dashboardUrl), statusCode: status),
+          ),
+        );
+        await ms(tester, 10);
+
+        expect(coordinator.planReasons.last, OfflineReason.serverUnavailable, reason: '$status');
+        expect(find.textContaining('HTTP $status'), findsNothing, reason: '$status');
+        await tester.pumpWidget(const SizedBox());
+      }
     });
 
     testWidgets('a real failure to connect is NOT labelled with an earlier, different reason', (

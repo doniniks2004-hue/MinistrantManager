@@ -242,12 +242,25 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
                 uri.path != '/public/mobile_handoff.php')
               return;
             _failedDocuments.add(uri.toString());
-            unawaited(
-              _loadPage(
-                forceOffline: true,
-                offlineReason: OfflineReason.serverUnavailable,
-              ),
-            );
+            final status = error.response?.statusCode;
+            if (status != null &&
+                status >= 400 &&
+                status < 500 &&
+                status != 408 &&
+                status != 429) {
+              // The server ANSWERED and refused this page (no permission,
+              // gone, bad request). Not a server problem and not "offline":
+              // saying so, and hiding the real cause behind a saved copy,
+              // is exactly the false OFFLINE this must not produce.
+              unawaited(_showPageRefusal(uri, status));
+            } else {
+              unawaited(
+                _loadPage(
+                  forceOffline: true,
+                  offlineReason: OfflineReason.serverUnavailable,
+                ),
+              );
+            }
           },
           onPageFinished: _onFinished,
           onWebResourceError: (e) {
@@ -684,6 +697,39 @@ $_captureChannel.postMessage(JSON.stringify({
   } catch (err) { return true; }
 })()
 ''';
+
+  /// A page the server refused with a 4xx: stop everything that is waiting,
+  /// abandon the load, and show the refusal with its code, plus the saved
+  /// copy as an explicit choice when there is one.
+  Future<void> _showPageRefusal(Uri uri, int status) async {
+    final generation = ++_loadGeneration;
+    _navigationDeadline?.cancel();
+    _navigationDeadline = null;
+    _totalDeadline?.cancel();
+    _totalDeadline = null;
+    _recoveryTimer?.cancel();
+    _recoverable = false;
+    final path = snapshotPagePath(uri) ?? _currentPath;
+    final hasCopy = await widget.coordinator.hasSavedCopy(
+      parishId: widget.parishId,
+      userId: widget.userId,
+      pagePath: path,
+    );
+    if (!mounted || _loggingOut || generation != _loadGeneration) return;
+    final refusal = PageLoadServerError(
+      statusCode: status,
+      errorCode: null,
+      path: uri.path,
+      hasSnapshot: hasCopy,
+    );
+    _online = false;
+    _offlineLoadUrl = null;
+    _afterHandoffPath = null;
+    _banner = null;
+    _serverError = refusal;
+    _errorText = describeServerError(refusal);
+    setState(() => _state = _LoadState.error);
+  }
 
   /// [prepared] is a handoff ticket already obtained by the background
   /// check; the load then skips planning and uses it, instead of asking the
