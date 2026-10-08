@@ -613,6 +613,21 @@ void main() {
         expect(result.errorCode, 'invalid_response');
       });
 
+      test('a defect in this app (TypeError) is never presented as the server refusing', () async {
+        await saveDashboard();
+        for (final error in <Object>[
+          TypeError(),
+          StateError('not activated'),
+          NoSuchMethodError.withInvocation(
+            Object(),
+            Invocation.method(#foo, const []),
+          ),
+        ]) {
+          final result = await plan(coordinatorFailingWith(error));
+          expect(result, isA<PageLoadOffline>(), reason: '${error.runtimeType}');
+        }
+      });
+
       test('5xx / 408 / 429 fall back to the saved copy, labelled as a server problem', () async {
         await saveDashboard();
         for (final status in [500, 502, 503, 408, 429]) {

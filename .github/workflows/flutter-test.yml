@@ -74,6 +74,7 @@ jobs:
           flutter test --concurrency=1 --reporter json | python3 -c '
           import json, sys
           names = {}
+          prints = {}
           failed = 0
           for line in sys.stdin:
               line = line.strip()
@@ -86,10 +87,14 @@ jobs:
               t = e.get("type")
               if t == "testStart":
                   names[e["test"]["id"]] = e["test"]["name"]
+              elif t == "print":
+                  prints.setdefault(e["testID"], []).append(e.get("message") or "")
               elif t == "error":
                   failed += 1
-                  msg = (e.get("error") or "").replace("\n", " | ")[:700]
-                  print("::error title=TEST FAILED::%s :: %s" % (names.get(e["testID"], "?"), msg))
+                  msg = (e.get("error") or "").replace("\n", " | ")[:300]
+                  dump = " | ".join(prints.get(e["testID"], [])).replace("\n", " | ")
+                  keep = dump[:1400]
+                  print("::error title=TEST FAILED::%s :: %s :: PRINTS: %s" % (names.get(e["testID"], "?"), msg, keep))
               sys.stdout.flush()
           sys.exit(1 if failed else 0)
           '

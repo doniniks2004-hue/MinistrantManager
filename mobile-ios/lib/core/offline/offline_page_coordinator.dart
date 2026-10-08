@@ -377,8 +377,11 @@ class HandoffFailure {
     }
     // The request returned, but not a handoff reply (e.g. an HTML page
     // where JSON was expected): the server answered, so this is not the
-    // network, and a saved copy will not make it go away.
-    if (error is FormatException || error is TypeError || error is NoSuchMethodError) {
+    // network, and a saved copy will not make it go away. ONLY the
+    // FormatException the handoff service raises for exactly this case
+    // counts; a TypeError or NoSuchMethodError is a defect in this app and
+    // must not be presented to the user as the server's refusal.
+    if (error is FormatException) {
       return const HandoffFailure._(
         HandoffFailureKind.rejected,
         null,
