@@ -8,6 +8,7 @@ import 'package:webview_flutter/webview_flutter.dart';
 import '../../core/util/startup_trace.dart';
 import '../../core/offline/offline_page_coordinator.dart';
 import '../../core/offline/page_identity.dart';
+import '../../core/offline/server_reachability.dart';
 
 /// Hosts the real PHP page. Offline replays saved views, without writes.
 class OfflineAwarePageScreen extends StatefulWidget {
@@ -83,20 +84,31 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
   /// Tunable — verify on a real device on a slow mobile connection.
   static const _pageRenderBudget = Duration(seconds: 8);
 
-  /// ONE absolute budget for everything that stands between "load
-  /// started" and "saved view on screen": the handoff attempt, local
-  /// planning, and rendering the loopback page. It is a single timer
-  /// started when the load starts — NOT a budget per stage. Per-stage
-  /// budgets add up (1.4 s of planning left the full 2 s render budget
-  /// still to run: spinner until 3.4 s); one timer cannot. It does not
-  /// apply once a handoff ticket exists (the online page then has
-  /// [_pageRenderBudget]). A failure detector, not a target: a loopback
-  /// page normally renders in well under a second. Worst case on a
-  /// Wi-Fi-without-internet network: the 1.5 s connect budget leaves
-  /// ~0.5 s for local planning and rendering — if on-device measurement
-  /// shows that is too tight, shorten OfflinePageCoordinator.onlineTimeout
-  /// rather than lengthening this.
+  /// How long the saved copy may take to appear once the app has DECIDED to
+  /// show it, i.e. from the moment planning says "offline". A failure
+  /// detector, not a target: a loopback page normally renders in well under
+  /// a second.
+  ///
+  /// It is counted from that decision and NOT from the start of the load. It
+  /// used to run from the start, so it also covered the attempt to reach the
+  /// server: when the system had not yet noticed the network was gone, that
+  /// attempt ran to its own 1.5 s limit and left ~0.5 s for the first,
+  /// cold, opening of the copy (server start, decryption, WebView). The
+  /// timer then expired, the error appeared, and the copy that was in fact
+  /// still loading was ignored; only a manual refresh, when the dead network
+  /// failed instantly, left enough time. Reaching the server is bounded by
+  /// OfflinePageCoordinator.onlineTimeout; this bounds showing the copy.
   static const _offlineTotalBudget = Duration(seconds: 2);
+
+  /// Guard for the PLANNING phase only (the attempt to reach the server plus
+  /// reading the saved copy: 1.5 s + 1.5 s at most, with margin). It is
+  /// replaced by [_offlineTotalBudget] as soon as planning decides.
+  static const _planningGuard = Duration(milliseconds: 3500);
+
+  /// How often an idle live page checks that the server can still be
+  /// reached, and how soon a doubtful result is checked again.
+  static const _heartbeatInterval = Duration(milliseconds: 1500);
+  static const _heartbeatConfirmDelay = Duration(milliseconds: 400);
 
   /// True from the moment a handoff ticket is in hand (PageLoadOnline) —
   /// from then on [_offlineTotalBudget] no longer applies.
@@ -178,6 +190,25 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
   /// Carried across offline link taps so they do not reset it.
   OfflineReason _offlineReason = OfflineReason.noNetwork;
 
+  /// Automatic retries of a FAILED first opening of the saved copy. The
+  /// first opening is cold (server just started, nothing cached) and the
+  /// second, with the same data, worked every time a person tried it, so
+  /// one retry is made without waiting for a tap. One only: a copy that
+  /// fails twice is reported.
+  int _offlineAutoRetries = 0;
+
+  /// The loopback document's navigation has actually begun. An error that
+  /// reports no address and arrives before this is the abandoned live
+  /// navigation's, not this one's.
+  bool _offlineDocStarted = false;
+
+  // ---- noticing a lost connection on an idle live page --------------------
+  Timer? _heartbeat;
+  bool _heartbeatInFlight = false;
+  int _heartbeatMisses = 0;
+  bool _connectionLostDeferred = false;
+  OfflineReason _lostReason = OfflineReason.noNetwork;
+
   /// Times in a row the PHP session was found expired and silently renewed.
   /// One renewal per expiry; a second login page right after it means the
   /// renewal did not help, and only then is the user signed out.
@@ -228,6 +259,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
                 _totalDeadline?.cancel();
                 _totalDeadline = null;
                 _failedDocuments.add(uri.toString());
+                if (_retryOfflineOnce()) return;
                 setState(() {
                   _state = _LoadState.error;
                   _errorText =
@@ -270,8 +302,13 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
               // one (abandoned, or replaced by a retry) must not fail the
               // load that IS current.
               final failed = e.url == null ? null : Uri.tryParse(e.url!);
-              if (_offlineLoadUrl == null ||
-                  (failed != null && !_isCurrentOfflineDocument(failed))) {
+              if (_offlineLoadUrl == null) return;
+              if (failed != null) {
+                if (!_isCurrentOfflineDocument(failed)) return;
+              } else if (!_offlineDocStarted) {
+                // An error that names no address and comes before OUR
+                // document even started belongs to the live navigation that
+                // was just abandoned (its failure is what sent us offline).
                 return;
               }
             }
@@ -289,6 +326,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
               );
             } else {
               _offlineLoadUrl = null;
+              if (_retryOfflineOnce()) return;
               setState(() {
                 _state = _LoadState.error;
                 _errorText = 'Nie udało się otworzyć zapisanej kopii strony.';
@@ -299,7 +337,23 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
         ),
       );
     WidgetsBinding.instance.addObserver(this);
+    // Before the first plan: the loopback server must already be listening
+    // when the first fallback needs it. Not awaited, never fails.
+    unawaited(widget.coordinator.warmUp());
+    unawaited(_hideScrollBars());
     unawaited(_loadPage(forceOffline: widget.forceOffline));
+  }
+
+  /// The page has its own scrolling; the native scroll bar drawn over the
+  /// right edge of the web view is only noise. Scrolling by gesture is not
+  /// affected: only whether the bar is DRAWN.
+  Future<void> _hideScrollBars() async {
+    try {
+      await _controller.setVerticalScrollBarEnabled(false);
+      await _controller.setHorizontalScrollBarEnabled(false);
+    } catch (_) {
+      // A platform without the setting keeps its bar; nothing else depends on it.
+    }
   }
 
   @override
@@ -317,6 +371,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     _navigationDeadline?.cancel();
     _totalDeadline?.cancel();
     _recoveryTimer?.cancel();
+    _heartbeat?.cancel();
     _captureTimer?.cancel();
     super.dispose();
   }
@@ -331,9 +386,12 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
         _recoveryTimer?.cancel();
         unawaited(_attemptRecovery(_loadGeneration));
       }
+      // A live page checked nothing while the app was away.
+      if (_online && _state == _LoadState.ready) _startHeartbeat();
     } else {
       _appInBackground = true;
       _recoveryTimer?.cancel();
+      _heartbeat?.cancel();
     }
   }
 
@@ -386,6 +444,16 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     });
   }
 
+  /// The first opening of the saved copy failed (error, or it did not finish
+  /// in time). Opens it once more, at once, with a fresh plan and a fresh
+  /// address. Returns whether a retry was started.
+  bool _retryOfflineOnce() {
+    if (_offlineAutoRetries >= 1) return false;
+    _offlineAutoRetries++;
+    unawaited(_loadPage(forceOffline: true));
+    return true;
+  }
+
   /// Expiry of [_offlineTotalBudget]. Gives up on THIS load completely —
   /// including bumping [_loadGeneration] — so a plan, loadRequest or page
   /// callback that finishes late cannot bring the abandoned load back
@@ -394,11 +462,13 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     if (!mounted || _loggingOut || generation != _loadGeneration) return;
     if (_onlineRendering || _state != _LoadState.loading) return;
     _loadGeneration++;
+    final wasOpeningACopy = _offlineLoadUrl != null;
     // The engine is still running the navigation we are giving up on; its
     // late onPageFinished must not turn this error back into "ready".
     _offlineLoadUrl = null;
     _navigationDeadline?.cancel();
     _navigationDeadline = null;
+    if (wasOpeningACopy && _retryOfflineOnce()) return;
     setState(() {
       _state = _LoadState.error;
       _errorText = 'Zapisana kopia strony nie otworzyła się na czas. Spróbuj ponownie.';
@@ -412,6 +482,12 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     if (!mounted || _loggingOut) return;
     _captureTimer?.cancel();
     final uri = Uri.tryParse(url);
+    if (!_online &&
+        uri != null &&
+        widget.coordinator.localServer.ownsUrl(uri) &&
+        _isCurrentOfflineDocument(uri)) {
+      _offlineDocStarted = true;
+    }
     if (_online && uri != null && _trusted(uri)) {
       _failedDocuments.remove(uri.toString());
       final path = snapshotPagePath(uri);
@@ -466,6 +542,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     }
     setState(() => _state = _LoadState.ready);
     StartupTrace.mark(_online ? 'page_ready_online' : 'page_ready_offline');
+    if (!_online) _offlineAutoRetries = 0;
     if (!_online) {
       unawaited(
         _controller
@@ -483,6 +560,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     if (_online) {
       _recoveryAttempts = 0;
       _sessionRenewals = 0;
+      _startHeartbeat();
       final path = snapshotPagePath(uri);
       if (path == null) return;
       _currentPath = path;
@@ -557,6 +635,7 @@ $_captureChannel.postMessage(JSON.stringify({
     _loadGeneration++;
     _recoverable = false;
     _recoveryTimer?.cancel();
+    _heartbeat?.cancel();
     _offlineLoadUrl = null;
     _navigationDeadline?.cancel();
     _totalDeadline?.cancel();
@@ -569,6 +648,97 @@ $_captureChannel.postMessage(JSON.stringify({
       await _controller.clearLocalStorage();
     } catch (_) {}
     await widget.onLogout!();
+  }
+
+  // ---- noticing a lost connection on an idle live page ----------------------
+  //
+  // Nothing else notices it: a page that is already loaded makes no request,
+  // so without this the app sat on the live page until the user happened to
+  // navigate or refresh. A quick TCP connection to the server, repeated
+  // while a live page is on screen, tells "no network" from "slow server"
+  // from "fine" within a moment, and the saved copy then opens by itself.
+
+  void _startHeartbeat() {
+    _heartbeatMisses = 0;
+    _scheduleHeartbeat(_heartbeatInterval);
+  }
+
+  void _scheduleHeartbeat(Duration delay) {
+    _heartbeat?.cancel();
+    if (!mounted ||
+        _loggingOut ||
+        !_online ||
+        _state != _LoadState.ready ||
+        _appInBackground ||
+        _connectionLostDeferred) {
+      return;
+    }
+    final generation = _loadGeneration;
+    _heartbeat = Timer(delay, () => unawaited(_heartbeatTick(generation)));
+  }
+
+  Future<Reachability> _checkOnce() async {
+    try {
+      return await widget.coordinator.checkReachability(widget.allowedHost);
+    } catch (_) {
+      return Reachability.timedOut;
+    }
+  }
+
+  bool _liveAndCurrent(int generation) =>
+      mounted &&
+      !_loggingOut &&
+      generation == _loadGeneration &&
+      _online &&
+      _state == _LoadState.ready;
+
+  Future<void> _heartbeatTick(int generation) async {
+    if (!_liveAndCurrent(generation) || _heartbeatInFlight) return;
+    _heartbeatInFlight = true;
+    final verdict = await _checkOnce().whenComplete(() {
+      _heartbeatInFlight = false;
+    });
+    if (!_liveAndCurrent(generation)) return;
+
+    switch (verdict) {
+      case Reachability.reachable:
+        _heartbeatMisses = 0;
+        _scheduleHeartbeat(_heartbeatInterval);
+      case Reachability.noRoute:
+        // The system itself says there is no way out: act at once.
+        await _connectionLost(OfflineReason.noNetwork, generation);
+      case Reachability.dnsFailure ||
+          Reachability.refused ||
+          Reachability.timedOut:
+        // Doubtful on its own (a DNS hiccup, a busy server): confirm
+        // shortly, and only act on a repeat.
+        _heartbeatMisses++;
+        if (_heartbeatMisses >= 2) {
+          await _connectionLost(
+            verdict == Reachability.dnsFailure
+                ? OfflineReason.noNetwork
+                : OfflineReason.serverUnavailable,
+            generation,
+          );
+        } else {
+          _scheduleHeartbeat(_heartbeatConfirmDelay);
+        }
+    }
+  }
+
+  Future<void> _connectionLost(OfflineReason reason, int generation) async {
+    // Never swap a page the user is typing into for a copy on their own:
+    // offer it instead.
+    if (await _hasUnsavedInput()) {
+      if (!_liveAndCurrent(generation)) return;
+      setState(() {
+        _connectionLostDeferred = true;
+        _lostReason = reason;
+      });
+      return;
+    }
+    if (!_liveAndCurrent(generation)) return;
+    await _loadPage(forceOffline: true, offlineReason: reason);
   }
 
   void _scheduleRecovery() {
@@ -708,6 +878,7 @@ $_captureChannel.postMessage(JSON.stringify({
     _totalDeadline?.cancel();
     _totalDeadline = null;
     _recoveryTimer?.cancel();
+    _heartbeat?.cancel();
     _recoverable = false;
     final path = snapshotPagePath(uri) ?? _currentPath;
     final hasCopy = await widget.coordinator.hasSavedCopy(
@@ -752,13 +923,21 @@ $_captureChannel.postMessage(JSON.stringify({
     if (!mounted || _loggingOut) return;
     setState(() => _state = _LoadState.loading);
     _onlineRendering = false;
+    _heartbeat?.cancel();
+    _connectionLostDeferred = false;
+    _offlineDocStarted = false;
+    // A load the user asked for starts with a fresh allowance of automatic
+    // retries; a retry itself (forced offline) does not.
+    if (!forceOffline) _offlineAutoRetries = 0;
     // From here on any offline navigation that was still pending belongs
     // to an abandoned load.
     _offlineLoadUrl = null;
     _serverError = null;
     _totalDeadline?.cancel();
+    // Covers PLANNING only; replaced by the saved copy's own 2 s below as
+    // soon as planning has decided to show it.
     _totalDeadline = Timer(
-      _offlineTotalBudget,
+      _planningGuard,
       () => _expireOfflineBudget(generation),
     );
     try {
@@ -822,6 +1001,12 @@ $_captureChannel.postMessage(JSON.stringify({
           _offlineLoadUrl = plan.url;
           _recoverable = !widget.forceOffline;
           _scheduleRecovery();
+          // The decision to show the copy is made: from NOW it has 2 s.
+          _totalDeadline?.cancel();
+          _totalDeadline = Timer(
+            _offlineTotalBudget,
+            () => _expireOfflineBudget(generation),
+          );
           await _controller.loadRequest(plan.url);
         case PageLoadOfflineNoSnapshot():
           _online = false;
@@ -886,6 +1071,27 @@ $_captureChannel.postMessage(JSON.stringify({
                       tooltip: 'Spróbuj połączyć',
                       icon: const Icon(Icons.refresh),
                       onPressed: () => _loadPage(),
+                    ),
+                  ],
+                ),
+              ),
+            if (_connectionLostDeferred)
+              Container(
+                color: Colors.orange.shade100,
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Row(
+                  children: [
+                    const Expanded(
+                      child: Text(
+                        'Utracono połączenie z serwerem. Na stronie są niezapisane dane — pokaż zapisaną wersję, gdy będziesz gotowy.',
+                        style: TextStyle(fontSize: 12),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () => unawaited(
+                        _loadPage(forceOffline: true, offlineReason: _lostReason),
+                      ),
+                      child: const Text('POKAŻ ZAPISANĄ WERSJĘ'),
                     ),
                   ],
                 ),

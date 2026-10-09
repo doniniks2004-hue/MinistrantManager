@@ -183,6 +183,44 @@ void main() {
       },
     );
 
+    test('concurrent start() calls share ONE bind (no orphaned server on another port)', () async {
+      final fresh = LocalSnapshotServer(encryptor: testEncryptor);
+      addTearDown(fresh.stop);
+      final ports = await Future.wait([for (var i = 0; i < 8; i++) fresh.start()]);
+
+      expect(ports.toSet(), hasLength(1), reason: 'every caller got the same port');
+      expect(fresh.port, ports.first);
+      expect(await fresh.start(), ports.first, reason: 'and later calls too');
+
+      // After stop() nothing is left listening on that port: no second
+      // server survived the first one's shutdown.
+      await fresh.stop();
+      await expectLater(
+        client
+            .openUrl('GET', Uri.parse('http://127.0.0.1:${ports.first}/x'))
+            .then((r) => r.close()),
+        throwsA(isA<SocketException>()),
+      );
+    });
+
+    test('stop() while a start is still binding leaves nothing running', () async {
+      final fresh = LocalSnapshotServer(encryptor: testEncryptor);
+      final starting = fresh.start();
+      await fresh.stop();
+      await starting;
+      expect(fresh.isRunning, isFalse);
+    });
+
+    test('the server can be started again after a stop', () async {
+      final fresh = LocalSnapshotServer(encryptor: testEncryptor);
+      addTearDown(fresh.stop);
+      await fresh.start();
+      await fresh.stop();
+      expect(fresh.isRunning, isFalse);
+      expect(await fresh.start(), isPositive);
+      expect(fresh.isRunning, isTrue);
+    });
+
     test('after stop(), the port is no longer accepting connections', () async {
       await server.stop();
       expect(server.isRunning, isFalse);

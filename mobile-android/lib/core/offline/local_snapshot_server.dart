@@ -89,12 +89,22 @@ class LocalSnapshotServer {
   /// listening on. Calling this again while already running is a no-op
   /// that just returns the existing port — callers don't need to track
   /// "did I already start this" themselves.
-  Future<int> start() async {
+  Future<int> start() {
     final existing = _server;
-    if (existing != null) {
-      return existing.port;
-    }
+    if (existing != null) return Future.value(existing.port);
+    // Concurrent callers share ONE bind. Without this, two calls made before
+    // the first bind finished both saw "not running", both bound a port, the
+    // second overwrote _server and the first server was orphaned on a port
+    // nobody knew — and a URL built from either could point at the wrong one.
+    return _starting ??= _bind().whenComplete(() {
+      // Block body: whenComplete would wait on a returned Future.
+      _starting = null;
+    });
+  }
 
+  Future<int>? _starting;
+
+  Future<int> _bind() async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     _server = server;
     server.listen(
@@ -110,6 +120,14 @@ class LocalSnapshotServer {
   }
 
   Future<void> stop() async {
+    // A start still binding must finish first, or its server would outlive
+    // this stop() and be left running.
+    final pending = _starting;
+    if (pending != null) {
+      try {
+        await pending;
+      } catch (_) {}
+    }
     final server = _server;
     _server = null;
     rootDirectory = null;

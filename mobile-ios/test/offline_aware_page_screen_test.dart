@@ -5,6 +5,7 @@ import 'package:ministrant_manager/core/offline/connectivity_probe.dart';
 import 'package:ministrant_manager/core/offline/local_snapshot_server.dart';
 import 'package:ministrant_manager/core/offline/offline_page_coordinator.dart';
 import 'package:ministrant_manager/core/offline/page_resource_downloader.dart';
+import 'package:ministrant_manager/core/offline/server_reachability.dart';
 import 'package:ministrant_manager/core/offline/snapshot_capture_service.dart';
 import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
 import 'package:ministrant_manager/core/offline/snapshot_store.dart';
@@ -26,6 +27,9 @@ import 'package:webview_flutter_platform_interface/webview_flutter_platform_inte
 // ---------------------------------------------------------------------------
 
 class _FakePlatform extends WebViewPlatform {
+  /// Makes the scroll-bar calls throw, like a platform without the setting.
+  static bool scrollBarsThrowing = false;
+
   final controllers = <_FakeController>[];
   final delegates = <_FakeDelegate>[];
 
@@ -83,6 +87,28 @@ class _FakeController extends PlatformWebViewController {
     loaded.add(params.uri);
   }
 
+  /// What the screen asked for regarding scroll bars.
+  final scrollBars = <String, bool>{};
+
+  @override
+  Future<void> setVerticalScrollBarEnabled(bool enabled) async {
+    if (_FakePlatform.scrollBarsThrowing) {
+      throw UnimplementedError('no scroll bar control on this platform');
+    }
+    scrollBars['vertical'] = enabled;
+  }
+
+  @override
+  Future<void> setHorizontalScrollBarEnabled(bool enabled) async {
+    if (_FakePlatform.scrollBarsThrowing) {
+      throw UnimplementedError('no scroll bar control on this platform');
+    }
+    scrollBars['horizontal'] = enabled;
+  }
+
+  @override
+  bool supportsSetScrollBarsEnabled() => true;
+
   /// Every script the screen ran (to see e.g. that a page capture was asked for).
   final scripts = <String>[];
 
@@ -124,6 +150,7 @@ class _FakeDelegate extends PlatformNavigationDelegate {
   _FakeDelegate(PlatformNavigationDelegateCreationParams params)
     : super.implementation(params);
 
+  PageEventCallback? onPageStarted;
   PageEventCallback? onPageFinished;
   NavigationRequestCallback? onNavigationRequest;
   WebResourceErrorCallback? onWebResourceError;
@@ -137,7 +164,9 @@ class _FakeDelegate extends PlatformNavigationDelegate {
   }
 
   @override
-  Future<void> setOnPageStarted(PageEventCallback onPageStarted) async {}
+  Future<void> setOnPageStarted(PageEventCallback onPageStarted) async {
+    this.onPageStarted = onPageStarted;
+  }
 
   @override
   Future<void> setOnPageFinished(PageEventCallback onPageFinished) async {
@@ -192,13 +221,20 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
   factory _ScriptedCoordinator(
     Future<PageLoadPlan> Function(bool forceOffline) script, {
     Future<OnlineProbeResult> Function(int call)? probe,
+    Future<Reachability> Function(int call)? reachability,
   }) => _ScriptedCoordinator._(
     SnapshotStore(encryptor: _encryptor),
     script,
     probe ?? (_) async => const OnlineProbeUnavailable(),
+    reachability ?? (_) async => Reachability.reachable,
   );
 
-  _ScriptedCoordinator._(SnapshotStore store, this.script, this.probeScript)
+  _ScriptedCoordinator._(
+    SnapshotStore store,
+    this.script,
+    this.probeScript,
+    this.reachabilityScript,
+  )
     : super(
         connectivityProbe: ConnectivityProbe(),
         captureService: SnapshotCaptureService(
@@ -215,7 +251,26 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
 
   final Future<PageLoadPlan> Function(bool forceOffline) script;
   final Future<OnlineProbeResult> Function(int call) probeScript;
+  final Future<Reachability> Function(int call) reachabilityScript;
   int planCalls = 0;
+
+  /// Order of the calls the screen makes ('warmUp', 'plan').
+  final events = <String>[];
+  int reachabilityCalls = 0;
+  final reachabilityHosts = <String>[];
+
+  @override
+  Future<void> warmUp() async {
+    events.add('warmUp');
+  }
+
+  @override
+  Future<Reachability> checkReachability(String host) {
+    reachabilityCalls++;
+    reachabilityHosts.add(host);
+    return reachabilityScript(reachabilityCalls);
+  }
+
   int probeCalls = 0;
   final probeTargets = <String>[];
 
@@ -255,6 +310,7 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
     OfflineReason offlineReason = OfflineReason.noNetwork,
   }) {
     planCalls++;
+    events.add('plan');
     planRequests.add((targetPath, handoffPath));
     planReasons.add(offlineReason);
     // Like the real coordinator: a forced fallback carries the reason the
@@ -373,31 +429,67 @@ void main() {
     expect(find.byType(spinner), findsOneWidget);
     expect(find.byType(WebViewWidget), findsOneWidget);
 
-    await tester.pump(const Duration(milliseconds: 2001));
+    // The copy never finishes: it is retried once by itself, then reported.
+    await tester.pump(const Duration(milliseconds: 4400));
     expect(find.byType(spinner), findsNothing);
     expect(find.text('SPRÓBUJ PONOWNIE'), findsOneWidget);
     expect(find.byType(WebViewWidget), findsOneWidget);
   });
 
   testWidgets(
-    'offline total deadline is absolute: 1400 ms of planning leaves no spinner at 2001 ms',
+    'FIRST SWITCH: a handoff that runs into its own limit still leaves the saved copy its full 2 s',
     (tester) async {
+      // The system has not noticed yet that the network is gone, so the
+      // attempt to reach the server runs to its limit (1.4 s). The copy is
+      // then opened cold and needs ~0.7 s more. It used to be given up on
+      // at 2.0 s from the START of the load — ignoring a copy that was
+      // about to appear — so only a manual refresh opened it.
       final coordinator = _ScriptedCoordinator(
-        (_) => _after(const Duration(milliseconds: 1400), _offlinePlan()),
+        (forceOffline) => forceOffline
+            ? Future.value(_offlinePlan())
+            : _after(const Duration(milliseconds: 1400), _offlinePlan()),
       );
       await tester.pumpWidget(_host(coordinator));
 
       await tester.pump(const Duration(milliseconds: 1400));
-      expect(
-        find.byType(spinner),
-        findsOneWidget,
-        reason: 'plan finished, the local page has not reported finished yet',
-      );
       expect(platform.controllers.single.loaded, [_localUrl]);
 
-      await tester.pump(const Duration(milliseconds: 601)); // t = 2001 ms
+      await tester.pump(const Duration(milliseconds: 701)); // t = 2101 ms
+      expect(find.byType(spinner), findsOneWidget, reason: 'still within ITS 2 s');
+      expect(find.textContaining('nie otworzyła się na czas'), findsNothing);
+      expect(coordinator.planCalls, 1, reason: 'no premature retry either');
+
+      platform.delegates.single.onPageFinished!(_localUrl.toString());
+      await tester.pump(const Duration(milliseconds: 1));
+
+      expect(find.byType(spinner), findsNothing);
+      expect(find.textContaining('OFFLINE •'), findsOneWidget);
+      expect(find.text('SPRÓBUJ PONOWNIE'), findsNothing, reason: 'no tap was needed');
+    },
+  );
+
+  testWidgets(
+    'a copy that never finishes is reported only after ITS OWN 2 s, and after one automatic retry',
+    (tester) async {
+      final coordinator = _ScriptedCoordinator(
+        (forceOffline) => forceOffline
+            ? Future.value(_offlinePlan())
+            : _after(const Duration(milliseconds: 1400), _offlinePlan()),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await tester.pump(const Duration(milliseconds: 1400));
+
+      await tester.pump(const Duration(milliseconds: 1500)); // t = 2900
+      expect(find.byType(spinner), findsOneWidget, reason: 'counted from the decision, not the start');
+
+      await tester.pump(const Duration(milliseconds: 700)); // t = 3600: first budget over
+      expect(coordinator.planCalls, 2, reason: 'one automatic retry');
+      expect(find.byType(spinner), findsOneWidget);
+
+      await tester.pump(const Duration(milliseconds: 2100)); // the retry's budget over
       expect(find.byType(spinner), findsNothing);
       expect(find.textContaining('nie otworzyła się na czas'), findsOneWidget);
+      expect(coordinator.planCalls, 2, reason: 'and no more than one');
     },
   );
 
@@ -405,14 +497,15 @@ void main() {
     'a plan that completes AFTER the deadline cannot bring the abandoned load back',
     (tester) async {
       final coordinator = _ScriptedCoordinator(
-        (_) => _after(const Duration(milliseconds: 2500), _offlinePlan()),
+        (_) => _after(const Duration(milliseconds: 4000), _offlinePlan()),
       );
       await tester.pumpWidget(_host(coordinator));
 
-      await tester.pump(const Duration(milliseconds: 2001));
+      // Planning itself has a guard (3.5 s): a plan that hangs is reported.
+      await tester.pump(const Duration(milliseconds: 3600));
       expect(find.textContaining('nie otworzyła się na czas'), findsOneWidget);
 
-      await tester.pump(const Duration(milliseconds: 600)); // plan resolves
+      await tester.pump(const Duration(milliseconds: 500)); // plan resolves
       expect(
         platform.controllers.single.loaded,
         isEmpty,
@@ -457,7 +550,9 @@ void main() {
       await tester.pump(const Duration(milliseconds: 1));
       expect(platform.controllers.single.loaded, [_localUrl]);
 
-      await tester.pump(const Duration(milliseconds: 2001));
+      // First budget, the one automatic retry, second budget: only now is
+      // the load really given up on.
+      await tester.pump(const Duration(milliseconds: 4100));
       expect(find.textContaining('nie otworzyła się na czas'), findsOneWidget);
 
       platform.delegates.single.onPageFinished!(_localUrl.toString());
@@ -477,12 +572,13 @@ void main() {
   ) async {
     final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
     await tester.pumpWidget(_host(coordinator));
-    await tester.pump(const Duration(milliseconds: 2002));
+    await tester.pump(const Duration(milliseconds: 4100));
     expect(find.text('SPRÓBUJ PONOWNIE'), findsOneWidget);
 
     await tester.tap(find.text('SPRÓBUJ PONOWNIE'));
     await tester.pump(const Duration(milliseconds: 1));
-    expect(platform.controllers.single.loaded, [_localUrl, _localUrl]);
+    // initial load, the automatic retry, the manual retry
+    expect(platform.controllers.single.loaded, [_localUrl, _localUrl, _localUrl]);
     expect(find.byType(spinner), findsOneWidget);
 
     platform.delegates.single.onPageFinished!(_localUrl.toString());
@@ -503,27 +599,29 @@ void main() {
         (_) async => _offlinePlan(_localUrlN(++plans)),
       );
       await tester.pumpWidget(_host(coordinator));
-      await tester.pump(const Duration(milliseconds: 2002)); // load #1 expired
+      await tester.pump(const Duration(milliseconds: 4100)); // #1 and its retry #2 expired
       expect(find.text('SPRÓBUJ PONOWNIE'), findsOneWidget);
 
       await tester.tap(find.text('SPRÓBUJ PONOWNIE'));
-      await tester.pump(const Duration(milliseconds: 1)); // load #2 started
+      await tester.pump(const Duration(milliseconds: 1)); // load #3 started
       expect(platform.controllers.single.loaded, [
         _localUrlN(1),
         _localUrlN(2),
+        _localUrlN(3),
       ]);
 
-      // The engine finally finishes the navigation the screen abandoned.
+      // The engine finally finishes navigations the screen abandoned.
       platform.delegates.single.onPageFinished!(_localUrlN(1).toString());
+      platform.delegates.single.onPageFinished!(_localUrlN(2).toString());
       await tester.pump(const Duration(milliseconds: 1));
       expect(
         find.byType(spinner),
         findsOneWidget,
-        reason: 'load #2 is still pending; load #1 finishing is not its result',
+        reason: 'load #3 is still pending; earlier loads finishing is not its result',
       );
 
-      // Load #2's own callback does finish it.
-      platform.delegates.single.onPageFinished!(_localUrlN(2).toString());
+      // Load #3's own callback does finish it.
+      platform.delegates.single.onPageFinished!(_localUrlN(3).toString());
       await tester.pump(const Duration(milliseconds: 1));
       expect(find.byType(spinner), findsNothing);
       expect(find.text('SPRÓBUJ PONOWNIE'), findsNothing);
@@ -673,6 +771,371 @@ void main() {
 
     expect(find.textContaining('SERWER NIEDOSTĘPNY • ostatnia synchronizacja'), findsOneWidget);
     expect(find.textContaining('OFFLINE •'), findsNothing);
+  });
+
+  group('first switch to the saved copy', () {
+    Future<void> ms(WidgetTester tester, int millis) =>
+        tester.pump(Duration(milliseconds: millis));
+
+    WebResourceError mainFrameError(String? url) => WebResourceError(
+      errorCode: -6,
+      description: 'net::ERR_CONNECTION_REFUSED',
+      isForMainFrame: true,
+      url: url,
+    );
+
+    testWidgets(
+      'REGRESSION: the first read of the copy fails and the view recovers by itself, no refresh',
+      (tester) async {
+        final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
+        await tester.pumpWidget(_host(coordinator));
+        await ms(tester, 10);
+        expect(platform.controllers.single.loaded, [_localUrl]);
+
+        // The first, cold, request to the loopback server fails.
+        platform.delegates.single.onWebResourceError!(
+          mainFrameError(_localUrl.toString()),
+        );
+        await ms(tester, 10);
+
+        // No error screen, no tap: it is opened again at once.
+        expect(find.text('SPRÓBUJ PONOWNIE'), findsNothing);
+        expect(find.textContaining('Nie udało się otworzyć'), findsNothing);
+        expect(coordinator.planCalls, 2);
+        expect(platform.controllers.single.loaded, [_localUrl, _localUrl]);
+
+        platform.delegates.single.onPageFinished!(_localUrl.toString());
+        await ms(tester, 10);
+
+        expect(find.byType(CircularProgressIndicator), findsNothing);
+        expect(find.textContaining('OFFLINE •'), findsOneWidget);
+        expect(find.text('SPRÓBUJ PONOWNIE'), findsNothing);
+      },
+    );
+
+    testWidgets(
+      'REGRESSION: the same recovery when the server answers the first read with an error status',
+      (tester) async {
+        final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
+        await tester.pumpWidget(_host(coordinator));
+        await ms(tester, 10);
+
+        platform.delegates.single.onHttpError!(
+          HttpResponseError(
+            request: WebResourceRequest(uri: _localUrl),
+            response: WebResourceResponse(uri: _localUrl, statusCode: 500),
+          ),
+        );
+        await ms(tester, 10);
+
+        expect(find.textContaining('uszkodzona'), findsNothing);
+        expect(coordinator.planCalls, 2, reason: 'opened again by itself');
+        platform.delegates.single.onPageFinished!(_localUrl.toString());
+        await ms(tester, 10);
+        expect(find.textContaining('OFFLINE •'), findsOneWidget);
+      },
+    );
+
+    testWidgets('a copy that fails twice is reported, not retried forever', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+
+      platform.delegates.single.onWebResourceError!(mainFrameError(_localUrl.toString()));
+      await ms(tester, 10);
+      platform.delegates.single.onWebResourceError!(mainFrameError(_localUrl.toString()));
+      await ms(tester, 10);
+
+      expect(find.textContaining('Nie udało się otworzyć zapisanej kopii'), findsOneWidget);
+      expect(find.text('SPRÓBUJ PONOWNIE'), findsOneWidget);
+      await tester.pump(const Duration(seconds: 30));
+      expect(coordinator.planCalls, 2, reason: 'one automatic retry, then it stops');
+    });
+
+    testWidgets('after a success a LATER failure gets its own automatic retry', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+      platform.delegates.single.onWebResourceError!(mainFrameError(_localUrl.toString()));
+      await ms(tester, 10);
+      platform.delegates.single.onPageFinished!(_localUrl.toString());
+      await ms(tester, 10);
+      expect(coordinator.planCalls, 2);
+
+      // The user refreshes (a fresh load); that one fails once too.
+      await tester.tap(find.byIcon(Icons.refresh));
+      await ms(tester, 10);
+      final before = coordinator.planCalls;
+      platform.delegates.single.onWebResourceError!(mainFrameError(_localUrl.toString()));
+      await ms(tester, 10);
+      expect(coordinator.planCalls, before + 1, reason: 'a fresh allowance of one retry');
+      expect(find.text('SPRÓBUJ PONOWNIE'), findsNothing);
+    });
+
+    testWidgets(
+      "an error with no address from the ABANDONED live navigation does not fail the copy",
+      (tester) async {
+        final coordinator = _ScriptedCoordinator(
+          (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+        );
+        await tester.pumpWidget(_host(coordinator));
+        await ms(tester, 10);
+        platform.delegates.single.onPageFinished!(
+          'https://szarlej.ministrant.eu/public/dashboard.php',
+        );
+        await ms(tester, 10);
+
+        // The live navigation fails -> the screen switches to the copy ...
+        platform.delegates.single.onWebResourceError!(
+          mainFrameError('https://szarlej.ministrant.eu/public/ranking.php'),
+        );
+        await ms(tester, 10);
+        expect(platform.controllers.single.loaded.last, _localUrl);
+
+        // ... and the engine reports the same failure once more, naming no
+        // address, before the copy has even started.
+        platform.delegates.single.onWebResourceError!(mainFrameError(null));
+        await ms(tester, 10);
+        expect(find.text('SPRÓBUJ PONOWNIE'), findsNothing);
+        expect(coordinator.planCalls, 2, reason: 'ignored: no retry, no error');
+
+        platform.delegates.single.onPageStarted!(_localUrl.toString());
+        platform.delegates.single.onPageFinished!(_localUrl.toString());
+        await ms(tester, 10);
+        expect(find.textContaining('OFFLINE •'), findsOneWidget);
+      },
+    );
+
+    testWidgets('an address-less error AFTER the copy started is its own failure', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+      platform.delegates.single.onPageStarted!(_localUrl.toString());
+      platform.delegates.single.onWebResourceError!(mainFrameError(null));
+      await ms(tester, 10);
+
+      expect(coordinator.planCalls, 2, reason: 'counted: opened again');
+    });
+
+    testWidgets('the loopback server is warmed up BEFORE the first plan', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+      expect(coordinator.events.take(2), ['warmUp', 'plan']);
+    });
+
+    testWidgets('the scroll bars are hidden; nothing else about scrolling is touched', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+
+      expect(platform.controllers.single.scrollBars, {
+        'vertical': false,
+        'horizontal': false,
+      });
+      // Only the bar is switched off: gesture scrolling is the view's own and
+      // is the same online and offline (no scroll-related call at all).
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('a platform that cannot hide the bars does not break the page', (
+      tester,
+    ) async {
+      _FakePlatform.scrollBarsThrowing = true;
+      addTearDown(() => _FakePlatform.scrollBarsThrowing = false);
+      final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+      platform.delegates.single.onPageFinished!(_localUrl.toString());
+      await ms(tester, 10);
+      expect(find.textContaining('OFFLINE •'), findsOneWidget);
+    });
+  });
+
+  group('connection lost on an idle live page', () {
+    const dashboardUrl = 'https://szarlej.ministrant.eu/public/dashboard.php';
+
+    Future<void> ms(WidgetTester tester, int millis) =>
+        tester.pump(Duration(milliseconds: millis));
+
+    /// The live page has loaded (plan -> ticket -> page finished).
+    Future<void> liveReady(WidgetTester tester) async {
+      await ms(tester, 10);
+      platform.delegates.single.onPageFinished!(dashboardUrl);
+      await ms(tester, 10);
+    }
+
+    _ScriptedCoordinator scripted(
+      Future<Reachability> Function(int call) reachability, {
+      Future<OnlineProbeResult> Function(int call)? probe,
+    }) => _ScriptedCoordinator(
+      (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+      reachability: reachability,
+      probe: probe,
+    );
+
+    testWidgets(
+      'ACCEPTANCE: the network goes away, nobody touches anything, the saved copy appears',
+      (tester) async {
+        final coordinator = scripted(
+          (call) async => call < 3 ? Reachability.reachable : Reachability.noRoute,
+        );
+        await tester.pumpWidget(_host(coordinator));
+        await liveReady(tester);
+        expect(platform.controllers.single.loaded, [_ticketUrl]);
+
+        await ms(tester, 4400); // two checks passed, the third not yet due
+        expect(platform.controllers.single.loaded, [_ticketUrl]);
+
+        await ms(tester, 300); // third check: no route
+        expect(platform.controllers.single.loaded, [_ticketUrl, _localUrl]);
+        expect(coordinator.planReasons.last, OfflineReason.noNetwork);
+
+        platform.delegates.single.onPageFinished!(_localUrl.toString());
+        await ms(tester, 10);
+        expect(find.textContaining('OFFLINE •'), findsOneWidget);
+        expect(find.text('SPRÓBUJ PONOWNIE'), findsNothing);
+        expect(coordinator.reachabilityHosts.toSet(), {'szarlej.ministrant.eu'});
+      },
+    );
+
+    testWidgets('a doubtful result (timeout, DNS) must repeat before the page is left', (
+      tester,
+    ) async {
+      const script = [
+        Reachability.timedOut, // 1: doubtful
+        Reachability.reachable, // 2: fine again -> forgotten
+        Reachability.timedOut, // 3: doubtful
+        Reachability.timedOut, // 4: repeated -> act
+      ];
+      final coordinator = scripted((call) async => script[call - 1]);
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+
+      await ms(tester, 3500);
+      expect(platform.controllers.single.loaded, [_ticketUrl], reason: 'not after one miss');
+
+      await ms(tester, 400);
+      expect(platform.controllers.single.loaded, [_ticketUrl, _localUrl]);
+      expect(coordinator.planReasons.last, OfflineReason.serverUnavailable);
+    });
+
+    testWidgets('a name that cannot be resolved twice in a row is a lost network', (
+      tester,
+    ) async {
+      final coordinator = scripted((_) async => Reachability.dnsFailure);
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      await ms(tester, 2200);
+      expect(platform.controllers.single.loaded, [_ticketUrl, _localUrl]);
+      expect(coordinator.planReasons.last, OfflineReason.noNetwork);
+    });
+
+    testWidgets('unsaved input: the page is NOT swapped; the copy is offered instead', (
+      tester,
+    ) async {
+      final coordinator = scripted((_) async => Reachability.noRoute);
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      platform.controllers.single.jsResult = true; // a field was edited
+
+      await ms(tester, 1600);
+      expect(platform.controllers.single.loaded, [_ticketUrl]);
+      expect(find.textContaining('Utracono połączenie'), findsOneWidget);
+      expect(find.text('POKAŻ ZAPISANĄ WERSJĘ'), findsOneWidget);
+
+      final calls = coordinator.reachabilityCalls;
+      await tester.pump(const Duration(seconds: 20));
+      expect(coordinator.reachabilityCalls, calls, reason: 'no further checks while it waits');
+      expect(platform.controllers.single.loaded, [_ticketUrl]);
+
+      await tester.tap(find.text('POKAŻ ZAPISANĄ WERSJĘ'));
+      await ms(tester, 10);
+      expect(platform.controllers.single.loaded, [_ticketUrl, _localUrl]);
+      expect(find.text('POKAŻ ZAPISANĄ WERSJĘ'), findsNothing);
+    });
+
+    testWidgets('a reachable server leaves the page alone, however long it stays', (
+      tester,
+    ) async {
+      final coordinator = scripted((_) async => Reachability.reachable);
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      await tester.pump(const Duration(minutes: 1));
+
+      expect(platform.controllers.single.loaded, [_ticketUrl]);
+      expect(coordinator.planCalls, 1);
+      expect(coordinator.reachabilityCalls, greaterThan(30));
+    });
+
+    testWidgets('nothing is checked while the app is in the background; it resumes on return', (
+      tester,
+    ) async {
+      final coordinator = scripted((_) async => Reachability.reachable);
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      await tester.pump(const Duration(seconds: 10));
+      expect(coordinator.reachabilityCalls, 0);
+
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await ms(tester, 1600);
+      expect(coordinator.reachabilityCalls, 1);
+    });
+
+    testWidgets('once on the saved copy, the checks stop (the reconnect logic takes over)', (
+      tester,
+    ) async {
+      final coordinator = scripted((_) async => Reachability.noRoute);
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      await ms(tester, 1600);
+      expect(platform.controllers.single.loaded, [_ticketUrl, _localUrl]);
+
+      final calls = coordinator.reachabilityCalls;
+      await tester.pump(const Duration(seconds: 30));
+      expect(coordinator.reachabilityCalls, calls);
+    });
+
+    testWidgets(
+      'WHOLE LOOP, no taps: live -> network lost -> saved copy -> network back -> live again',
+      (tester) async {
+        final coordinator = scripted(
+          (call) async => call == 2 ? Reachability.noRoute : Reachability.reachable,
+          probe: (_) async => OnlineProbeRecovered(_onlinePlan()),
+        );
+        await tester.pumpWidget(_host(coordinator));
+        await liveReady(tester);
+
+        await ms(tester, 3100); // check 2 -> no route -> the copy
+        expect(platform.controllers.single.loaded, [_ticketUrl, _localUrl]);
+        platform.delegates.single.onPageFinished!(_localUrl.toString());
+        await ms(tester, 10);
+        expect(find.textContaining('OFFLINE •'), findsOneWidget);
+
+        await ms(tester, 2200); // the reconnect check is due and succeeds
+        expect(platform.controllers.single.loaded, [_ticketUrl, _localUrl, _ticketUrl]);
+        platform.delegates.single.onPageFinished!(dashboardUrl);
+        await ms(tester, 10);
+        expect(find.textContaining('OFFLINE •'), findsNothing);
+
+        // And the live page is watched again.
+        final calls = coordinator.reachabilityCalls;
+        await ms(tester, 1600);
+        expect(coordinator.reachabilityCalls, greaterThan(calls));
+      },
+    );
   });
 
   group('automatic return to the live page', () {
