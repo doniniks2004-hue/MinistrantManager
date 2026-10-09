@@ -68,7 +68,15 @@ class OfflinePageCoordinator {
   /// page to notice a lost connection that no request has yet run into.
   final ServerReachability reachability;
 
-  Future<Reachability> checkReachability(String host) => reachability.check(host);
+  Future<Reachability> checkReachability(String host) async {
+    final verdict = await reachability.check(host);
+    // Debug builds only, like the handoff line: which way a lost connection
+    // was recognised (noRoute at once, dnsFailure after a repeat, ...).
+    if (kDebugMode && verdict != Reachability.reachable) {
+      debugPrint('reachability: ${verdict.name}');
+    }
+    return verdict;
+  }
 
   /// Gets the loopback server listening BEFORE it is needed. Starting it was
   /// part of the first fallback to a saved copy, so the very first switch
