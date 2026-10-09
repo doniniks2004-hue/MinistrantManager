@@ -10,6 +10,7 @@ import 'package:ministrant_manager/core/offline/connectivity_probe.dart';
 import 'package:ministrant_manager/core/offline/local_snapshot_server.dart';
 import 'package:ministrant_manager/core/offline/offline_page_coordinator.dart';
 import 'package:ministrant_manager/core/offline/page_resource_downloader.dart';
+import 'package:ministrant_manager/core/offline/server_reachability.dart';
 import 'package:ministrant_manager/core/offline/snapshot_capture_service.dart';
 import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
 import 'package:ministrant_manager/core/offline/snapshot_manifest.dart';
@@ -23,6 +24,14 @@ import 'package:ministrant_manager/features/webview/webview_handoff_service.dart
 /// finding this fixes). Overrides ONLY requestHandoffUrl(); secureStorage
 /// is still the REAL field OfflinePageCoordinator reads
 /// (handoffService.secureStorage.serverUrl) for its reachability check.
+/// A server that cannot bind (e.g. no loopback), to prove warmUp never throws.
+class _FailingServer extends LocalSnapshotServer {
+  _FailingServer() : super(encryptor: _testEncryptor);
+
+  @override
+  Future<int> start() => Future<int>.error(const SocketException('no loopback'));
+}
+
 class _FakeHandoffService extends WebviewHandoffService {
   _FakeHandoffService(SecureStorageService secureStorage)
     : super(api: ApiClient(secureStorage), secureStorage: secureStorage);
@@ -239,6 +248,69 @@ void main() {
       if (await tempRoot.exists()) {
         await tempRoot.delete(recursive: true);
       }
+    });
+
+    test('warmUp starts the loopback server once, however many callers and however early', () async {
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: store,
+        localServer: localServer,
+        handoffService: _FakeHandoffService(SecureStorageService()),
+      );
+      expect(localServer.isRunning, isFalse);
+      await Future.wait([coordinator.warmUp(), coordinator.warmUp(), coordinator.warmUp()]);
+      expect(localServer.isRunning, isTrue);
+      final port = localServer.port;
+
+      await store.writeSnapshot(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/ranking.php',
+        html: '<html>Ranking</html>',
+        assets: {},
+      );
+      final plan = await coordinator.plan(
+        parishId: 'p',
+        userId: 'u',
+        targetPath: '/public/ranking.php',
+        forceOffline: true,
+      );
+      expect(plan, isA<PageLoadOffline>());
+      expect(localServer.port, port, reason: 'the plan reuses the warmed server');
+      expect((plan as PageLoadOffline).url.port, port);
+    });
+
+    test('a failing warmUp never throws: the plan reports a real failure where it can be handled', () async {
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: store,
+        localServer: _FailingServer(),
+        handoffService: _FakeHandoffService(SecureStorageService()),
+      );
+      await coordinator.warmUp(); // completes normally
+    });
+
+    test('checkReachability asks the injected check about the given host', () async {
+      String? asked;
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: store,
+        localServer: localServer,
+        handoffService: _FakeHandoffService(SecureStorageService()),
+        reachability: ServerReachability(
+          connect: (host, port, {timeout}) {
+            asked = '$host:$port';
+            return Future<Socket>.error(
+              SocketException('x', osError: OSError('Network is unreachable', 101)),
+            );
+          },
+        ),
+      );
+      expect(await coordinator.checkReachability('szarlej.ministrant.eu'), Reachability.noRoute);
+      expect(asked, 'szarlej.ministrant.eu:443');
     });
 
     test('known offline never makes a handoff request', () async {

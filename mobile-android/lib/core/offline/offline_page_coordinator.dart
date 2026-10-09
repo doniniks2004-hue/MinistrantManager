@@ -8,6 +8,7 @@ import 'page_identity.dart';
 import '../../features/webview/webview_handoff_service.dart';
 import 'connectivity_probe.dart';
 import 'local_snapshot_server.dart';
+import 'server_reachability.dart';
 import 'snapshot_capture_service.dart';
 import 'snapshot_store.dart';
 
@@ -45,6 +46,7 @@ class OfflinePageCoordinator {
     required this.handoffService,
     this.onlineTimeout = const Duration(milliseconds: 1500),
     this.offlinePlanTimeout = const Duration(milliseconds: 1500),
+    this.reachability = const ServerReachability(),
   });
 
   final ConnectivityProbe connectivityProbe;
@@ -61,6 +63,34 @@ class OfflinePageCoordinator {
   /// stuck filesystem/server step can never leave the screen waiting
   /// forever on plan() itself.
   final Duration offlinePlanTimeout;
+
+  /// Quick "can the server be reached at all" check, used on an idle live
+  /// page to notice a lost connection that no request has yet run into.
+  final ServerReachability reachability;
+
+  Future<Reachability> checkReachability(String host) async {
+    final verdict = await reachability.check(host);
+    // Debug builds only, like the handoff line: which way a lost connection
+    // was recognised (noRoute at once, dnsFailure after a repeat, ...).
+    if (kDebugMode && verdict != Reachability.reachable) {
+      debugPrint('reachability: ${verdict.name}');
+    }
+    return verdict;
+  }
+
+  /// Gets the loopback server listening BEFORE it is needed. Starting it was
+  /// part of the first fallback to a saved copy, so the very first switch
+  /// paid for the bind inside the time allowed to show the page. Safe to
+  /// call at any time and from several places: start() is idempotent and
+  /// concurrent calls share one bind.
+  Future<void> warmUp() async {
+    try {
+      await localServer.start();
+    } catch (_) {
+      // Not fatal: planning an offline view starts it again and reports a
+      // real failure where it can be handled.
+    }
+  }
 
   /// Bumped at the start of every plan() — "a NEWER plan exists".
   int _planGeneration = 0;
