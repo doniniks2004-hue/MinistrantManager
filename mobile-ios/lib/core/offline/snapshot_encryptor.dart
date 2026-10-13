@@ -1,3 +1,4 @@
+import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -27,9 +28,15 @@ import 'package:encrypt/encrypt.dart' as enc;
 /// mirroring the EXISTING `getOrCreateDbEncryptionKey()` pattern exactly)
 /// — this class only ever receives an already-resolved key string.
 class SnapshotEncryptor {
-  SnapshotEncryptor({required String hexKey}) : _encrypter = enc.Encrypter(enc.AES(_keyFromHex(hexKey), mode: enc.AESMode.gcm));
+  SnapshotEncryptor({required String hexKey})
+    : _hexKey = hexKey,
+      _encrypter = enc.Encrypter(enc.AES(_keyFromHex(hexKey), mode: enc.AESMode.gcm));
 
+  final String _hexKey;
   final enc.Encrypter _encrypter;
+
+  /// Below this size the work is cheaper than starting an isolate for it.
+  static const _backgroundThresholdBytes = 8 * 1024;
 
   /// 96 bits — the standard, NIST-recommended IV length for AES-GCM.
   static const _ivLengthBytes = 12;
@@ -62,6 +69,31 @@ class SnapshotEncryptor {
     return ivBytes + encrypted.bytes;
   }
 
+  /// [encryptBytes] and [decryptBytes] are plain Dart (package:encrypt over
+  /// pointycastle) and run on whichever isolate calls them. A dashboard is
+  /// about 260 KB (page 56, stylesheet 22, script 21, logo 158) and every
+  /// open of it is decrypted, every capture of it is encrypted. Done on the
+  /// isolate that also runs the interface and the WebView's callbacks, that
+  /// is seconds of a frozen event loop in a debug build, during which timers
+  /// are late and callbacks wait: a page that is in fact opening is declared
+  /// late by a timer that fires before the callback that would have said so.
+  ///
+  /// These run the same work on another isolate and give the same result
+  /// (same format, same errors). Only the key and the bytes are sent.
+  Future<List<int>> encryptBytesInBackground(List<int> plaintext) {
+    if (plaintext.length < _backgroundThresholdBytes) {
+      return Future.sync(() => encryptBytes(plaintext));
+    }
+    return _encryptInBackground(_hexKey, _asUint8List(plaintext));
+  }
+
+  Future<List<int>> decryptBytesInBackground(List<int> packed) {
+    if (packed.length < _backgroundThresholdBytes) {
+      return Future.sync(() => decryptBytes(packed));
+    }
+    return _decryptInBackground(_hexKey, _asUint8List(packed));
+  }
+
   /// Reverses [encryptBytes] exactly. Throws (never returns garbage) if
   /// [packed] is too short to even contain an IV, or if the GCM
   /// authentication tag doesn't match — i.e. the data was corrupted or
@@ -77,3 +109,22 @@ class SnapshotEncryptor {
     return _encrypter.decryptBytes(encrypted, iv: iv);
   }
 }
+
+// Top level on purpose, and kept apart from the methods above: a closure
+// handed to Isolate.run carries every variable of the scope it was written in,
+// and in a method that scope includes `this`, whose Encrypter cannot be sent
+// to another isolate. Here the only things in scope are the key and the bytes.
+Uint8List _asUint8List(List<int> bytes) =>
+    bytes is Uint8List ? bytes : Uint8List.fromList(bytes);
+
+Future<List<int>> _encryptInBackground(String hexKey, Uint8List bytes) =>
+    Isolate.run(() => _encryptJob(hexKey, bytes));
+
+Future<List<int>> _decryptInBackground(String hexKey, Uint8List bytes) =>
+    Isolate.run(() => _decryptJob(hexKey, bytes));
+
+List<int> _encryptJob(String hexKey, Uint8List bytes) =>
+    SnapshotEncryptor(hexKey: hexKey).encryptBytes(bytes);
+
+List<int> _decryptJob(String hexKey, Uint8List bytes) =>
+    SnapshotEncryptor(hexKey: hexKey).decryptBytes(bytes);

@@ -50,7 +50,30 @@ class OfflinePageCoordinator {
     this.offlinePlanTimeout = const Duration(milliseconds: 1500),
     this.reachability = const ServerReachability(),
     ConnectivityMonitor? connectivity,
-  }) : connectivity = connectivity ?? ConnectivityMonitor(PlatformNetworkSignal());
+  }) : connectivity = connectivity ?? ConnectivityMonitor(PlatformNetworkSignal()) {
+    localServer.trace = trace;
+  }
+
+  /// Decrypts the saved copy of [pagePath] into the server's memory ahead of
+  /// time, in the background, so that opening it later costs nothing. For the
+  /// moments the copy is not needed yet: while the live page loads, and just
+  /// after a new copy was written. Never throws.
+  Future<void> prewarmPage({
+    required String parishId,
+    required String userId,
+    required String pagePath,
+  }) async {
+    try {
+      final dir = await snapshotStore.getPageDirectoryIfReady(
+        parishId: parishId,
+        userId: userId,
+        pagePath: pagePath,
+      );
+      if (dir != null) await localServer.prewarm(dir);
+    } catch (_) {
+      // Best effort: the copy is simply decrypted when it is opened.
+    }
+  }
 
   /// What the operating system says about the device's connection, turned
   /// into decisions (lost / doubtful / returned). It says nothing about the
@@ -316,11 +339,13 @@ class OfflinePageCoordinator {
     required String path,
     required String? diagnosticMessage,
   }) async {
+    final planWatch = Stopwatch()..start();
     final manifest = await snapshotStore.readManifestFor(
       parishId: parishId,
       userId: userId,
       pagePath: path,
     );
+    trace('offline-plan: manifest read in ${planWatch.elapsedMilliseconds} ms');
     if (manifest == null || _isStale(ticket)) {
       return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage);
     }
@@ -402,6 +427,11 @@ class OfflinePageCoordinator {
         );
         lastCaptureOutcome = outcome;
         if (kDebugMode) debugPrint(outcome.toString());
+        // The copy that was just written is the one a switch will open next:
+        // have it decrypted before it is needed.
+        if (outcome.status == CaptureStatus.saved) {
+          unawaited(prewarmPage(parishId: parishId, userId: userId, pagePath: targetPath));
+        }
         if (!_captureOutcomes.isClosed) _captureOutcomes.add(outcome);
       } catch (_) {
         // A failed capture leaves the previous snapshot intact.

@@ -383,6 +383,16 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     // Before the first plan: the loopback server must already be listening
     // when the first fallback needs it. Not awaited, never fails.
     unawaited(widget.coordinator.warmUp());
+    // While the live page loads (the phone is idle and online) decrypt the saved
+    // copy of this page, so that if the connection is lost soon after a cold
+    // start, opening it costs nothing.
+    unawaited(
+      widget.coordinator.prewarmPage(
+        parishId: widget.parishId,
+        userId: widget.userId,
+        pagePath: widget.targetPath,
+      ),
+    );
     unawaited(_hideScrollBars());
     widget.coordinator.connectivity.start();
     _connectivitySub = widget.coordinator.connectivity.events.listen(
@@ -517,7 +527,16 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
   /// including bumping [_loadGeneration] — so a plan, loadRequest or page
   /// callback that finishes late cannot bring the abandoned load back
   /// and flip the screen under the user after the error is already shown.
-  void _expireOfflineBudget(int generation) {
+  Future<void> _expireOfflineBudget(int generation) async {
+    if (!mounted || _loggingOut || generation != _loadGeneration) return;
+    // A timer and a platform callback that are both due in the same instant
+    // run in the order they reached the queue, and after a stretch in which the
+    // event loop was busy the timer can reach it first: the page had finished
+    // (its callback is already waiting) and was nevertheless declared late,
+    // abandoned, and opened a second time from scratch. One turn of the event
+    // loop lets what has ALREADY arrived run. This is not extra time: nothing
+    // that had not happened by the deadline can happen in it.
+    await Future<void>.delayed(Duration.zero);
     if (!mounted || _loggingOut || generation != _loadGeneration) return;
     if (_onlineRendering || _state != _LoadState.loading) return;
     _loadGeneration++;
@@ -659,6 +678,16 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
       final path = snapshotPagePath(uri);
       if (path == null) return;
       _currentPath = path;
+      // The saved copy of the page that is on screen is the one a switch would
+      // open next: have it decrypted while the phone is idle and online (a
+      // no-op when it already is in memory).
+      unawaited(
+        widget.coordinator.prewarmPage(
+          parishId: widget.parishId,
+          userId: widget.userId,
+          pagePath: path,
+        ),
+      );
       _capture();
       // Capture again after typical async DOM updates; navigation cancels this.
       // Cancel any earlier one first: only the LAST reference is cancelled
