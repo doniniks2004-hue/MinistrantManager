@@ -528,7 +528,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     _navigationDeadline?.cancel();
     _navigationDeadline = null;
     if (wasOpeningACopy) {
-      widget.coordinator.trace('offline-render: deadline expired; attempt=');
+      widget.coordinator.trace('offline-render: deadline expired; retry=$_offlineAutoRetries');
     }
     if (wasOpeningACopy && _retryOfflineOnce()) return;
     setState(() {
