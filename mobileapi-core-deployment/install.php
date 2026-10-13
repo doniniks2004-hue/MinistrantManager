@@ -162,6 +162,11 @@ $protect = [
     'public_html/public/mobile_handoff.php',
     'public_html/config/mobile_internal_api_secret.php',
     'public_html/.htaccess',
+    'public_html/mm-mobile-bootstrap.php',
+    'public_html/mm-mobile-config.php',
+    'public_html/mm-mobile-session-login.php',
+    'public_html/mm-mobile-session-change-password.php',
+    'public_html/mm-mobile-webview-handoff.php',
 ];
 foreach ($profile['legacy_backup_files'] ?? [] as $legacyRel) {
     $protect[] = 'public_html/' . ltrim($legacyRel, '/');
@@ -228,14 +233,13 @@ chmod($secretPath, 0600);
 $htaccess = $publicRoot . '/.htaccess';
 $snippet = file_get_contents($packageRoot . '/public_html-additions/htaccess-snippet.txt');
 $currentHt = is_file($htaccess) ? (file_get_contents($htaccess) ?: '') : '';
-$marker = '# BEGIN MINISTRANT MANAGER MOBILEAPI';
-if (!str_contains($currentHt, $marker)) {
-    // MobileAPI routes MUST be evaluated before any legacy catch-all/front
-    // controller rules already present in the parish .htaccess. Appending
-    // them at the end lets an earlier [L] rule swallow /api/v1/mobile/*
-    // and can surface as an unrelated 500 from the legacy router.
-    $mobileBlock = $marker . "\n" . trim((string)$snippet) . "\n# END MINISTRANT MANAGER MOBILEAPI\n\n";
-    file_put_contents($htaccess, $mobileBlock . ltrim($currentHt));
+require_once $packageRoot . '/scripts/routing_config.php';
+foreach (['bootstrap', 'config', 'session-login', 'session-change-password', 'webview-handoff'] as $endpoint) {
+    $proxy = 'mm-mobile-' . $endpoint . '.php';
+    if (!copy($packageRoot . '/public_html-additions/' . $proxy, $publicRoot . '/' . $proxy)) fail('Cannot write MobileAPI proxy.');
+}
+if (file_put_contents($htaccess, canonicalMobileRouting($currentHt, (string)$snippet)) === false) {
+    fail('Cannot write MobileAPI routing.');
 }
 
 copy($packageRoot . '/scripts/preflight.php', $targetRoot . '/preflight.php');

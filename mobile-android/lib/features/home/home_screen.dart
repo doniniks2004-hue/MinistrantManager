@@ -1,33 +1,60 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+
 import '../../core/util/store_link_launcher.dart';
 import '../../core/database/app_database.dart';
-import '../../core/network/api_client.dart';
 import '../../core/sync/sync_engine.dart';
 import '../auth/login_screen.dart';
 import '../auth/user_session_service.dart';
 import '../config/config_service.dart';
+import '../device_settings/device_settings_screen.dart';
 import '../../core/offline/offline_page_coordinator.dart';
-import '../dashboard/dashboard_screen.dart';
-import '../dashboard/module_descriptor.dart';
+import '../../core/util/startup_trace.dart';
 import '../revocation/revocation_handler.dart';
+import '../webview/offline_aware_page_screen.dart';
+
+/// How long the LOCAL start-up reads (keystore, database open) may take. They
+/// normally take milliseconds; one that never answers used to leave the
+/// screen on its spinner for good, because the start-up timeout in main.dart
+/// ends before this screen's own first reads begin. Past this limit the
+/// existing "could not read app data" screen, with its retry, is shown.
+const _localReadLimit = Duration(seconds: 10);
 
 /// Spec §26–§28: renders instantly from SQLite, shows an OFFLINE banner
 /// with the timestamp of the last known-good sync when relevant, and
 /// updates reactively once the background sync completes.
 ///
 /// Hybrid dashboard milestone: this screen owns the DEVICE-level
-/// lifecycle (status/heartbeat/revoke/offline-lease, maintenance/update-
-/// required — all unchanged) AND the USER-level lifecycle on top of it:
-/// once the device is confirmed active/offline-ok, it checks whether a
-/// `mobile_user_token` exists (UserSessionService) and shows LoginScreen
-/// if not, or DashboardScreen if so — the dashboard, not a single fixed
-/// screen, is the top-level post-login content now; individual modules
-/// (native or WebView) are reached BY NAVIGATING FROM the dashboard.
+/// Owns device/user lifecycle and, after login, opens the real legacy PHP
+/// dashboard through the offline-aware WebView. The PHP page is the
+/// single source of truth for the post-login UI; native Flutter UI is
+/// intentionally limited to activation, login, device state and the
+/// single allowed offline-status banner.
+/// Whether the page screen must show saved copies ONLY, whatever the network.
+///
+/// Only states in which live data must not be shown force it. Crucially
+/// [DeviceAuthState.offlineWithinLease] does not: it is what the screen holds
+/// from the first frame (taken from local state) until the server has
+/// answered the device check, and also when that check could not be made.
+/// Treating it as "offline" made EVERY cold start begin on a saved copy (or
+/// on "no saved copy" on a first run) and stay there until the check —
+/// which can take 10 s to connect and another 15–20 s to answer — finished,
+/// and then reload the page: a long start and an OFFLINE label with a
+/// working network. Trying the live page is itself the authorization: the
+/// handoff is refused (401/403) for a device the server no longer accepts,
+/// and the device check runs in parallel and wipes a revoked one. If the
+/// server cannot be reached the screen falls back to the saved copy and
+/// keeps trying, exactly as it would after a confirmed `active`.
+@visibleForTesting
+bool forceOfflineFor(DeviceAuthState? state) =>
+    !(state == DeviceAuthState.active ||
+        state == DeviceAuthState.offlineWithinLease);
+
 class HomeScreen extends StatefulWidget {
   const HomeScreen({
     super.key,
     required this.db,
-    required this.api,
     required this.syncEngine,
     required this.configService,
     required this.revocationHandler,
@@ -39,7 +66,6 @@ class HomeScreen extends StatefulWidget {
   });
 
   final AppDatabase db;
-  final ApiClient api;
   final SyncEngine syncEngine;
   final ConfigService configService;
   final RevocationHandler revocationHandler;
@@ -68,22 +94,128 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   DeviceAuthState? _authState;
   String? _minimumSupportedAppVersion;
-  DateTime? _lastSyncAt;
-  bool _lastSyncFailed = false;
   Map<String, dynamic>? _clientConfig;
   bool? _hasUserSession; // null while checking
-  List<ModuleDescriptor>? _modules;
-  int? _userRoleId;
+  int? _userId;
+  String? _parishId;
+  String? _serverUrl;
+
+  /// True once the identifiers above have been read from local storage for
+  /// the CURRENT session (reset when a login completes, since the values
+  /// from before it no longer apply). Separates "still being read" — a
+  /// spinner is right — from "read, and something is missing" — which is an
+  /// error the user must be able to act on, not a spinner.
+  bool _identityRead = false;
+
+  /// The very first local read failed, so nothing is known about this
+  /// device's state. There is no cached state to fall back on; without this
+  /// flag the screen stayed on its first-frame spinner indefinitely.
+  bool _stateLoadFailed = false;
+  bool _syncInProgress = false;
+  int _sessionGeneration = 0;
+  Timer? _leaseTimer;
+
+  Future<void> _openDeviceSettings() async {
+    final slug = await widget.userSessionService.secureStorage.parishSlug;
+    if (!mounted) return;
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+          builder: (_) => DeviceSettingsScreen(
+                revocationHandler: widget.revocationHandler,
+                parishSlug: slug,
+                onParishReset: () {
+                  _sessionGeneration++;
+                  Navigator.of(context).popUntil((route) => route.isFirst);
+                  widget.onRevoked();
+                },
+              )),
+    );
+  }
+
+  /// A state the user can act on, instead of a spinner that never ends.
+  /// The app bar keeps the device-settings entry (including "change
+  /// parish"), the one way out when the stored device data itself is bad.
+  Scaffold _problemScaffold({
+    required String message,
+    bool showLogout = false,
+  }) =>
+      Scaffold(
+        appBar: _deviceSettingsBar(),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.error_outline, size: 48, color: Colors.red),
+                const SizedBox(height: 16),
+                Text(message, textAlign: TextAlign.center),
+                const SizedBox(height: 20),
+                FilledButton(
+                  onPressed: _bootstrapThenSync,
+                  child: const Text('SPRÓBUJ PONOWNIE'),
+                ),
+                if (showLogout) ...[
+                  const SizedBox(height: 8),
+                  OutlinedButton(
+                    onPressed: _onLogout,
+                    child: const Text('WYLOGUJ'),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      );
+
+  AppBar _deviceSettingsBar() => AppBar(
+        title: const Text('Ministrant Manager'),
+        actions: [
+          IconButton(
+            tooltip: 'Urządzenie / Parafia',
+            onPressed: _openDeviceSettings,
+            icon: const Icon(Icons.settings_outlined),
+          )
+        ],
+      );
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _bootstrapThenSync();
+    _leaseTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => _checkLocalLease(),
+    );
+  }
+
+  Future<void> _checkLocalLease() async {
+    bool allowsData() =>
+        _authState == DeviceAuthState.active ||
+        _authState == DeviceAuthState.offlineWithinLease;
+    if (!allowsData()) return;
+    final generation = _sessionGeneration;
+    try {
+      final meta = await widget.db.ensureSyncMetadata();
+      if (!mounted || generation != _sessionGeneration || !allowsData()) return;
+      if (!widget.syncEngine.offlineLease.isWithinLease(
+        meta.lastAuthorizationCheck,
+        leaseHours: meta.offlineLeaseHours,
+      )) {
+        widget.offlinePageCoordinator.localServer.rootDirectory = null;
+        setState(() => _authState = DeviceAuthState.offlineLeaseExpired);
+        unawaited(_bootstrapThenSync());
+      }
+    } catch (_) {
+      // A reset may close the previous database while this check is pending.
+    }
   }
 
   @override
   void dispose() {
+    _sessionGeneration++;
+    _leaseTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -97,18 +229,141 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  /// The signed-in user's identifiers, read from the keystore. The reads are
+  /// independent, so they run together instead of one after another (five
+  /// sequential keystore round-trips stood between launch and the first
+  /// screen); nothing is read for a user who is not signed in.
+  Future<({bool hasUserSession, int? userId, String? parishId, String? serverUrl})>
+  _readIdentity() async {
+    final hasSession =
+        await widget.userSessionService.secureStorage.hasUserSession;
+    if (!hasSession) {
+      return (hasUserSession: false, userId: null, parishId: null, serverUrl: null);
+    }
+    final ids = await _readIdentityValues();
+    return (
+      hasUserSession: true,
+      userId: ids.userId,
+      parishId: ids.parishId,
+      serverUrl: ids.serverUrl,
+    );
+  }
+
+  Future<({int? userId, String? parishId, String? serverUrl})>
+  _readIdentityValues() async {
+    final storage = widget.userSessionService.secureStorage;
+    final values = await Future.wait<Object?>([
+      storage.currentUserId,
+      storage.parishId,
+      storage.serverUrl,
+    ]);
+    return (
+      userId: values[0] as int?,
+      parishId: values[1] as String?,
+      serverUrl: values[2] as String?,
+    );
+  }
+
+  /// Always assigned together, and always from storage: marks the
+  /// identifiers as read so the build can tell "missing" from "loading".
+  void _applyIdentity({
+    required bool hasUserSession,
+    int? userId,
+    String? parishId,
+    String? serverUrl,
+  }) {
+    _hasUserSession = hasUserSession;
+    _userId = userId;
+    _parishId = parishId;
+    _serverUrl = serverUrl;
+    _identityRead = true;
+    StartupTrace.mark('identity_read');
+  }
+
+  /// The host of the stored server URL, or null if there is no URL or it has
+  /// no host. `Uri.parse(url).host` on a malformed value used to throw
+  /// inside build().
+  String? get _serverHost {
+    final url = _serverUrl;
+    if (url == null) return null;
+    final host = Uri.tryParse(url)?.host;
+    return (host == null || host.isEmpty) ? null : host;
+  }
+
   Future<void> _bootstrapThenSync() async {
+    if (_syncInProgress) return;
+    _syncInProgress = true;
+    final generation = _sessionGeneration;
+    if (_stateLoadFailed && mounted) {
+      setState(() => _stateLoadFailed = false);
+    }
+    try {
+      await _refreshState(generation);
+    } catch (_) {
+      // Preserve the locally validated lease state on malformed responses.
+      // But if nothing has been established locally yet there is no state
+      // to preserve, and silently returning leaves the spinner up forever.
+      if (mounted &&
+          generation == _sessionGeneration &&
+          _hasUserSession == null) {
+        setState(() => _stateLoadFailed = true);
+      }
+    } finally {
+      _syncInProgress = false;
+      if (mounted && generation != _sessionGeneration)
+        unawaited(_bootstrapThenSync());
+    }
+  }
+
+  Future<void> _refreshState(int generation) async {
     // Client-config (global: store URLs, maintenance mode) is checked
     // unconditionally and first — it has no activation dependency and
     // must be available even to a screen that's about to show a blocking
     // UPDATE_REQUIRED/maintenance state.
-    final clientConfig = await widget.configService.loadClientConfig();
+    // OFFLINE-FIRST: establish the local UI state before ANY network request.
+    // The keystore reads and the database open are independent: start both,
+    // then wait for both. (`ignore` so that if one fails before the other is
+    // awaited, the second one's error is not reported as unhandled; the
+    // awaits below still throw it.)
+    final identityRead = _readIdentity().timeout(_localReadLimit)..ignore();
+    final metaRead =
+        widget.db.ensureSyncMetadata().timeout(_localReadLimit)..ignore();
+    final localIdentity = await identityRead;
+    final localMeta = await metaRead;
+    final localHasUserSession = localIdentity.hasUserSession;
+    final localUserId = localIdentity.userId;
+    final localParishId = localIdentity.parishId;
+    final localServerUrl = localIdentity.serverUrl;
+    final localWithinLease = widget.syncEngine.offlineLease.isWithinLease(
+      localMeta.lastAuthorizationCheck,
+      leaseHours: localMeta.offlineLeaseHours,
+    );
+
+    if (!mounted || generation != _sessionGeneration) return;
+    setState(() {
+      _authState = localWithinLease
+          ? DeviceAuthState.offlineWithinLease
+          : DeviceAuthState.offlineLeaseExpired;
+      _applyIdentity(
+        hasUserSession: localHasUserSession,
+        userId: localUserId,
+        parishId: localParishId,
+        serverUrl: localServerUrl,
+      );
+    });
+
+    // Global config and device authorization are independent; a config timeout
+    // must not postpone a confirmed revocation or opening the online page.
+    final configFuture = widget.configService.loadClientConfig().catchError(
+          (_) => null,
+        );
 
     final status = await widget.syncEngine.checkDeviceStatus(
       appVersion: widget.appVersion,
       osVersion: widget.osVersion,
     );
 
+    if (!mounted || generation != _sessionGeneration) return;
     if (status == null) {
       // Not activated — shouldn't normally reach HomeScreen in this state.
       return;
@@ -117,10 +372,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() {
       _authState = status.state;
       _minimumSupportedAppVersion = status.minimumSupportedAppVersion;
-      _clientConfig = clientConfig;
     });
 
-    if (status.state == DeviceAuthState.revoked || status.state == DeviceAuthState.parishDisabled) {
+    if (status.state != DeviceAuthState.active &&
+        status.state != DeviceAuthState.offlineWithinLease) {
+      widget.offlinePageCoordinator.localServer.rootDirectory = null;
+    }
+    if (status.state == DeviceAuthState.revoked ||
+        status.state == DeviceAuthState.parishDisabled) {
       await widget.revocationHandler.handle(status.state);
       widget.onRevoked();
       return;
@@ -146,70 +405,97 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // Is a USER actually signed in on this device? Checked regardless of
     // online/offline device state (offlineWithinLease still shows the
     // login screen if no one's signed in yet).
-    final hasUserSession = await widget.userSessionService.secureStorage.hasUserSession;
+    final earlyIdentity = await _readIdentity().timeout(_localReadLimit);
+    final hasUserSession = earlyIdentity.hasUserSession;
+    final earlyUserId = earlyIdentity.userId;
+    final earlyParishId = earlyIdentity.parishId;
+    final earlyServerUrl = earlyIdentity.serverUrl;
+    if (!mounted || generation != _sessionGeneration) return;
+    setState(() {
+      _applyIdentity(
+        hasUserSession: hasUserSession,
+        userId: earlyUserId,
+        parishId: earlyParishId,
+        serverUrl: earlyServerUrl,
+      );
+    });
+    unawaited(
+      configFuture.then((config) {
+        if (mounted && generation == _sessionGeneration)
+          setState(() => _clientConfig = config);
+      }),
+    );
 
     if (status.state == DeviceAuthState.active && hasUserSession) {
       try {
         await widget.syncEngine.runFullSync();
-        await widget.syncEngine.heartbeat(appVersion: widget.appVersion, osVersion: widget.osVersion);
-        _lastSyncFailed = false;
+        await widget.syncEngine.heartbeat(
+          appVersion: widget.appVersion,
+          osVersion: widget.osVersion,
+        );
+        // Online sync succeeded; the PHP dashboard below remains the single source of truth for the UI.
       } on ParishSessionExpiredException {
         // Review round point 4: the PARISH rejected the mobile_user_token
         // — a USER session problem, never a device problem. Clear ONLY
         // the user session and fall through to the login screen; device
         // activation is completely untouched.
+        if (!mounted || generation != _sessionGeneration) return;
         await widget.userSessionService.handleParishSessionExpired();
-        setState(() {
-          _hasUserSession = false;
-        });
+        if (mounted && generation == _sessionGeneration)
+          setState(() {
+            _hasUserSession = false;
+          });
         return;
-      } on ParishContractErrorException catch (e) {
+      } on ParishContractErrorException {
         // Review round fix, point 2: a genuine CONTRACT error
         // (400/403/422 — e.g. the real missing-X-Installation-Id bug)
         // must NEVER be swallowed as a plain network hiccup — that would
         // silently render an empty dashboard/module as if the user
         // genuinely had no data, while the sync in fact never even ran.
-        debugPrint('Parish contract error during sync: $e');
-        _lastSyncFailed = true;
+        // The PHP page remains available; no internal response is logged.
+        // Keep the authenticated PHP dashboard as the UI source of truth even if background sync fails.
       } catch (_) {
         // Genuine transport failure / timeout / 5xx — cached data on
         // screen is still valid, no visible error needed (spec §26).
       }
     }
 
-    // Hybrid dashboard milestone: the module list itself also survives
-    // offline (ConfigService's own cache-fallback) — a fresh install with
-    // no cache yet and no connectivity is the only case with nothing to
-    // show, same as any other config-dependent screen.
-    List<ModuleDescriptor>? modules;
-    int? roleId;
-    if (hasUserSession) {
-      final rawModules = await widget.configService.loadModules();
-      modules = rawModules != null ? ModuleDescriptor.parseList(rawModules) : null;
-      roleId = await widget.userSessionService.secureStorage.currentUserRoleId;
-    }
+    final finalIds = hasUserSession
+        ? await _readIdentityValues().timeout(_localReadLimit)
+        : (userId: null, parishId: null, serverUrl: null);
+    final userId = finalIds.userId;
+    final parishId = finalIds.parishId;
+    final serverUrl = finalIds.serverUrl;
 
-    final meta = await widget.db.ensureSyncMetadata();
+    if (!mounted || generation != _sessionGeneration) return;
     setState(() {
-      _lastSyncAt = meta.lastSyncAt;
-      _hasUserSession = hasUserSession;
-      _modules = modules;
-      _userRoleId = roleId;
+      _applyIdentity(
+        hasUserSession: hasUserSession,
+        userId: userId,
+        parishId: parishId,
+        serverUrl: serverUrl,
+      );
     });
-  }
-
-  void _onLoggedIn() {
-    setState(() => _hasUserSession = true);
-    _bootstrapThenSync();
   }
 
   Future<void> _onLogout() async {
+    _sessionGeneration++;
+    widget.offlinePageCoordinator.localServer.rootDirectory = null;
     await widget.userSessionService.logout();
+    if (mounted)
+      setState(() {
+        _hasUserSession = false;
+        _userId = null;
+      });
+  }
+
+  void _onLoggedIn() {
+    _sessionGeneration++;
     setState(() {
-      _hasUserSession = false;
-      _modules = null;
-      _userRoleId = null;
+      _hasUserSession = true;
+      _identityRead = false;
     });
+    _bootstrapThenSync();
   }
 
   Future<void> _openStoreListing() async {
@@ -226,18 +512,30 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(24),
-            child: Column(mainAxisSize: MainAxisSize.min, children: [
-              const Icon(Icons.build_circle_outlined, size: 48, color: Colors.orange),
-              const SizedBox(height: 16),
-              Text(
-                (_clientConfig?['maintenance_message'] as String?)?.isNotEmpty == true
-                    ? _clientConfig!['maintenance_message'] as String
-                    : 'Ministrant Manager jest chwilowo w trybie konserwacji.',
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 20),
-              FilledButton(onPressed: _bootstrapThenSync, child: const Text('SPRÓBUJ PONOWNIE')),
-            ]),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.build_circle_outlined,
+                  size: 48,
+                  color: Colors.orange,
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  (_clientConfig?['maintenance_message'] as String?)
+                              ?.isNotEmpty ==
+                          true
+                      ? _clientConfig!['maintenance_message'] as String
+                      : 'Ministrant Manager jest chwilowo w trybie konserwacji.',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 20),
+                FilledButton(
+                  onPressed: _bootstrapThenSync,
+                  child: const Text('SPRÓBUJ PONOWNIE'),
+                ),
+              ],
+            ),
           ),
         ),
       );
@@ -246,32 +544,40 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (_authState == DeviceAuthState.updateRequired) {
       final hasStoreUrl = Theme.of(context).platform == TargetPlatform.iOS
           ? (_clientConfig?['ios_store_url'] as String?)?.isNotEmpty == true
-          : (_clientConfig?['android_store_url'] as String?)?.isNotEmpty == true;
+          : (_clientConfig?['android_store_url'] as String?)?.isNotEmpty ==
+              true;
 
       return Scaffold(
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(24),
-            child: Column(mainAxisSize: MainAxisSize.min, children: [
-              const Icon(Icons.system_update, size: 48, color: Colors.orange),
-              const SizedBox(height: 16),
-              const Text(
-                'Dostępna jest wymagana aktualizacja Ministrant Manager.',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                'Aby kontynuować, zaktualizuj aplikację'
-                '${_minimumSupportedAppVersion != null ? " do wersji ${_minimumSupportedAppVersion!} lub nowszej" : ""}.',
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 20),
-              FilledButton(
-                onPressed: hasStoreUrl ? _openStoreListing : null,
-                child: Text(hasStoreUrl ? 'AKTUALIZUJ' : 'Aktualizacja wkrótce dostępna'),
-              ),
-            ]),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.system_update, size: 48, color: Colors.orange),
+                const SizedBox(height: 16),
+                const Text(
+                  'Dostępna jest wymagana aktualizacja Ministrant Manager.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Aby kontynuować, zaktualizuj aplikację'
+                  '${_minimumSupportedAppVersion != null ? " do wersji ${_minimumSupportedAppVersion!} lub nowszej" : ""}.',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 20),
+                FilledButton(
+                  onPressed: hasStoreUrl ? _openStoreListing : null,
+                  child: Text(
+                    hasStoreUrl
+                        ? 'AKTUALIZUJ'
+                        : 'Aktualizacja wkrótce dostępna',
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       );
@@ -279,19 +585,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (_authState == DeviceAuthState.authError) {
       return Scaffold(
+        appBar: _deviceSettingsBar(),
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(24),
-            child: Column(mainAxisSize: MainAxisSize.min, children: [
-              const Icon(Icons.lock_outline, size: 48, color: Colors.red),
-              const SizedBox(height: 16),
-              const Text(
-                'Nie udało się potwierdzić autoryzacji tego urządzenia.\nSpróbuj ponownie za chwilę.',
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 20),
-              FilledButton(onPressed: _bootstrapThenSync, child: const Text('SPRÓBUJ PONOWNIE')),
-            ]),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.lock_outline, size: 48, color: Colors.red),
+                const SizedBox(height: 16),
+                const Text(
+                  'Nie udało się potwierdzić autoryzacji tego urządzenia.\nSpróbuj ponownie za chwilę.',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 20),
+                FilledButton(
+                  onPressed: _bootstrapThenSync,
+                  child: const Text('SPRÓBUJ PONOWNIE'),
+                ),
+              ],
+            ),
           ),
         ),
       );
@@ -301,21 +614,35 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (isOfflineExpired) {
       return Scaffold(
+        appBar: _deviceSettingsBar(),
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(24),
-            child: Column(mainAxisSize: MainAxisSize.min, children: [
-              const Icon(Icons.wifi_off, size: 48, color: Colors.grey),
-              const SizedBox(height: 16),
-              const Text(
-                'Dostęp do danych wymaga ponownego połączenia\nz serwerem Ministrant Manager.',
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 20),
-              FilledButton(onPressed: _bootstrapThenSync, child: const Text('SPRÓBUJ PONOWNIE')),
-            ]),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.wifi_off, size: 48, color: Colors.grey),
+                const SizedBox(height: 16),
+                const Text(
+                  'Dostęp do danych wymaga ponownego połączenia\nz serwerem Ministrant Manager.',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 20),
+                FilledButton(
+                  onPressed: _bootstrapThenSync,
+                  child: const Text('SPRÓBUJ PONOWNIE'),
+                ),
+              ],
+            ),
           ),
         ),
+      );
+    }
+
+    if (_stateLoadFailed) {
+      return _problemScaffold(
+        message:
+            'Nie udało się odczytać danych aplikacji z urządzenia.\nSpróbuj ponownie.',
       );
     }
 
@@ -327,37 +654,40 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     if (_hasUserSession == false) {
-      return LoginScreen(userSessionService: widget.userSessionService, onLoggedIn: _onLoggedIn);
+      return LoginScreen(
+        userSessionService: widget.userSessionService,
+        onLoggedIn: _onLoggedIn,
+        onOpenDeviceSettings: _openDeviceSettings,
+      );
     }
 
-    if (_modules == null) {
-      // Logged in, but the module list hasn't resolved yet (first frame,
-      // or genuinely offline with no cache at all yet).
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    final host = _serverHost;
+    if (_userId == null || _parishId == null || host == null) {
+      // Still being read: a spinner is right. Already read and something
+      // is missing or unusable: it will not fix itself, so say so and
+      // offer the ways out instead of spinning forever.
+      if (!_identityRead) {
+        return const Scaffold(
+          body: Center(child: CircularProgressIndicator()),
+        );
+      }
+      return _problemScaffold(
+        message:
+            'Brakuje danych potrzebnych do otwarcia strony (parafia lub adres serwera).\nWyloguj się i zaloguj ponownie albo zmień parafię w ustawieniach urządzenia.',
+        showLogout: true,
+      );
     }
 
-    final showOffline = _authState == DeviceAuthState.offlineWithinLease;
-
-    return DashboardScreen(
-      modules: _modules!,
-      userRoleId: _userRoleId,
-      db: widget.db,
-      secureStorage: widget.userSessionService.secureStorage,
-      offlinePageCoordinator: widget.offlinePageCoordinator,
-      appVersion: widget.appVersion,
-      isOnline: !showOffline,
-      syncFailed: _lastSyncFailed,
-      lastSyncAt: _lastSyncAt,
-      onSync: _bootstrapThenSync,
+    return OfflineAwarePageScreen(
+      key: ValueKey('$_parishId:$_userId'),
+      title: 'Ministrant Manager',
+      targetPath: '/public/dashboard.php',
+      allowedHost: host,
+      parishId: _parishId!,
+      userId: _userId!.toString(),
+      coordinator: widget.offlinePageCoordinator,
+      forceOffline: forceOfflineFor(_authState),
       onLogout: _onLogout,
-      revocationHandler: widget.revocationHandler,
-      // Offline-architecture milestone, P9: a manual "Zmień parafię"
-      // completing is, deliberately, handled by the EXACT SAME callback
-      // as a server-reported revocation — both end with the app back at
-      // the activation screen with fresh services, and there is only
-      // ever one correct way to do that rebuild (see main.dart's own
-      // _onRevoked docblock).
-      onParishReset: widget.onRevoked,
     );
   }
 }

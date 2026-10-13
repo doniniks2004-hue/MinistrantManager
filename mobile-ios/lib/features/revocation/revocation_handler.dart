@@ -71,6 +71,33 @@ class RevocationHandler {
   /// tests.
   Future<void> resetParishManually() => _wipeAndDeactivate();
 
+  /// Deletes the saved pages of the current parish AND invalidates the key
+  /// that encrypts them, each attempted on its own: a failure to delete the
+  /// files (a locked directory, a full disk) must never skip destroying the
+  /// key, because a key that is gone makes every surviving file unreadable.
+  /// They used to share one try, so the first failure skipped the second.
+  ///
+  /// Returns whether BOTH steps succeeded. False means the wipe is not
+  /// complete (files may remain, or the key may still exist) and must not be
+  /// reported as a full erase.
+  Future<bool> wipeSnapshotsAndKey() async {
+    var complete = true;
+    try {
+      final parishId = await secureStorage.parishId;
+      if (parishId != null) {
+        await snapshotStore.clearForParish(parishId: parishId);
+      }
+    } catch (_) {
+      complete = false;
+    }
+    try {
+      await secureStorage.deleteSnapshotEncryptionKey();
+    } catch (_) {
+      complete = false;
+    }
+    return complete;
+  }
+
   Future<void> _wipeAndDeactivate() async {
     // Read parishId BEFORE clearActivation() below wipes it — same
     // "can't clear something keyed by a value you've already thrown
@@ -80,25 +107,14 @@ class RevocationHandler {
     // (unencrypted, lower-stakes) offline page cache must never abort
     // the crypto-erase sequence below, which is what actually matters
     // most for a revoked device.
-    try {
-      final parishId = await secureStorage.parishId;
-      if (parishId != null) {
-        await snapshotStore.clearForParish(parishId: parishId);
-      }
-      // Offline-architecture milestone, P8.2 — "REVOKE -> clear
-      // snapshots -> crypto-erase key", the SAME defense-in-depth
-      // reasoning as deleteDbEncryptionKey() just below: even a
-      // leftover/backed-up copy of a snapshot file that somehow
-      // survived clearForParish()'s deletion is permanently unreadable
-      // once the key itself is gone. The key is per-DEVICE, not
-      // per-parish (a device is only ever activated for one parish at a
-      // time), so destroying it on any revocation is always correct —
-      // whatever parish this device is activated for NEXT gets a
-      // genuinely fresh key on first snapshot write.
-      await secureStorage.deleteSnapshotEncryptionKey();
-    } catch (_) {
-      // Best-effort — see this field's own docblock.
-    }
+    //
+    // REVOKE -> clear snapshots -> crypto-erase key: the same defence in
+    // depth as deleteDbEncryptionKey() below. A copy of a snapshot file that
+    // somehow survives the deletion is permanently unreadable once the key
+    // is gone. The key is per DEVICE, not per parish, so destroying it on any
+    // revocation is always right: the next parish gets a fresh one on its
+    // first snapshot write. The two steps are independent (see the method).
+    await wipeSnapshotsAndKey();
 
     // Order matters: rows first (needs a live connection), then the file
     // (needs the connection closed), then the key (only once the file is

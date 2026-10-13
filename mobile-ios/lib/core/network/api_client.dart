@@ -53,9 +53,18 @@ class ApiClient {
     final token = await _secureStorage.mobileUserToken;
     final installationId = await _secureStorage.installationId;
     if (serverUrl == null || token == null || installationId == null) {
-      throw StateError(
-        'Parish API not ready — device not activated (no server_url/installation_id) or no user signed in yet (no mobile_user_token).',
-      );
+      // K12 diagnostic round: names WHICH field is actually missing —
+      // the previous generic message made "not activated" and "not
+      // signed in yet" indistinguishable from each other, which is
+      // exactly the ambiguity being chased right now on a real device
+      // where the symptom (silent fallback to offline) gives no hint on
+      // its own which precondition actually failed.
+      final missing = [
+        if (serverUrl == null) 'server_url',
+        if (token == null) 'mobile_user_token',
+        if (installationId == null) 'installation_id',
+      ].join(', ');
+      throw StateError('Parish API not ready — missing: $missing.');
     }
 
     _parishDio = Dio(BaseOptions(

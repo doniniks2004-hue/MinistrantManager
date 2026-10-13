@@ -33,6 +33,8 @@ function handoff_fail(string $message): never
     exit;
 }
 
+header('Cache-Control: no-store');
+header('Referrer-Policy: no-referrer');
 $ticket = $_GET['ticket'] ?? '';
 if (!is_string($ticket) || $ticket === '') {
     handoff_fail('Brak biletu dostępu.');
@@ -48,7 +50,10 @@ if ($consumed === null) {
 $stmt = $conn->prepare('SELECT id, full_name, role_id, password_changed, is_active FROM users WHERE id = ?');
 $stmt->bind_param('i', $consumed['user_id']);
 $stmt->execute();
-$user = $stmt->get_result()->fetch_assoc();
+$userId = $fullName = $roleId = $passwordChanged = $isActive = null;
+$stmt->bind_result($userId, $fullName, $roleId, $passwordChanged, $isActive);
+$user = $stmt->fetch() ? ['id' => $userId, 'full_name' => $fullName,
+    'role_id' => $roleId, 'password_changed' => $passwordChanged, 'is_active' => $isActive] : null;
 $stmt->close();
 
 if ($user === null || (int) $user['is_active'] !== 1) {
@@ -58,6 +63,9 @@ if ((int) $user['password_changed'] !== 1) {
     handoff_fail('Wymagana jest zmiana hasła w aplikacji.');
 }
 
+if (session_status() !== PHP_SESSION_ACTIVE) session_start();
+// Replace any previous user's PHP session, never inherit it.
+$_SESSION = [];
 // Same session-regeneration pattern as src/auth.php's password login.
 if (session_status() === PHP_SESSION_ACTIVE) {
     $sessionData = $_SESSION;

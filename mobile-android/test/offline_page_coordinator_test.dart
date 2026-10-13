@@ -1,6 +1,8 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:dio/dio.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ministrant_manager/core/network/api_client.dart';
@@ -8,8 +10,10 @@ import 'package:ministrant_manager/core/offline/connectivity_probe.dart';
 import 'package:ministrant_manager/core/offline/local_snapshot_server.dart';
 import 'package:ministrant_manager/core/offline/offline_page_coordinator.dart';
 import 'package:ministrant_manager/core/offline/page_resource_downloader.dart';
+import 'package:ministrant_manager/core/offline/server_reachability.dart';
 import 'package:ministrant_manager/core/offline/snapshot_capture_service.dart';
 import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
+import 'package:ministrant_manager/core/offline/snapshot_manifest.dart';
 import 'package:ministrant_manager/core/offline/snapshot_store.dart';
 import 'package:ministrant_manager/core/secure/secure_storage_service.dart';
 import 'package:ministrant_manager/features/webview/webview_handoff_service.dart';
@@ -20,16 +24,106 @@ import 'package:ministrant_manager/features/webview/webview_handoff_service.dart
 /// finding this fixes). Overrides ONLY requestHandoffUrl(); secureStorage
 /// is still the REAL field OfflinePageCoordinator reads
 /// (handoffService.secureStorage.serverUrl) for its reachability check.
+/// Counts what the coordinator asks the capture service to do.
+class _CountingCapture extends SnapshotCaptureService {
+  _CountingCapture(SnapshotStore store)
+    : super(downloader: PageResourceDownloader(), store: store);
+
+  final htmls = <String>[];
+  Completer<void>? gate;
+  CaptureOutcome outcome = const CaptureOutcome(CaptureStatus.saved);
+
+  @override
+  Future<CaptureOutcome> captureAndSave({
+    required String parishId,
+    required String userId,
+    required Uri serverBaseUrl,
+    required String targetPath,
+    required String renderedHtml,
+    int? expectedGeneration,
+  }) async {
+    htmls.add(renderedHtml);
+    await gate?.future;
+    return outcome;
+  }
+}
+
+/// A server that cannot bind (e.g. no loopback), to prove warmUp never throws.
+class _FailingServer extends LocalSnapshotServer {
+  _FailingServer() : super(encryptor: _testEncryptor);
+
+  @override
+  Future<int> start() => Future<int>.error(const SocketException('no loopback'));
+}
+
 class _FakeHandoffService extends WebviewHandoffService {
-  _FakeHandoffService(SecureStorageService secureStorage) : super(api: ApiClient(secureStorage), secureStorage: secureStorage);
+  _FakeHandoffService(SecureStorageService secureStorage)
+    : super(api: ApiClient(secureStorage), secureStorage: secureStorage);
 
   Uri? handoffUrlToReturn;
   Object? errorToThrow;
+  int calls = 0;
+  bool hang = false;
+
+  /// If set, the request stays pending until this completes.
+  Completer<void>? gate;
+  Duration? lastTimeout;
+  String? lastPath;
 
   @override
-  Future<Uri> requestHandoffUrl(String path) async {
+  Future<Uri> requestHandoffUrl(
+    String path, {
+    Duration timeout = WebviewHandoffService.defaultTimeout,
+  }) async {
+    calls++;
+    lastTimeout = timeout;
+    lastPath = path;
+    if (hang) return Completer<Uri>().future;
+    if (gate != null) await gate!.future;
     if (errorToThrow != null) throw errorToThrow!;
     return handoffUrlToReturn!;
+  }
+}
+
+DioException _httpError(int status, [Object? data]) {
+  final request = RequestOptions(path: '/mobile/webview/handoff');
+  return DioException(
+    requestOptions: request,
+    type: DioExceptionType.badResponse,
+    response: Response<Object?>(
+      requestOptions: request,
+      statusCode: status,
+      data: data,
+    ),
+  );
+}
+
+/// Lets a test hold individual pages' local planning steps open (until
+/// the gate returned by [hold] completes — or forever, if the test never
+/// completes it) while other pages plan normally. Everything else is the
+/// real SnapshotStore.
+class _GatedStore extends SnapshotStore {
+  _GatedStore(Directory root)
+    : super(encryptor: _testEncryptor, rootOverride: root);
+
+  final Map<String, Completer<void>> _gates = {};
+
+  Completer<void> hold(String pagePath) =>
+      _gates[pagePath] = Completer<void>();
+
+  @override
+  Future<SnapshotManifest?> readManifestFor({
+    required String parishId,
+    required String userId,
+    required String pagePath,
+  }) async {
+    final gate = _gates[pagePath];
+    if (gate != null) await gate.future;
+    return super.readManifestFor(
+      parishId: parishId,
+      userId: userId,
+      pagePath: pagePath,
+    );
   }
 }
 
@@ -46,7 +140,9 @@ void main() {
 
     setUp(() async {
       reachableServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
-      reachableUrl = Uri.parse('http://127.0.0.1:${reachableServer.port}/public/dashboard.php');
+      reachableUrl = Uri.parse(
+        'http://127.0.0.1:${reachableServer.port}/public/dashboard.php',
+      );
       reachableServer.listen((request) async {
         await request.response.close();
       });
@@ -62,13 +158,21 @@ void main() {
     });
 
     test('a 404 response still counts as reachable — this checks network reachability, not whether the path exists', () async {
-      final notFoundServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final notFoundServer = await HttpServer.bind(
+        InternetAddress.loopbackIPv4,
+        0,
+      );
       notFoundServer.listen((request) async {
         request.response.statusCode = HttpStatus.notFound;
         await request.response.close();
       });
       final probe = ConnectivityProbe();
-      expect(await probe.canReach(Uri.parse('http://127.0.0.1:${notFoundServer.port}/anything')), isTrue);
+      expect(
+        await probe.canReach(
+          Uri.parse('http://127.0.0.1:${notFoundServer.port}/anything'),
+        ),
+        isTrue,
+      );
       await notFoundServer.close(force: true);
     });
 
@@ -76,58 +180,74 @@ void main() {
       final port = reachableServer.port;
       await reachableServer.close(force: true);
       final probe = ConnectivityProbe();
-      expect(await probe.canReach(Uri.parse('http://127.0.0.1:$port/public/dashboard.php')), isFalse);
+      expect(
+        await probe.canReach(
+          Uri.parse('http://127.0.0.1:$port/public/dashboard.php'),
+        ),
+        isFalse,
+      );
     });
 
     test('a server that never responds within the timeout is treated as unreachable', () async {
-      final hangingServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final hangingServer = await HttpServer.bind(
+        InternetAddress.loopbackIPv4,
+        0,
+      );
       hangingServer.listen((request) {
         // Deliberately never responds — the probe's own timeout must
         // still resolve this to false rather than hanging the caller.
       });
-      final probe = ConnectivityProbe(timeout: const Duration(milliseconds: 200));
-      expect(await probe.canReach(Uri.parse('http://127.0.0.1:${hangingServer.port}/slow')), isFalse);
+      final probe = ConnectivityProbe(
+        timeout: const Duration(milliseconds: 200),
+      );
+      expect(
+        await probe.canReach(
+          Uri.parse('http://127.0.0.1:${hangingServer.port}/slow'),
+        ),
+        isFalse,
+      );
       await hangingServer.close(force: true);
     });
   });
 
   group('OfflinePageCoordinator', () {
-    const secureStorageChannel = MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
+    const secureStorageChannel = MethodChannel(
+      'plugins.it_nomads.com/flutter_secure_storage',
+    );
     final fakeStore = <String, String>{};
 
     setUp(() {
       TestWidgetsFlutterBinding.ensureInitialized();
       fakeStore.clear();
-      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
-        secureStorageChannel,
-        (call) async {
-          final args = call.arguments as Map?;
-          final key = args?['key'] as String?;
-          switch (call.method) {
-            case 'read':
-              return key != null ? fakeStore[key] : null;
-            case 'write':
-              final value = args?['value'] as String?;
-              if (key != null) {
-                if (value == null) {
-                  fakeStore.remove(key);
-                } else {
-                  fakeStore[key] = value;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(secureStorageChannel, (call) async {
+            final args = call.arguments as Map?;
+            final key = args?['key'] as String?;
+            switch (call.method) {
+              case 'read':
+                return key != null ? fakeStore[key] : null;
+              case 'write':
+                final value = args?['value'] as String?;
+                if (key != null) {
+                  if (value == null) {
+                    fakeStore.remove(key);
+                  } else {
+                    fakeStore[key] = value;
+                  }
                 }
-              }
-              return null;
-            case 'delete':
-              if (key != null) fakeStore.remove(key);
-              return null;
-            default:
-              return null;
-          }
-        },
-      );
+                return null;
+              case 'delete':
+                if (key != null) fakeStore.remove(key);
+                return null;
+              default:
+                return null;
+            }
+          });
     });
 
     tearDown(() {
-      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(secureStorageChannel, null);
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(secureStorageChannel, null);
     });
 
     late Directory tempRoot;
@@ -136,10 +256,15 @@ void main() {
     late SnapshotCaptureService captureService;
 
     setUp(() async {
-      tempRoot = await Directory.systemTemp.createTemp('offline_page_coordinator_test_');
+      tempRoot = await Directory.systemTemp.createTemp(
+        'offline_page_coordinator_test_',
+      );
       store = SnapshotStore(encryptor: _testEncryptor, rootOverride: tempRoot);
       localServer = LocalSnapshotServer(encryptor: _testEncryptor);
-      captureService = SnapshotCaptureService(downloader: PageResourceDownloader(), store: store);
+      captureService = SnapshotCaptureService(
+        downloader: PageResourceDownloader(),
+        store: store,
+      );
     });
 
     tearDown(() async {
@@ -149,14 +274,831 @@ void main() {
       }
     });
 
+    test('an offline plan after the app was away: the dead listener is replaced, the URL answers', () async {
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: store,
+        localServer: localServer,
+        handoffService: _FakeHandoffService(SecureStorageService()),
+      );
+      await store.writeSnapshot(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/ranking.php',
+        html: '<html>Ranking</html>',
+        assets: {},
+      );
+      await localServer.start();
+      await localServer.debugKillListenerForTest(); // reclaimed while in the background
+
+      final plan = await coordinator.plan(
+        parishId: 'p',
+        userId: 'u',
+        targetPath: '/public/ranking.php',
+        forceOffline: true,
+      );
+
+      expect(plan, isA<PageLoadOffline>());
+      final url = (plan as PageLoadOffline).url;
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        url.port,
+        timeout: const Duration(seconds: 1),
+      );
+      socket.destroy(); // the plan's address is a live one
+    });
+
+    test('warmUp starts the loopback server once, however many callers and however early', () async {
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: store,
+        localServer: localServer,
+        handoffService: _FakeHandoffService(SecureStorageService()),
+      );
+      expect(localServer.isRunning, isFalse);
+      await Future.wait([coordinator.warmUp(), coordinator.warmUp(), coordinator.warmUp()]);
+      expect(localServer.isRunning, isTrue);
+      final port = localServer.port;
+
+      await store.writeSnapshot(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/ranking.php',
+        html: '<html>Ranking</html>',
+        assets: {},
+      );
+      final plan = await coordinator.plan(
+        parishId: 'p',
+        userId: 'u',
+        targetPath: '/public/ranking.php',
+        forceOffline: true,
+      );
+      expect(plan, isA<PageLoadOffline>());
+      expect(localServer.port, port, reason: 'the plan reuses the warmed server');
+      expect((plan as PageLoadOffline).url.port, port);
+    });
+
+    test('a failing warmUp never throws: the plan reports a real failure where it can be handled', () async {
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: store,
+        localServer: _FailingServer(),
+        handoffService: _FakeHandoffService(SecureStorageService()),
+      );
+      await coordinator.warmUp(); // completes normally
+    });
+
+    test('checkReachability asks the injected check about the given host', () async {
+      String? asked;
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: store,
+        localServer: localServer,
+        handoffService: _FakeHandoffService(SecureStorageService()),
+        reachability: ServerReachability(
+          connect: (host, port, {timeout}) {
+            asked = '$host:$port';
+            return Future<Socket>.error(
+              SocketException('x', osError: OSError('Network is unreachable', 101)),
+            );
+          },
+        ),
+      );
+      expect(await coordinator.checkReachability('szarlej.ministrant.eu'), Reachability.noRoute);
+      expect(asked, 'szarlej.ministrant.eu:443');
+    });
+
+    test('known offline never makes a handoff request', () async {
+      final handoff = _FakeHandoffService(SecureStorageService())..hang = true;
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: store,
+        localServer: localServer,
+        handoffService: handoff,
+      );
+      await store.writeSnapshot(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/ranking.php',
+        html: '<html>Ranking</html>',
+        assets: {},
+      );
+      final plan = await coordinator.plan(
+        parishId: 'p',
+        userId: 'u',
+        targetPath: '/public/ranking.php',
+        forceOffline: true,
+      );
+      expect(plan, isA<PageLoadOffline>());
+      expect(handoff.calls, 0);
+    });
+
+    test('a blackholed handoff has a total deadline', () async {
+      final handoff = _FakeHandoffService(SecureStorageService())..hang = true;
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: store,
+        localServer: localServer,
+        handoffService: handoff,
+        onlineTimeout: const Duration(milliseconds: 100),
+      );
+      final clock = Stopwatch()..start();
+      final plan = await coordinator.plan(
+        parishId: 'p',
+        userId: 'u',
+        targetPath: '/public/dashboard.php',
+      );
+      expect(plan, isA<PageLoadOfflineNoSnapshot>());
+      expect(clock.elapsedMilliseconds, lessThan(500));
+      expect(handoff.calls, 1);
+    });
+
+    test('a stuck local planning step has its own deadline', () async {
+      final gated = _GatedStore(tempRoot)..hold('/public/dashboard.php');
+      final handoff = _FakeHandoffService(SecureStorageService())
+        ..errorToThrow = Exception('down');
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: gated,
+        localServer: localServer,
+        handoffService: handoff,
+        offlinePlanTimeout: const Duration(milliseconds: 100),
+      );
+      final clock = Stopwatch()..start();
+      final plan = await coordinator.plan(
+        parishId: 'p',
+        userId: 'u',
+        targetPath: '/public/dashboard.php',
+      );
+      expect(plan, isA<PageLoadOfflineNoSnapshot>());
+      expect(clock.elapsedMilliseconds, lessThan(1000));
+    });
+
+    test('a superseded local plan never repoints the shared server', () async {
+      final gated = _GatedStore(tempRoot);
+      await gated.writeSnapshot(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/dashboard.php',
+        html: '<html>Dashboard</html>',
+        assets: {},
+      );
+      await gated.writeSnapshot(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/ranking.php',
+        html: '<html>Ranking</html>',
+        assets: {},
+      );
+      final dashboardGate = gated.hold('/public/dashboard.php');
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: gated,
+        localServer: localServer,
+        handoffService: _FakeHandoffService(SecureStorageService()),
+      );
+
+      // The dashboard plan is held open at the gate; a NEWER plan for
+      // another page runs to completion first.
+      final slow = coordinator.plan(
+        parishId: 'p',
+        userId: 'u',
+        targetPath: '/public/dashboard.php',
+        forceOffline: true,
+      );
+      final fast = await coordinator.plan(
+        parishId: 'p',
+        userId: 'u',
+        targetPath: '/public/ranking.php',
+        forceOffline: true,
+      );
+      expect(fast, isA<PageLoadOffline>());
+      final rankingDir = await gated.getPageDirectoryIfReady(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/ranking.php',
+      );
+      expect(localServer.rootDirectory?.path, rankingDir!.path);
+
+      dashboardGate.complete();
+      final late = await slow;
+      expect(late, isA<PageLoadOfflineNoSnapshot>());
+      expect(
+        localServer.rootDirectory?.path,
+        rankingDir.path,
+        reason: 'the older, slower plan must not repoint the server',
+      );
+    });
+
+    test(
+      'an EXPIRED local plan never repoints the shared server when it finally finishes',
+      () async {
+        final gated = _GatedStore(tempRoot);
+        await gated.writeSnapshot(
+          parishId: 'p',
+          userId: 'u',
+          pagePath: '/public/dashboard.php',
+          html: '<html>Dashboard</html>',
+          assets: {},
+        );
+        final gate = gated.hold('/public/dashboard.php');
+        final coordinator = OfflinePageCoordinator(
+          connectivityProbe: ConnectivityProbe(),
+          captureService: captureService,
+          snapshotStore: gated,
+          localServer: localServer,
+          handoffService: _FakeHandoffService(SecureStorageService()),
+          offlinePlanTimeout: const Duration(milliseconds: 100),
+        );
+
+        // No newer plan is ever started: only the plan's OWN deadline
+        // can be what stops it. Future.timeout alone would not.
+        final plan = await coordinator.plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/dashboard.php',
+          forceOffline: true,
+        );
+        expect(plan, isA<PageLoadOfflineNoSnapshot>());
+        expect(localServer.rootDirectory, isNull);
+
+        gate.complete(); // the expired read now completes
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+
+        expect(
+          localServer.rootDirectory,
+          isNull,
+          reason: 'an expired plan must not repoint the server afterwards',
+        );
+        expect(localServer.isRunning, isFalse);
+      },
+    );
+
+    test(
+      "one plan's timeout never invalidates a NEWER plan that is still healthy",
+      () async {
+        final gated = _GatedStore(tempRoot);
+        for (final path in ['/public/dashboard.php', '/public/ranking.php']) {
+          await gated.writeSnapshot(
+            parishId: 'p',
+            userId: 'u',
+            pagePath: path,
+            html: '<html>$path</html>',
+            assets: {},
+          );
+        }
+        final dashboardGate = gated.hold('/public/dashboard.php');
+        final rankingGate = gated.hold('/public/ranking.php');
+        final coordinator = OfflinePageCoordinator(
+          connectivityProbe: ConnectivityProbe(),
+          captureService: captureService,
+          snapshotStore: gated,
+          localServer: localServer,
+          handoffService: _FakeHandoffService(SecureStorageService()),
+          offlinePlanTimeout: const Duration(milliseconds: 600),
+        );
+
+        // t=0: older plan A starts and will expire at t=600.
+        final planA = coordinator.plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/dashboard.php',
+          forceOffline: true,
+        );
+        // t=200: NEWER plan B starts; its own deadline is t=800.
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+        final planB = coordinator.plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/ranking.php',
+          forceOffline: true,
+        );
+        // t=700: A has expired, B has not. Release B.
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        expect(await planA, isA<PageLoadOfflineNoSnapshot>());
+        rankingGate.complete();
+
+        expect(
+          await planB,
+          isA<PageLoadOffline>(),
+          reason: "A's expiry must not have invalidated B",
+        );
+        final rankingDir = await gated.getPageDirectoryIfReady(
+          parishId: 'p',
+          userId: 'u',
+          pagePath: '/public/ranking.php',
+        );
+        expect(localServer.rootDirectory?.path, rankingDir!.path);
+
+        dashboardGate.complete(); // expired A finally unblocks
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        expect(localServer.rootDirectory?.path, rankingDir.path);
+      },
+    );
+
+    test('each offline plan has its own document URL; the previous one stops being owned', () async {
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: store,
+        localServer: localServer,
+        handoffService: _FakeHandoffService(SecureStorageService()),
+      );
+      await store.writeSnapshot(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/ranking.php',
+        html: '<html>Ranking</html>',
+        assets: {},
+      );
+      Future<PageLoadOffline> planOffline() async =>
+          await coordinator.plan(
+                parishId: 'p',
+                userId: 'u',
+                targetPath: '/public/ranking.php',
+                forceOffline: true,
+              )
+              as PageLoadOffline;
+
+      final first = await planOffline();
+      final second = await planOffline();
+
+      // OfflineAwarePageScreen tells a retry's document from the one it
+      // replaced by this: a late callback for the older URL is rejected
+      // by ownsUrl() itself. If the server ever stopped rotating its
+      // token, that separation would silently disappear — hence a test.
+      expect(second.url.path, isNot(first.url.path));
+      expect(localServer.ownsUrl(second.url), isTrue);
+      expect(localServer.ownsUrl(first.url), isFalse);
+
+      final previousHttpOverrides = HttpOverrides.current;
+      HttpOverrides.global = null;
+      try {
+        final client = HttpClient();
+        final response = await (await client.getUrl(second.url)).close();
+        expect(response.statusCode, 200);
+        expect(await utf8.decoder.bind(response).join(), contains('Ranking'));
+        client.close(force: true);
+      } finally {
+        HttpOverrides.global = previousHttpOverrides;
+      }
+    });
+
+    group('a ticket is requested for the entry page, not for the page being opened', () {
+      late _FakeHandoffService handoff;
+      late OfflinePageCoordinator coordinator;
+
+      setUp(() {
+        handoff = _FakeHandoffService(SecureStorageService())
+          ..handoffUrlToReturn = Uri.parse(
+            'https://szarlej.ministrant.eu/public/mobile_handoff.php?ticket=t',
+          );
+        coordinator = OfflinePageCoordinator(
+          connectivityProbe: ConnectivityProbe(),
+          captureService: captureService,
+          snapshotStore: store,
+          localServer: localServer,
+          handoffService: handoff,
+        );
+      });
+
+      test('the server is asked about the entry page; the plan is for the page the user is opening', () async {
+        final plan = await coordinator.plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/schedule.php?month=11',
+          handoffPath: '/public/dashboard.php',
+        );
+
+        // schedule.php is linked from the panel but not in the server's
+        // handoff allowlist; asking for a ticket for it is a 400.
+        expect(handoff.lastPath, '/public/dashboard.php');
+        expect(plan, isA<PageLoadOnline>());
+        expect((plan as PageLoadOnline).targetPath, '/public/schedule.php?month=11');
+      });
+
+      test('without handoffPath the page itself is requested, as before', () async {
+        await coordinator.plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/ranking.php',
+        );
+        expect(handoff.lastPath, '/public/ranking.php');
+      });
+
+      test('an unusable handoffPath falls back to the page itself instead of failing', () async {
+        await coordinator.plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/ranking.php',
+          handoffPath: '/public/login.php',
+        );
+        expect(handoff.lastPath, '/public/ranking.php');
+      });
+
+      test('offline, the copy of the page being opened is used - not the entry page\'s', () async {
+        for (final page in ['/public/dashboard.php', '/public/schedule.php']) {
+          await store.writeSnapshot(
+            parishId: 'p',
+            userId: 'u',
+            pagePath: page,
+            html: '<html>$page</html>',
+            assets: {},
+          );
+        }
+        handoff.errorToThrow = TimeoutException('down');
+
+        final plan = await coordinator.plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/schedule.php',
+          handoffPath: '/public/dashboard.php',
+        );
+
+        expect(plan, isA<PageLoadOffline>());
+        final scheduleDir = await store.getPageDirectoryIfReady(
+          parishId: 'p',
+          userId: 'u',
+          pagePath: '/public/schedule.php',
+        );
+        expect(localServer.rootDirectory?.path, scheduleDir!.path);
+      });
+
+      test('a refusal names the path that was actually requested', () async {
+        handoff.errorToThrow = _httpError(400, {'error': 'invalid_path'});
+
+        final plan = await coordinator.plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/schedule.php',
+          handoffPath: '/public/dashboard.php',
+        );
+
+        expect(plan, isA<PageLoadServerError>());
+        expect((plan as PageLoadServerError).path, '/public/dashboard.php');
+      });
+    });
+
+    group('probeOnline (background check that the connection is back)', () {
+      late _FakeHandoffService handoff;
+      late OfflinePageCoordinator coordinator;
+
+      setUp(() {
+        handoff = _FakeHandoffService(SecureStorageService());
+        coordinator = OfflinePageCoordinator(
+          connectivityProbe: ConnectivityProbe(),
+          captureService: captureService,
+          snapshotStore: store,
+          localServer: localServer,
+          handoffService: handoff,
+        );
+      });
+
+      Future<OnlineProbeResult> probe({Duration? timeout}) =>
+          coordinator.probeOnline(
+            parishId: 'p',
+            userId: 'u',
+            targetPath: '/public/dashboard.php',
+            timeout: timeout ?? const Duration(seconds: 6),
+          );
+
+      test('a ticket means recovered, and it uses the longer limit, not the opening one', () async {
+        handoff.handoffUrlToReturn = Uri.parse(
+          'https://szarlej.ministrant.eu/public/mobile_handoff.php?ticket=t',
+        );
+        final result = await probe();
+
+        expect(result, isA<OnlineProbeRecovered>());
+        final plan = (result as OnlineProbeRecovered).plan;
+        expect(plan.targetPath, '/public/dashboard.php');
+        expect(handoff.lastTimeout, const Duration(seconds: 6));
+        expect(
+          handoff.lastTimeout,
+          greaterThan(WebviewHandoffService.defaultTimeout),
+          reason: 'a slow server must be told apart from a missing one',
+        );
+      });
+
+      test('no answer and transient server problems mean "try later", never a refusal', () async {
+        final request = RequestOptions(path: '/x');
+        for (final error in <Object>[
+          DioException(requestOptions: request, type: DioExceptionType.connectionError),
+          TimeoutException('slow'),
+          _httpError(503),
+          _httpError(429),
+        ]) {
+          handoff.errorToThrow = error;
+          expect(await probe(), isA<OnlineProbeUnavailable>(), reason: '$error');
+        }
+      });
+
+      test('a refusal is reported as one, with the sanitized facts and whether a copy exists', () async {
+        await store.writeSnapshot(
+          parishId: 'p',
+          userId: 'u',
+          pagePath: '/public/dashboard.php',
+          html: '<html>Saved</html>',
+          assets: {},
+        );
+        handoff.errorToThrow = _httpError(401, {'error': 'session_expired'});
+
+        final result = await probe();
+
+        expect(result, isA<OnlineProbeRejected>());
+        final error = (result as OnlineProbeRejected).error;
+        expect(error.statusCode, 401);
+        expect(error.errorCode, 'session_expired');
+        expect(error.hasSnapshot, isTrue);
+      });
+
+      test('a request that never answers still ends, after the limit', () async {
+        handoff.hang = true;
+        final clock = Stopwatch()..start();
+        final result = await probe(timeout: const Duration(milliseconds: 100));
+        expect(result, isA<OnlineProbeUnavailable>());
+        expect(clock.elapsedMilliseconds, lessThan(1500));
+      });
+
+      test('concurrent checks for the same page share ONE request', () async {
+        handoff.handoffUrlToReturn = Uri.parse(
+          'https://szarlej.ministrant.eu/public/mobile_handoff.php?ticket=t',
+        );
+        handoff.gate = Completer<void>();
+
+        final a = probe();
+        final b = probe();
+        final c = probe();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        expect(handoff.calls, 1, reason: 'three callers, one request');
+
+        handoff.gate!.complete();
+        final results = await Future.wait([a, b, c]);
+        expect(results.every((r) => r is OnlineProbeRecovered), isTrue);
+        expect(handoff.calls, 1);
+
+        // Once it has finished, the next check is a fresh request.
+        handoff.gate = null;
+        await probe();
+        expect(handoff.calls, 2);
+      });
+
+      test('a page the app cannot identify is "unavailable", not a request', () async {
+        final result = await coordinator.probeOnline(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/login.php',
+        );
+        expect(result, isA<OnlineProbeUnavailable>());
+        expect(handoff.calls, 0);
+      });
+    });
+
+    group('handoff failure classes', () {
+      OfflinePageCoordinator coordinatorFailingWith(Object error) {
+        final handoff = _FakeHandoffService(SecureStorageService())
+          ..errorToThrow = error;
+        return OfflinePageCoordinator(
+          connectivityProbe: ConnectivityProbe(),
+          captureService: captureService,
+          snapshotStore: store,
+          localServer: localServer,
+          handoffService: handoff,
+        );
+      }
+
+      // The snapshot key includes the query, so tests that expect a saved
+      // copy use the plain path; the query-stripping test passes its own.
+      Future<PageLoadPlan> plan(
+        OfflinePageCoordinator c, {
+        String target = '/public/dashboard.php',
+      }) => c.plan(parishId: 'p', userId: 'u', targetPath: target);
+
+      Future<void> saveDashboard() => store.writeSnapshot(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/dashboard.php',
+        html: '<html>Saved</html>',
+        assets: {},
+      );
+
+      test('a server that ANSWERED 400 is a server error, not "offline" - the refused path and code survive', () async {
+        final result = await plan(
+          coordinatorFailingWith(
+            _httpError(400, {
+              'error': 'invalid_path',
+              'message': 'Nieznana lub niedozwolona ścieżka modułu.',
+            }),
+          ),
+          target: '/public/dashboard.php?month=10',
+        );
+
+        expect(result, isA<PageLoadServerError>());
+        final error = result as PageLoadServerError;
+        expect(error.statusCode, 400);
+        expect(error.errorCode, 'invalid_path');
+        // The page path only: no query (it can carry filters/ids).
+        expect(error.path, '/public/dashboard.php');
+        expect(error.hasSnapshot, isFalse);
+        expect(localServer.isRunning, isFalse, reason: 'no snapshot was served');
+      });
+
+      test('with a saved copy it is STILL a server error, and says a copy exists', () async {
+        await saveDashboard();
+        final result = await plan(
+          coordinatorFailingWith(_httpError(400, {'error': 'invalid_path'})),
+        );
+
+        expect(result, isA<PageLoadServerError>());
+        expect((result as PageLoadServerError).hasSnapshot, isTrue);
+      });
+
+      test('401 and 403 are server errors that keep their status', () async {
+        for (final status in [401, 403, 404, 422]) {
+          final result = await plan(coordinatorFailingWith(_httpError(status)));
+          expect(result, isA<PageLoadServerError>(), reason: '$status');
+          expect((result as PageLoadServerError).statusCode, status);
+        }
+      });
+
+      test('only a short machine code is kept - never a message, markup or a long string', () async {
+        for (final hostile in <Object?>[
+          '<script>alert(1)</script>',
+          'Ticket abc123 for user 42',
+          'a' * 100,
+          'Invalid_Path',
+          '',
+          42,
+          null,
+        ]) {
+          final result = await plan(
+            coordinatorFailingWith(
+              _httpError(400, {
+                'error': hostile,
+                'message': 'secret message that must not surface',
+              }),
+            ),
+          ) as PageLoadServerError;
+          expect(result.errorCode, isNull, reason: '$hostile');
+          expect(result.statusCode, 400);
+        }
+        // A body that is not JSON at all (an HTML error page).
+        final html = await plan(
+          coordinatorFailingWith(_httpError(400, '<html>Bad gateway</html>')),
+        ) as PageLoadServerError;
+        expect(html.errorCode, isNull);
+      });
+
+      test('a reply that is not a handoff reply at all is a server error, not "offline"', () async {
+        final result = await plan(
+          coordinatorFailingWith(const FormatException('Invalid handoff response.')),
+        ) as PageLoadServerError;
+        expect(result.statusCode, isNull);
+        expect(result.errorCode, 'invalid_response');
+      });
+
+      test('a defect in this app (TypeError) is never presented as the server refusing', () async {
+        await saveDashboard();
+        // Produced the way they occur for real, not by constructing them.
+        Object failedCast() {
+          try {
+            final Object? value = 5;
+            return value as String;
+          } catch (e) {
+            return e;
+          }
+        }
+
+        Object missingMethod() {
+          try {
+            final dynamic value = 5;
+            return value.noSuchMethodHere();
+          } catch (e) {
+            return e;
+          }
+        }
+
+        for (final error in <Object>[
+          failedCast(),
+          missingMethod(),
+          StateError('not activated'),
+        ]) {
+          final result = await plan(coordinatorFailingWith(error));
+          expect(result, isA<PageLoadOffline>(), reason: '${error.runtimeType}');
+        }
+      });
+
+      test('5xx / 408 / 429 fall back to the saved copy, labelled as a server problem', () async {
+        await saveDashboard();
+        for (final status in [500, 502, 503, 408, 429]) {
+          final result = await plan(coordinatorFailingWith(_httpError(status)));
+          expect(result, isA<PageLoadOffline>(), reason: '$status');
+          expect(
+            (result as PageLoadOffline).reason,
+            OfflineReason.serverUnavailable,
+            reason: '$status',
+          );
+        }
+      });
+
+      test('5xx with no saved copy is the ordinary "no saved copy" state', () async {
+        final result = await plan(coordinatorFailingWith(_httpError(503)));
+        expect(result, isA<PageLoadOfflineNoSnapshot>());
+      });
+
+      test('no answer at all (connection, timeout, socket) is "no network"', () async {
+        await saveDashboard();
+        final request = RequestOptions(path: '/mobile/webview/handoff');
+        for (final error in <Object>[
+          DioException(requestOptions: request, type: DioExceptionType.connectionError),
+          DioException(requestOptions: request, type: DioExceptionType.connectionTimeout),
+          DioException(requestOptions: request, type: DioExceptionType.cancel),
+          TimeoutException('handoff'),
+          const SocketException('Failed host lookup'),
+        ]) {
+          final result = await plan(coordinatorFailingWith(error));
+          expect(result, isA<PageLoadOffline>(), reason: '$error');
+          expect(
+            (result as PageLoadOffline).reason,
+            OfflineReason.noNetwork,
+            reason: '$error',
+          );
+        }
+      });
+
+      test('a forced fallback keeps the reason its caller gives (a slow page is not "offline")', () async {
+        await saveDashboard();
+        final result = await coordinatorFailingWith(Exception('unused')).plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/dashboard.php',
+          forceOffline: true,
+          offlineReason: OfflineReason.slowServer,
+        );
+        expect(result, isA<PageLoadOffline>());
+        expect((result as PageLoadOffline).reason, OfflineReason.slowServer);
+      });
+
+      test('a reason handed in does not survive a fresh failure of another kind', () async {
+        await saveDashboard();
+        final request = RequestOptions(path: '/x');
+        final noAnswer = await coordinatorFailingWith(
+          DioException(requestOptions: request, type: DioExceptionType.connectionError),
+        ).plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/dashboard.php',
+          offlineReason: OfflineReason.slowServer,
+        );
+        expect((noAnswer as PageLoadOffline).reason, OfflineReason.noNetwork);
+
+        final serverDown = await coordinatorFailingWith(_httpError(503)).plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/dashboard.php',
+          offlineReason: OfflineReason.noNetwork,
+        );
+        expect((serverDown as PageLoadOffline).reason, OfflineReason.serverUnavailable);
+      });
+
+      test('the banner says SERWER NIEDOSTĘPNY for a server problem and OFFLINE otherwise', () {
+        expect(
+          formatOfflineBannerText(
+            DateTime.utc(2026, 10, 1, 8, 42),
+            reason: OfflineReason.slowServer,
+          ),
+          startsWith('SERWER ODPOWIADA ZBYT WOLNO • ostatnia synchronizacja: '),
+        );
+        final captured = DateTime.utc(2026, 10, 1, 8, 42);
+        expect(
+          formatOfflineBannerText(captured, reason: OfflineReason.serverUnavailable),
+          startsWith('SERWER NIEDOSTĘPNY • ostatnia synchronizacja: '),
+        );
+        expect(
+          formatOfflineBannerText(captured),
+          startsWith('OFFLINE • ostatnia synchronizacja: '),
+        );
+      });
+    });
+
     test('a reachable page plans to load online via a freshly-minted handoff URL, never targetPath itself', () async {
       final site = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       site.listen((request) async => request.response.close());
       fakeStore['server_url'] = 'http://127.0.0.1:${site.port}';
 
       final secureStorage = SecureStorageService();
-      final handoffUrl = Uri.parse('http://127.0.0.1:${site.port}/public/mobile_handoff.php?ticket=abc123');
-      final handoffService = _FakeHandoffService(secureStorage)..handoffUrlToReturn = handoffUrl;
+      final handoffUrl = Uri.parse(
+        'http://127.0.0.1:${site.port}/public/mobile_handoff.php?ticket=abc123',
+      );
+      final handoffService = _FakeHandoffService(secureStorage)
+        ..handoffUrlToReturn = handoffUrl;
 
       final coordinator = OfflinePageCoordinator(
         connectivityProbe: ConnectivityProbe(),
@@ -166,11 +1108,23 @@ void main() {
         handoffService: handoffService,
       );
 
-      final plan = await coordinator.plan(parishId: 'witosa', userId: '9001', targetPath: '/public/dashboard.php');
+      final plan = await coordinator.plan(
+        parishId: 'witosa',
+        userId: '9001',
+        targetPath: '/public/dashboard.php',
+      );
       expect(plan, isA<PageLoadOnline>());
       final onlinePlan = plan as PageLoadOnline;
-      expect(onlinePlan.url, handoffUrl, reason: 'navigation must use the one-time handoff URL, never the plain target path');
-      expect(onlinePlan.targetPath, '/public/dashboard.php', reason: 'the page identity must still be the real target, for capture/storage later');
+      expect(
+        onlinePlan.url,
+        handoffUrl,
+        reason: 'navigation must use the one-time handoff URL, never the plain target path',
+      );
+      expect(
+        onlinePlan.targetPath,
+        '/public/dashboard.php',
+        reason: 'the page identity must still be the real target, for capture/storage later',
+      );
 
       await site.close(force: true);
     });
@@ -190,7 +1144,8 @@ void main() {
       );
 
       final secureStorage = SecureStorageService();
-      final handoffService = _FakeHandoffService(secureStorage)..errorToThrow = Exception('ticket mint failed');
+      final handoffService = _FakeHandoffService(secureStorage)
+        ..errorToThrow = Exception('ticket mint failed');
 
       final coordinator = OfflinePageCoordinator(
         connectivityProbe: ConnectivityProbe(),
@@ -200,7 +1155,11 @@ void main() {
         handoffService: handoffService,
       );
 
-      final plan = await coordinator.plan(parishId: 'witosa', userId: '9001', targetPath: '/public/dashboard.php');
+      final plan = await coordinator.plan(
+        parishId: 'witosa',
+        userId: '9001',
+        targetPath: '/public/dashboard.php',
+      );
       expect(
         plan,
         isA<PageLoadOffline>(),
@@ -210,22 +1169,31 @@ void main() {
       await site.close(force: true);
     });
 
-    test('unreachable page with no prior snapshot plans offlineNoSnapshot', () async {
-      fakeStore['server_url'] = 'http://127.0.0.1:1';
-      final secureStorage = SecureStorageService();
-      final handoffService = _FakeHandoffService(secureStorage);
+    test(
+      'unreachable page with no prior snapshot plans offlineNoSnapshot',
+      () async {
+        fakeStore['server_url'] = 'http://127.0.0.1:1';
+        final secureStorage = SecureStorageService();
+        final handoffService = _FakeHandoffService(secureStorage);
 
-      final coordinator = OfflinePageCoordinator(
-        connectivityProbe: ConnectivityProbe(timeout: const Duration(milliseconds: 200)),
-        captureService: captureService,
-        snapshotStore: store,
-        localServer: localServer,
-        handoffService: handoffService,
-      );
+        final coordinator = OfflinePageCoordinator(
+          connectivityProbe: ConnectivityProbe(
+            timeout: const Duration(milliseconds: 200),
+          ),
+          captureService: captureService,
+          snapshotStore: store,
+          localServer: localServer,
+          handoffService: handoffService,
+        );
 
-      final plan = await coordinator.plan(parishId: 'witosa', userId: '9001', targetPath: '/public/dashboard.php');
-      expect(plan, isA<PageLoadOfflineNoSnapshot>());
-    });
+        final plan = await coordinator.plan(
+          parishId: 'witosa',
+          userId: '9001',
+          targetPath: '/public/dashboard.php',
+        );
+        expect(plan, isA<PageLoadOfflineNoSnapshot>());
+      },
+    );
 
     test('unreachable page WITH a prior snapshot plans offline, pointed at a working LocalSnapshotServer URL', () async {
       fakeStore['server_url'] = 'http://127.0.0.1:1';
@@ -242,14 +1210,20 @@ void main() {
       final handoffService = _FakeHandoffService(secureStorage);
 
       final coordinator = OfflinePageCoordinator(
-        connectivityProbe: ConnectivityProbe(timeout: const Duration(milliseconds: 200)),
+        connectivityProbe: ConnectivityProbe(
+          timeout: const Duration(milliseconds: 200),
+        ),
         captureService: captureService,
         snapshotStore: store,
         localServer: localServer,
         handoffService: handoffService,
       );
 
-      final plan = await coordinator.plan(parishId: 'witosa', userId: '9001', targetPath: '/public/dashboard.php');
+      final plan = await coordinator.plan(
+        parishId: 'witosa',
+        userId: '9001',
+        targetPath: '/public/dashboard.php',
+      );
       expect(plan, isA<PageLoadOffline>());
       final offlinePlan = plan as PageLoadOffline;
       expect(offlinePlan.capturedAt, DateTime.utc(2026, 10, 1, 8, 42, 0));
@@ -283,74 +1257,157 @@ void main() {
       }
     });
 
-    test(
-      'DIAGNOSTIC: isolates the 400 reported against the offline-plan URL — prints the real response instead of guessing',
-      () async {
-        fakeStore['server_url'] = 'http://127.0.0.1:1';
-        await store.writeSnapshot(
-          parishId: 'witosa',
-          userId: '9001',
-          pagePath: '/public/dashboard.php',
-          html: '<html><body>Diagnostic snapshot</body></html>',
-          assets: {},
-          capturedAt: DateTime.utc(2026, 10, 1, 8, 42, 0),
+    test('DIAGNOSTIC: isolates the 400 reported against the offline-plan URL — prints the real response instead of guessing', () async {
+      fakeStore['server_url'] = 'http://127.0.0.1:1';
+      await store.writeSnapshot(
+        parishId: 'witosa',
+        userId: '9001',
+        pagePath: '/public/dashboard.php',
+        html: '<html><body>Diagnostic snapshot</body></html>',
+        assets: {},
+        capturedAt: DateTime.utc(2026, 10, 1, 8, 42, 0),
+      );
+
+      final secureStorage = SecureStorageService();
+      final handoffService = _FakeHandoffService(secureStorage);
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(
+          timeout: const Duration(milliseconds: 200),
+        ),
+        captureService: captureService,
+        snapshotStore: store,
+        localServer: localServer,
+        handoffService: handoffService,
+      );
+
+      final plan = await coordinator.plan(
+        parishId: 'witosa',
+        userId: '9001',
+        targetPath: '/public/dashboard.php',
+      );
+      final offlinePlan = plan as PageLoadOffline;
+
+      // ignore: avoid_print
+      print('DIAGNOSTIC offlinePlan.url = ${offlinePlan.url}');
+      // ignore: avoid_print
+      print(
+        'DIAGNOSTIC offlinePlan.url.toString() = ${offlinePlan.url.toString()}',
+      );
+      // ignore: avoid_print
+      print(
+        'DIAGNOSTIC localServer.isRunning = ${localServer.isRunning}, port = ${localServer.port}',
+      );
+
+      // Confirmed root cause (see this file's own capstone test for
+      // the full explanation): flutter_test's own ambient
+      // HttpOverrides, installed by this group's
+      // TestWidgetsFlutterBinding.ensureInitialized() call, faked the
+      // original 400 this diagnostic test was built to isolate.
+      // Escaped here too (restored in finally) so this diagnostic now
+      // shows the REAL response for confirmation.
+      final previousHttpOverrides = HttpOverrides.current;
+      HttpOverrides.global = null;
+      try {
+        final client = HttpClient();
+        final request = await client.getUrl(offlinePlan.url);
+        // ignore: avoid_print
+        print(
+          'DIAGNOSTIC request.method = ${request.method}, request.uri = ${request.uri}',
         );
-
-        final secureStorage = SecureStorageService();
-        final handoffService = _FakeHandoffService(secureStorage);
-        final coordinator = OfflinePageCoordinator(
-          connectivityProbe: ConnectivityProbe(timeout: const Duration(milliseconds: 200)),
-          captureService: captureService,
-          snapshotStore: store,
-          localServer: localServer,
-          handoffService: handoffService,
+        final response = await request.close();
+        // ignore: avoid_print
+        print(
+          'DIAGNOSTIC statusCode = ${response.statusCode}, reasonPhrase = ${response.reasonPhrase}',
         );
-
-        final plan = await coordinator.plan(parishId: 'witosa', userId: '9001', targetPath: '/public/dashboard.php');
-        final offlinePlan = plan as PageLoadOffline;
-
         // ignore: avoid_print
-        print('DIAGNOSTIC offlinePlan.url = ${offlinePlan.url}');
+        print('DIAGNOSTIC headers = ${response.headers}');
+        final body = await utf8.decoder.bind(response).join();
         // ignore: avoid_print
-        print('DIAGNOSTIC offlinePlan.url.toString() = ${offlinePlan.url.toString()}');
-        // ignore: avoid_print
-        print('DIAGNOSTIC localServer.isRunning = ${localServer.isRunning}, port = ${localServer.port}');
+        print('DIAGNOSTIC body = $body');
+      } finally {
+        HttpOverrides.global = previousHttpOverrides;
+      }
 
-        // Confirmed root cause (see this file's own capstone test for
-        // the full explanation): flutter_test's own ambient
-        // HttpOverrides, installed by this group's
-        // TestWidgetsFlutterBinding.ensureInitialized() call, faked the
-        // original 400 this diagnostic test was built to isolate.
-        // Escaped here too (restored in finally) so this diagnostic now
-        // shows the REAL response for confirmation.
-        final previousHttpOverrides = HttpOverrides.current;
-        HttpOverrides.global = null;
-        try {
-          final client = HttpClient();
-          final request = await client.getUrl(offlinePlan.url);
-          // ignore: avoid_print
-          print('DIAGNOSTIC request.method = ${request.method}, request.uri = ${request.uri}');
-          final response = await request.close();
-          // ignore: avoid_print
-          print('DIAGNOSTIC statusCode = ${response.statusCode}, reasonPhrase = ${response.reasonPhrase}');
-          // ignore: avoid_print
-          print('DIAGNOSTIC headers = ${response.headers}');
-          final body = await utf8.decoder.bind(response).join();
-          // ignore: avoid_print
-          print('DIAGNOSTIC body = $body');
-        } finally {
-          HttpOverrides.global = previousHttpOverrides;
-        }
-
-        // Deliberately no hard assertion here beyond "the request completed" —
-        // this test's entire purpose is the printed output above, not a
-        // pass/fail signal.
-      },
-    );
+      // Deliberately no hard assertion here beyond "the request completed" —
+      // this test's entire purpose is the printed output above, not a
+      // pass/fail signal.
+    });
 
     test('formatOfflineBannerText produces the exact required format', () {
-      expect(formatOfflineBannerText(DateTime(2026, 10, 1, 8, 42)), 'OFFLINE • ostatnia synchronizacja: 08:42');
-      expect(formatOfflineBannerText(DateTime(2026, 10, 1, 23, 5)), 'OFFLINE • ostatnia synchronizacja: 23:05');
+      expect(
+        formatOfflineBannerText(DateTime(2026, 10, 1, 8, 42)),
+        'OFFLINE • ostatnia synchronizacja: 08:42',
+      );
+      expect(
+        formatOfflineBannerText(DateTime(2026, 10, 1, 23, 5)),
+        'OFFLINE • ostatnia synchronizacja: 23:05',
+      );
+    });
+
+    group('captures of one page do not pile up (F8)', () {
+      late _CountingCapture counting;
+      late OfflinePageCoordinator coordinator;
+
+      setUp(() {
+        fakeStore['server_url'] = 'https://szarlej.ministrant.eu';
+        counting = _CountingCapture(store);
+        coordinator = OfflinePageCoordinator(
+          connectivityProbe: ConnectivityProbe(),
+          captureService: counting,
+          snapshotStore: store,
+          localServer: localServer,
+          handoffService: _FakeHandoffService(SecureStorageService()),
+        );
+      });
+
+      void capture(String html, {String path = '/public/dashboard.php'}) =>
+          coordinator.captureInBackground(
+            parishId: 'p',
+            userId: 'u',
+            targetPath: path,
+            renderedHtml: html,
+          );
+
+      test('captures of the same page queued together: only the NEWEST runs', () async {
+        capture('first');
+        capture('second');
+        capture('third');
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        expect(counting.htmls, ['third']);
+      });
+
+      test('one that is already RUNNING finishes; the newer one waits, the middle one is skipped', () async {
+        counting.gate = Completer<void>();
+        capture('first');
+        await Future<void>.delayed(const Duration(milliseconds: 150));
+        expect(counting.htmls, ['first'], reason: 'running, held at the gate');
+
+        capture('second');
+        capture('third');
+        counting.gate!.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        expect(counting.htmls, ['first', 'third']);
+      });
+
+      test('different pages are never merged', () async {
+        capture('a', path: '/public/dashboard.php');
+        capture('b', path: '/public/ranking.php');
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        expect(counting.htmls, ['a', 'b']);
+      });
+
+      test('how a capture ended is published, and kept', () async {
+        counting.outcome = const CaptureOutcome(
+          CaptureStatus.rejectedIncomplete,
+          missingCritical: ['public/css/style.css'],
+        );
+        final published = coordinator.captureOutcomes.first;
+        capture('x');
+        final outcome = await published.timeout(const Duration(seconds: 2));
+        expect(outcome.status, CaptureStatus.rejectedIncomplete);
+        expect(outcome.missingCritical, ['public/css/style.css']);
+        expect(coordinator.lastCaptureOutcome, same(outcome));
+      });
     });
 
     test('captureInBackground eventually persists a snapshot keyed by targetPath, without the caller awaiting it', () async {
@@ -378,17 +1435,32 @@ void main() {
       // deliberately doesn't exist at the call site.
       var found = false;
       for (var attempt = 0; attempt < 20 && !found; attempt++) {
-        final manifest = await store.readManifestFor(parishId: 'witosa', userId: '9001', pagePath: '/public/dashboard.php');
+        final manifest = await store.readManifestFor(
+          parishId: 'witosa',
+          userId: '9001',
+          pagePath: '/public/dashboard.php',
+        );
         found = manifest != null;
         if (!found) {
           await Future<void>.delayed(const Duration(milliseconds: 100));
         }
       }
 
-      final dir = await store.getPageDirectoryIfReady(parishId: 'witosa', userId: '9001', pagePath: '/public/dashboard.php');
-      expect(dir, isNotNull, reason: 'captureInBackground must eventually write a real snapshot even though nothing was awaited at the call site');
-      final encryptedHtml = await File('${dir!.path}/snapshot.html').readAsBytes();
-      final decryptedHtml = utf8.decode(_testEncryptor.decryptBytes(encryptedHtml));
+      final dir = await store.getPageDirectoryIfReady(
+        parishId: 'witosa',
+        userId: '9001',
+        pagePath: '/public/dashboard.php',
+      );
+      expect(
+        dir,
+        isNotNull,
+        reason: 'captureInBackground must eventually write a real snapshot even though nothing was awaited at the call site',
+      );
+      final encryptedHtml = await File('${dir!.path}/snapshot.html')
+          .readAsBytes();
+      final decryptedHtml = utf8.decode(
+        _testEncryptor.decryptBytes(encryptedHtml),
+      );
       expect(decryptedHtml, contains('Freshly rendered'));
     });
   });

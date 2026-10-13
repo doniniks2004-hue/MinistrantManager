@@ -1,0 +1,13 @@
+# Both association files must be answered as JSON, with no redirect.
+# `apple-app-site-association` has NO file extension (Apple requires that exact
+# name), so the server cannot guess its type from it.
+# Applies under Apache (mod_mime). Under nginx the same must be set in the
+# server block (default_type application/json for this location).
+<IfModule mod_mime.c>
+    <Files "apple-app-site-association">
+        ForceType application/json
+    </Files>
+    <Files "assetlinks.json">
+        ForceType application/json
+    </Files>
+</IfModule>

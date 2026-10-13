@@ -58,8 +58,23 @@ class WebviewHandoffTicketService
         );
         $stmt->bind_param('s', $ticket);
         $stmt->execute();
-        $row = $stmt->get_result()->fetch_assoc();
+        $id = null;
+        $userId = null;
+        $installationId = null;
+        $targetPath = null;
+        $expiresAt = null;
+        $usedAt = null;
+        $stmt->bind_result($id, $userId, $installationId, $targetPath, $expiresAt, $usedAt);
+        $hasRow = $stmt->fetch();
         $stmt->close();
+        $row = $hasRow ? [
+            'id' => $id,
+            'user_id' => $userId,
+            'installation_id' => $installationId,
+            'target_path' => $targetPath,
+            'expires_at' => $expiresAt,
+            'used_at' => $usedAt,
+        ] : null;
 
         if ($row === null) {
             return null;

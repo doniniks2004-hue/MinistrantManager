@@ -80,9 +80,42 @@ final class MobileUserTokenService
         );
         $stmt->bind_param('s', $installationId);
         $stmt->execute();
-        $result = $stmt->get_result();
-        $row = $result->fetch_assoc();
+        $id = null;
+        $userId = null;
+        $tokenHash = null;
+        $roleId = null;
+        $roleName = null;
+        $parentId = null;
+        $canRequestSubstitution = null;
+        $canAcceptSubstitution = null;
+        $isActive = null;
+        $passwordChanged = null;
+        $stmt->bind_result(
+            $id,
+            $userId,
+            $tokenHash,
+            $roleId,
+            $roleName,
+            $parentId,
+            $canRequestSubstitution,
+            $canAcceptSubstitution,
+            $isActive,
+            $passwordChanged
+        );
+        $hasRow = $stmt->fetch();
         $stmt->close();
+        $row = $hasRow ? [
+            'id' => $id,
+            'user_id' => $userId,
+            'token_hash' => $tokenHash,
+            'role_id' => $roleId,
+            'role_name' => $roleName,
+            'parent_id' => $parentId,
+            'can_request_substitution' => $canRequestSubstitution,
+            'can_accept_substitution' => $canAcceptSubstitution,
+            'is_active' => $isActive,
+            'password_changed' => $passwordChanged,
+        ] : null;
 
         if ($row === null) {
             return null;

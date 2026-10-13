@@ -6,10 +6,15 @@ import 'user_session_service.dart';
 /// this screen until they complete the mandatory first-login password
 /// change; they never reach the dashboard with a pre-change token.
 class LoginScreen extends StatefulWidget {
-  const LoginScreen({super.key, required this.userSessionService, required this.onLoggedIn});
+  const LoginScreen(
+      {super.key,
+      required this.userSessionService,
+      required this.onLoggedIn,
+      this.onOpenDeviceSettings});
 
   final UserSessionService userSessionService;
   final VoidCallback onLoggedIn;
+  final VoidCallback? onOpenDeviceSettings;
 
   @override
   State<LoginScreen> createState() => _LoginScreenState();
@@ -50,7 +55,8 @@ class _LoginScreenState extends State<LoginScreen> {
       _errorMessage = null;
     });
 
-    final result = await widget.userSessionService.login(username: username, password: password);
+    final result = await widget.userSessionService
+        .login(username: username, password: password);
     if (!mounted) return;
 
     switch (result) {
@@ -76,7 +82,8 @@ class _LoginScreenState extends State<LoginScreen> {
       case UserLoginNetworkError():
         setState(() {
           _submitting = false;
-          _errorMessage = 'Brak połączenia z serwerem parafii. Spróbuj ponownie.';
+          _errorMessage =
+              'Brak połączenia z serwerem parafii. Spróbuj ponownie.';
         });
     }
   }
@@ -124,13 +131,15 @@ class _LoginScreenState extends State<LoginScreen> {
           _passwordController.clear();
           _newPasswordController.clear();
           _confirmPasswordController.clear();
-          _errorMessage = 'Nie udało się dokończyć zmiany hasła. Zaloguj się ponownie.';
+          _errorMessage =
+              'Nie udało się dokończyć zmiany hasła. Zaloguj się ponownie.';
         });
         break;
       case UserLoginNetworkError():
         setState(() {
           _submitting = false;
-          _errorMessage = 'Brak połączenia z serwerem parafii. Spróbuj ponownie.';
+          _errorMessage =
+              'Brak połączenia z serwerem parafii. Spróbuj ponownie.';
         });
     }
   }
@@ -147,13 +156,25 @@ class _LoginScreenState extends State<LoginScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: Text(_requiresPasswordChange ? 'Ustaw nowe hasło' : 'Logowanie')),
+      appBar: AppBar(
+        title: Text(_requiresPasswordChange ? 'Ustaw nowe hasło' : 'Logowanie'),
+        actions: [
+          if (widget.onOpenDeviceSettings != null)
+            IconButton(
+              tooltip: 'Urządzenie / Parafia',
+              onPressed: _submitting ? null : widget.onOpenDeviceSettings,
+              icon: const Icon(Icons.settings_outlined),
+            ),
+        ],
+      ),
       body: Center(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(24),
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 400),
-            child: _requiresPasswordChange ? _buildPasswordChange() : _buildLogin(),
+            child: _requiresPasswordChange
+                ? _buildPasswordChange()
+                : _buildLogin(),
           ),
         ),
       ),
@@ -176,7 +197,8 @@ class _LoginScreenState extends State<LoginScreen> {
           controller: _usernameController,
           enabled: !_submitting,
           autofillHints: const [AutofillHints.username],
-          decoration: const InputDecoration(labelText: 'Login', border: OutlineInputBorder()),
+          decoration: const InputDecoration(
+              labelText: 'Login', border: OutlineInputBorder()),
           textInputAction: TextInputAction.next,
         ),
         const SizedBox(height: 12),
@@ -189,8 +211,10 @@ class _LoginScreenState extends State<LoginScreen> {
             labelText: 'Hasło',
             border: const OutlineInputBorder(),
             suffixIcon: IconButton(
-              icon: Icon(_obscurePassword ? Icons.visibility_off : Icons.visibility),
-              onPressed: () => setState(() => _obscurePassword = !_obscurePassword),
+              icon: Icon(
+                  _obscurePassword ? Icons.visibility_off : Icons.visibility),
+              onPressed: () =>
+                  setState(() => _obscurePassword = !_obscurePassword),
             ),
           ),
           textInputAction: TextInputAction.done,
@@ -201,7 +225,10 @@ class _LoginScreenState extends State<LoginScreen> {
         FilledButton(
           onPressed: _submitting ? null : _submit,
           child: _submitting
-              ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2))
+              ? const SizedBox(
+                  height: 20,
+                  width: 20,
+                  child: CircularProgressIndicator(strokeWidth: 2))
               : const Text('ZALOGUJ'),
         ),
       ],
@@ -230,8 +257,11 @@ class _LoginScreenState extends State<LoginScreen> {
             labelText: 'Nowe hasło',
             border: const OutlineInputBorder(),
             suffixIcon: IconButton(
-              icon: Icon(_obscureNewPassword ? Icons.visibility_off : Icons.visibility),
-              onPressed: () => setState(() => _obscureNewPassword = !_obscureNewPassword),
+              icon: Icon(_obscureNewPassword
+                  ? Icons.visibility_off
+                  : Icons.visibility),
+              onPressed: () =>
+                  setState(() => _obscureNewPassword = !_obscureNewPassword),
             ),
           ),
           textInputAction: TextInputAction.next,
@@ -246,8 +276,11 @@ class _LoginScreenState extends State<LoginScreen> {
             labelText: 'Powtórz nowe hasło',
             border: const OutlineInputBorder(),
             suffixIcon: IconButton(
-              icon: Icon(_obscureConfirmPassword ? Icons.visibility_off : Icons.visibility),
-              onPressed: () => setState(() => _obscureConfirmPassword = !_obscureConfirmPassword),
+              icon: Icon(_obscureConfirmPassword
+                  ? Icons.visibility_off
+                  : Icons.visibility),
+              onPressed: () => setState(
+                  () => _obscureConfirmPassword = !_obscureConfirmPassword),
             ),
           ),
           textInputAction: TextInputAction.done,
@@ -258,7 +291,10 @@ class _LoginScreenState extends State<LoginScreen> {
         FilledButton(
           onPressed: _submitting ? null : _submitPasswordChange,
           child: _submitting
-              ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2))
+              ? const SizedBox(
+                  height: 20,
+                  width: 20,
+                  child: CircularProgressIndicator(strokeWidth: 2))
               : const Text('ZAPISZ NOWE HASŁO'),
         ),
         TextButton(

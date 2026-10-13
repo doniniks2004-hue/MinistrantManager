@@ -1,4 +1,7 @@
+import 'dart:convert';
+import 'dart:math';
 import 'dart:io';
+
 import 'package:path/path.dart' as p;
 
 import 'snapshot_encryptor.dart';
@@ -54,23 +57,109 @@ class LocalSnapshotServer {
   final SnapshotEncryptor encryptor;
 
   HttpServer? _server;
-  Directory? rootDirectory;
+  int? _boundPort;
+  Directory? _rootDirectory;
+  String _accessToken = '';
+  Directory? get rootDirectory => _rootDirectory;
+  set rootDirectory(Directory? root) {
+    _rootDirectory = root;
+    final random = Random.secure();
+    _accessToken = List.generate(
+      32,
+      (_) => random.nextInt(256).toRadixString(16).padLeft(2, '0'),
+    ).join();
+  }
 
-  int? get port => _server?.port;
+  Uri urlFor(String path) {
+    if (port == null) throw StateError('Snapshot server not ready.');
+    return Uri.parse(
+      'http://127.0.0.1:$port/$_accessToken/${path.replaceFirst(RegExp(r"^/"), "")}',
+    );
+  }
+
+  bool ownsUrl(Uri uri) =>
+      uri.scheme == 'http' &&
+      uri.host == '127.0.0.1' &&
+      uri.port == port &&
+      uri.path.startsWith('/$_accessToken/');
+
+  int? get port => _boundPort;
   bool get isRunning => _server != null;
 
   /// Starts the server if not already running and returns the port it's
   /// listening on. Calling this again while already running is a no-op
   /// that just returns the existing port — callers don't need to track
   /// "did I already start this" themselves.
-  Future<int> start() async {
+  Future<int> start() {
     final existing = _server;
-    if (existing != null) {
-      return existing.port;
-    }
+    if (existing != null) return Future.value(_boundPort!);
+    // Concurrent callers share ONE bind. Without this, two calls made before
+    // the first bind finished both saw "not running", both bound a port, the
+    // second overwrote _server and the first server was orphaned on a port
+    // nobody knew — and a URL built from either could point at the wrong one.
+    return _starting ??= _bind().whenComplete(() {
+      // Block body: whenComplete would wait on a returned Future.
+      _starting = null;
+    });
+  }
 
+  Future<int>? _starting;
+
+  /// The port, with the guarantee that the listener ACTUALLY accepts
+  /// connections right now.
+  ///
+  /// start() trusts that a server it started is still listening. iOS suspends
+  /// a backgrounded app and may reclaim its sockets: after the app comes back
+  /// the object is still there ([isRunning] is true) while nothing answers on
+  /// its port, and every page loaded from it fails. A loopback connection
+  /// costs a millisecond; if it is refused the listener is replaced (a new
+  /// port; every URL is built from the port at planning time, so nothing
+  /// else needs to know).
+  Future<int> ensureHealthy() {
+    // One check-and-repair at a time, shared by every caller: two callers
+    // that each found the socket dead and each called stop() + start() would
+    // stop one another's fresh server.
+    return _repairing ??= _checkAndRepair().whenComplete(() {
+      _repairing = null;
+    });
+  }
+
+  Future<int>? _repairing;
+
+  Future<int> _checkAndRepair() async {
+    final starting = _starting;
+    if (starting != null) return starting;
+    final current = _server;
+    if (current == null) return start();
+    if (_boundPort != null && await _accepts(_boundPort!)) return _boundPort!;
+    await stop();
+    return start();
+  }
+
+  static Future<bool> _accepts(int port) async {
+    try {
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        port,
+        timeout: const Duration(milliseconds: 500),
+      );
+      socket.destroy();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Closes the underlying listener WITHOUT forgetting it, which is what the
+  /// operating system does to a suspended app's sockets. For tests only.
+  Future<void> debugKillListenerForTest() async {
+    await _server?.close(force: true);
+  }
+
+  Future<int> _bind() async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     _server = server;
+    _boundPort = server.port;
     server.listen(
       _handleRequest,
       onError: (_) {
@@ -84,8 +173,18 @@ class LocalSnapshotServer {
   }
 
   Future<void> stop() async {
+    // A start still binding must finish first, or its server would outlive
+    // this stop() and be left running.
+    final pending = _starting;
+    if (pending != null) {
+      try {
+        await pending;
+      } catch (_) {}
+    }
     final server = _server;
     _server = null;
+    _boundPort = null;
+    rootDirectory = null;
     await server?.close(force: true);
   }
 
@@ -98,6 +197,12 @@ class LocalSnapshotServer {
         return;
       }
 
+      if (!ownsUrl(request.requestedUri)) {
+        response.statusCode = HttpStatus.notFound;
+        await response.close();
+        return;
+      }
+      final requestToken = _accessToken;
       final root = rootDirectory;
       if (root == null) {
         response.statusCode = HttpStatus.notFound;
@@ -105,7 +210,10 @@ class LocalSnapshotServer {
         return;
       }
 
-      final file = _resolveWithinRoot(root, request.uri.path);
+      final file = _resolveWithinRoot(
+        root,
+        request.uri.path.substring(requestToken.length + 1),
+      );
       if (file == null || !await file.exists()) {
         response.statusCode = HttpStatus.notFound;
         await response.close();
@@ -124,16 +232,37 @@ class LocalSnapshotServer {
       // buffering one complete file in memory per request is an
       // acceptable, deliberate trade-off for this specific content.
       final encryptedBytes = await file.readAsBytes();
-      final decryptedBytes = encryptor.decryptBytes(encryptedBytes);
+      var decryptedBytes = encryptor.decryptBytes(encryptedBytes);
+      if (requestToken != _accessToken || root != rootDirectory) {
+        response.statusCode = HttpStatus.notFound;
+        await response.close();
+        return;
+      }
+      final type = _contentTypeFor(file.path);
+      if (type.mimeType == 'text/html' || type.mimeType == 'text/css') {
+        decryptedBytes = utf8.encode(
+          utf8
+              .decode(decryptedBytes)
+              .replaceAll('/assets/', '/$requestToken/assets/'),
+        );
+      }
 
       response.statusCode = HttpStatus.ok;
-      response.headers.contentType = _contentTypeFor(file.path);
+      response.headers.contentType = type;
       response.headers.contentLength = decryptedBytes.length;
       // Review round: this is a point-in-time snapshot the app manages
       // itself — nothing upstream of this server (the WebView, any
       // platform HTTP cache) should ever serve a stale copy of a page
       // after the app has replaced it with a fresher snapshot.
       response.headers.set(HttpHeaders.cacheControlHeader, 'no-store');
+      response.headers.set('Referrer-Policy', 'no-referrer');
+      response.headers.set('X-Content-Type-Options', 'nosniff');
+      response.headers.set(
+        'Content-Security-Policy',
+        "default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+            "style-src 'self' 'unsafe-inline'; connect-src 'none'; form-action 'none'; "
+            "frame-src 'none'; object-src 'none'; base-uri 'none'",
+      );
 
       if (request.method == 'HEAD') {
         await response.close();
@@ -186,8 +315,9 @@ class LocalSnapshotServer {
       // listing, see this class's own docblock.
       return false;
     }
-    final rootWithSeparator =
-        rootCanonical.endsWith(Platform.pathSeparator) ? rootCanonical : '$rootCanonical${Platform.pathSeparator}';
+    final rootWithSeparator = rootCanonical.endsWith(Platform.pathSeparator)
+        ? rootCanonical
+        : '$rootCanonical${Platform.pathSeparator}';
     return targetCanonical.startsWith(rootWithSeparator);
   }
 
@@ -238,7 +368,10 @@ class LocalSnapshotServer {
     final slash = mimeType.indexOf('/');
     final primary = mimeType.substring(0, slash);
     final sub = mimeType.substring(slash + 1);
-    final isText = primary == 'text' || mimeType == 'application/json' || mimeType == 'application/xml';
+    final isText =
+        primary == 'text' ||
+        mimeType == 'application/json' ||
+        mimeType == 'application/xml';
     return ContentType(primary, sub, charset: isText ? 'utf-8' : null);
   }
 }

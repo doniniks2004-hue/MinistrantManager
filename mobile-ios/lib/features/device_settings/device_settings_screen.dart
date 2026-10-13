@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../../core/util/build_info.dart';
+import '../../core/util/startup_trace.dart';
 import '../revocation/revocation_handler.dart';
 
 /// Offline-architecture milestone, P9. Review round decision: "Reset/
@@ -100,6 +102,20 @@ class _DeviceSettingsScreenState extends State<DeviceSettingsScreen> {
             subtitle: const Text('Usuwa lokalne dane i offline cache tej parafii, wraca do aktywacji QR.'),
             trailing: _resetting ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2)) : null,
             onTap: _resetting ? null : _confirmAndReset,
+          ),
+          const Divider(height: 32),
+          ListTile(
+            leading: const Icon(Icons.info_outline),
+            title: const Text('Wersja aplikacji'),
+            subtitle: SelectableText('commit ${buildCommitLabel()}'),
+          ),
+          ListTile(
+            leading: const Icon(Icons.timer_outlined),
+            title: const Text('Diagnostyka startu'),
+            // Where the cold start spent its time, measured on this very
+            // device (from the first Dart code; Android's own process start
+            // is not included).
+            subtitle: SelectableText(StartupTrace.format()),
           ),
         ],
       ),
