@@ -550,6 +550,9 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
         _isCurrentOfflineDocument(uri)) {
       _offlineDocStarted = true;
     }
+    if (!_online && uri != null && widget.coordinator.localServer.ownsUrl(uri)) {
+      widget.coordinator.trace('offline-render: started; current=');
+    }
     if (_online && uri != null && _trusted(uri)) {
       _failedDocuments.remove(uri.toString());
       final path = snapshotPagePath(uri);
@@ -577,6 +580,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
             : !(widget.coordinator.localServer.ownsUrl(uri) &&
                   _isCurrentOfflineDocument(uri))))
       return;
+    if (!_online) widget.coordinator.trace('offline-render: finish callback');
     if (_failedDocuments.contains(uri.toString())) return;
     if (_online) {
       final finishedPath = snapshotPagePath(uri);
