@@ -527,6 +527,9 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     _offlineLoadUrl = null;
     _navigationDeadline?.cancel();
     _navigationDeadline = null;
+    if (wasOpeningACopy) {
+      widget.coordinator.trace('offline-render: deadline expired; retry=$_offlineAutoRetries');
+    }
     if (wasOpeningACopy && _retryOfflineOnce()) return;
     setState(() {
       _state = _LoadState.error;
@@ -546,6 +549,9 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
         widget.coordinator.localServer.ownsUrl(uri) &&
         _isCurrentOfflineDocument(uri)) {
       _offlineDocStarted = true;
+    }
+    if (!_online && uri != null && widget.coordinator.localServer.ownsUrl(uri)) {
+      widget.coordinator.trace('offline-render: started; current=');
     }
     if (_online && uri != null && _trusted(uri)) {
       _failedDocuments.remove(uri.toString());
@@ -574,6 +580,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
             : !(widget.coordinator.localServer.ownsUrl(uri) &&
                   _isCurrentOfflineDocument(uri))))
       return;
+    if (!_online) widget.coordinator.trace('offline-render: finish callback');
     if (_failedDocuments.contains(uri.toString())) return;
     if (_online) {
       final finishedPath = snapshotPagePath(uri);
@@ -620,7 +627,10 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     }
     setState(() => _state = _LoadState.ready);
     StartupTrace.mark(_online ? 'page_ready_online' : 'page_ready_offline');
-    if (!_online) _offlineAutoRetries = 0;
+    if (!_online) {
+      widget.coordinator.trace('offline-render: finished');
+      _offlineAutoRetries = 0;
+    }
     final lossWatch = _lossWatch;
     if (!_online && lossWatch != null) {
       widget.coordinator.trace(
