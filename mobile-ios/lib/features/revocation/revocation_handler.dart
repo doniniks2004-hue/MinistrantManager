@@ -1,3 +1,4 @@
+import 'package:webview_flutter/webview_flutter.dart' show WebViewCookieManager;
 import '../../core/database/app_database.dart';
 import '../../core/offline/snapshot_store.dart';
 import '../../core/secure/secure_storage_service.dart';
@@ -26,7 +27,17 @@ import '../../core/sync/sync_engine.dart';
 /// choosing "Zmień parafię" in settings). Never call either
 /// speculatively; both end with the app back at the activation screen.
 class RevocationHandler {
-  RevocationHandler({required this.db, required this.secureStorage, required this.snapshotStore});
+  RevocationHandler({
+    required this.db,
+    required this.secureStorage,
+    required this.snapshotStore,
+    Future<void> Function()? clearWebViewCookies,
+  }) : _clearWebViewCookies = clearWebViewCookies ?? _clearPlatformCookies;
+
+  final Future<void> Function() _clearWebViewCookies;
+
+  static Future<void> _clearPlatformCookies() =>
+      WebViewCookieManager().clearCookies();
 
   final AppDatabase db;
   final SecureStorageService secureStorage;
@@ -80,6 +91,24 @@ class RevocationHandler {
   /// Returns whether BOTH steps succeeded. False means the wipe is not
   /// complete (files may remain, or the key may still exist) and must not be
   /// reported as a full erase.
+  /// Removes the parish's PHP session from the WebView's cookie jar.
+  ///
+  /// The session the handoff creates lives for 30 days of inactivity on the
+  /// server (SESSION_LIFETIME_SECONDS), and the parish pages do not know about
+  /// devices at all: revoking a device stops the mobile API and the issuing of
+  /// new tickets, but a session cookie that is still in the jar would go on
+  /// working. Logging a user out already cleared it (user_session_service.dart);
+  /// the revocation path did not. Best-effort, like the rest of the wipe: it
+  /// must never stop the sequence that follows.
+  Future<void> clearWebViewSession() async {
+    try {
+      await _clearWebViewCookies();
+    } catch (_) {
+      // A platform without a WebView binding (a unit test) must not abort a
+      // revocation.
+    }
+  }
+
   Future<bool> wipeSnapshotsAndKey() async {
     var complete = true;
     try {
@@ -115,6 +144,7 @@ class RevocationHandler {
     // revocation is always right: the next parish gets a fresh one on its
     // first snapshot write. The two steps are independent (see the method).
     await wipeSnapshotsAndKey();
+    await clearWebViewSession();
 
     // Order matters: rows first (needs a live connection), then the file
     // (needs the connection closed), then the key (only once the file is

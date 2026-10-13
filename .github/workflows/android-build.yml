@@ -134,8 +134,11 @@ jobs:
       - name: Build release APK + AAB (only if keystore secrets are configured)
         if: ${{ env.HAS_ANDROID_KEYSTORE == 'true' && env.HAS_ANDROID_STORE_PASSWORD == 'true' && env.HAS_ANDROID_KEY_ALIAS == 'true' && env.HAS_ANDROID_KEY_PASSWORD == 'true' }}
         run: |
-          flutter build apk --release --dart-define=GIT_SHA=${{ github.sha }}
-          flutter build appbundle --release --dart-define=GIT_SHA=${{ github.sha }}
+          # Both stores reject an upload whose build number they have already
+          # seen, and pubspec.yaml's "+N" only changes when somebody edits it.
+          # The workflow's own run number only ever goes up.
+          flutter build apk --release --build-number=${{ github.run_number }} --dart-define=GIT_SHA=${{ github.sha }}
+          flutter build appbundle --release --build-number=${{ github.run_number }} --dart-define=GIT_SHA=${{ github.sha }}
 
       - name: Record which commit these files were built from
         # The commit is also compiled into the app (device settings -> "Wersja

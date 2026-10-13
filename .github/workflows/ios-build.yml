@@ -104,6 +104,16 @@ jobs:
             exit 1
           fi
 
+          # The Runner target applies Runner.entitlements, which declares
+          # Associated Domains (Universal Links). A profile without that
+          # capability makes the signing step fail with a message that does not
+          # say why, after the whole build has run. Say it here, first.
+          if ! /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.associated-domains' "$PROFILE_PLIST" >/dev/null 2>&1; then
+            echo "The provisioning profile does not include the Associated Domains capability."
+            echo "Enable it for the App ID eu.ministrant.manager in the Apple Developer portal and regenerate the profile."
+            exit 1
+          fi
+
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
 
@@ -136,7 +146,10 @@ jobs:
 
       - name: Build signed IPA
         if: ${{ env.HAS_APPLE_CERT == 'true' && env.HAS_APPLE_CERT_PASSWORD == 'true' && env.HAS_APPLE_PROFILE == 'true' && env.HAS_APPLE_TEAM_ID == 'true' }}
-        run: flutter build ipa --release --export-options-plist=ios/ExportOptions.generated.plist
+        # App Store Connect rejects a build number it has already seen for this
+        # version, and pubspec.yaml's "+N" only changes when somebody edits it.
+        # The workflow's own run number only ever goes up.
+        run: flutter build ipa --release --build-number=${{ github.run_number }} --export-options-plist=ios/ExportOptions.generated.plist
 
       - uses: actions/upload-artifact@v4
         with:
