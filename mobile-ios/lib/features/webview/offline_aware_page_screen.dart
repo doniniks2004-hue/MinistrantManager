@@ -527,6 +527,9 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     _offlineLoadUrl = null;
     _navigationDeadline?.cancel();
     _navigationDeadline = null;
+    if (wasOpeningACopy) {
+      widget.coordinator.trace('offline-render: deadline expired; attempt=');
+    }
     if (wasOpeningACopy && _retryOfflineOnce()) return;
     setState(() {
       _state = _LoadState.error;
@@ -620,7 +623,10 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     }
     setState(() => _state = _LoadState.ready);
     StartupTrace.mark(_online ? 'page_ready_online' : 'page_ready_offline');
-    if (!_online) _offlineAutoRetries = 0;
+    if (!_online) {
+      widget.coordinator.trace('offline-render: finished');
+      _offlineAutoRetries = 0;
+    }
     final lossWatch = _lossWatch;
     if (!_online && lossWatch != null) {
       widget.coordinator.trace(
