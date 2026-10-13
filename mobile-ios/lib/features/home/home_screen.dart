@@ -14,6 +14,13 @@ import '../../core/util/startup_trace.dart';
 import '../revocation/revocation_handler.dart';
 import '../webview/offline_aware_page_screen.dart';
 
+/// How long the LOCAL start-up reads (keystore, database open) may take. They
+/// normally take milliseconds; one that never answers used to leave the
+/// screen on its spinner for good, because the start-up timeout in main.dart
+/// ends before this screen's own first reads begin. Past this limit the
+/// existing "could not read app data" screen, with its retry, is shown.
+const _localReadLimit = Duration(seconds: 10);
+
 /// Spec §26–§28: renders instantly from SQLite, shows an OFFLINE banner
 /// with the timestamp of the last known-good sync when relevant, and
 /// updates reactively once the background sync completes.
@@ -318,8 +325,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // then wait for both. (`ignore` so that if one fails before the other is
     // awaited, the second one's error is not reported as unhandled; the
     // awaits below still throw it.)
-    final identityRead = _readIdentity()..ignore();
-    final metaRead = widget.db.ensureSyncMetadata()..ignore();
+    final identityRead = _readIdentity().timeout(_localReadLimit)..ignore();
+    final metaRead =
+        widget.db.ensureSyncMetadata().timeout(_localReadLimit)..ignore();
     final localIdentity = await identityRead;
     final localMeta = await metaRead;
     final localHasUserSession = localIdentity.hasUserSession;
@@ -397,7 +405,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // Is a USER actually signed in on this device? Checked regardless of
     // online/offline device state (offlineWithinLease still shows the
     // login screen if no one's signed in yet).
-    final earlyIdentity = await _readIdentity();
+    final earlyIdentity = await _readIdentity().timeout(_localReadLimit);
     final hasUserSession = earlyIdentity.hasUserSession;
     final earlyUserId = earlyIdentity.userId;
     final earlyParishId = earlyIdentity.parishId;
@@ -453,7 +461,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     final finalIds = hasUserSession
-        ? await _readIdentityValues()
+        ? await _readIdentityValues().timeout(_localReadLimit)
         : (userId: null, parishId: null, serverUrl: null);
     final userId = finalIds.userId;
     final parishId = finalIds.parishId;

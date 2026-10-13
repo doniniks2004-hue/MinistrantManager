@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -108,6 +110,7 @@ void main() {
   late AppDatabase sharedDb;
   final store = <String, String>{};
   var failReads = false;
+  var hangReads = false;
 
   setUpAll(() {
     TestWidgetsFlutterBinding.ensureInitialized();
@@ -121,6 +124,7 @@ void main() {
   setUp(() {
     store.clear();
     failReads = false;
+    hangReads = false;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(_channel, (call) async {
       final args = call.arguments as Map?;
@@ -128,6 +132,7 @@ void main() {
       switch (call.method) {
         case 'read':
           if (failReads) throw PlatformException(code: 'keystore-unavailable');
+          if (hangReads) return Completer<Object?>().future; // never answers
           return key == null ? null : store[key];
         case 'write':
           final value = args?['value'] as String?;
@@ -245,5 +250,32 @@ void main() {
     expect(find.textContaining('Nie udało się odczytać danych aplikacji'), findsNothing);
     expect(find.textContaining(missingData), findsOneWidget);
     expect(find.byType(spinner), findsNothing);
+  });
+
+  testWidgets('F5: a local read that NEVER answers ends in the error with a retry, not in a spinner', (
+    tester,
+  ) async {
+    hangReads = true;
+    store['mobile_user_token'] = 'token';
+    store['current_user_id'] = '7';
+
+    await tester.pumpWidget(_home(sharedDb));
+    await _settle(tester);
+    expect(find.byType(spinner), findsOneWidget, reason: 'still waiting within the limit');
+
+    await tester.pump(const Duration(seconds: 11)); // past the limit
+    await _settle(tester);
+    expect(find.byType(spinner), findsNothing);
+    expect(
+      find.textContaining('Nie udało się odczytać danych aplikacji'),
+      findsOneWidget,
+    );
+
+    hangReads = false; // the storage answers again
+    await tester.tap(find.text('SPRÓBUJ PONOWNIE'));
+    await _settle(tester);
+
+    expect(find.textContaining('Nie udało się odczytać danych aplikacji'), findsNothing);
+    expect(find.textContaining(missingData), findsOneWidget, reason: 'the retry really re-read');
   });
 }

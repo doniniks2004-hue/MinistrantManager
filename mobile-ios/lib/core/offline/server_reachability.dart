@@ -48,7 +48,7 @@ Reachability classifySocketException(SocketException error) {
       text.contains('name or service not known')) {
     return Reachability.dnsFailure;
   }
-  if (code == _econnrefused || text.contains('connection refused')) {
+  if (code == _econnrefused || code == 10061 || text.contains('connection refused')) {
     return Reachability.refused;
   }
   if (code == _etimedout || text.contains('timed out')) {

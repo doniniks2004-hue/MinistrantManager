@@ -24,6 +24,30 @@ import 'package:ministrant_manager/features/webview/webview_handoff_service.dart
 /// finding this fixes). Overrides ONLY requestHandoffUrl(); secureStorage
 /// is still the REAL field OfflinePageCoordinator reads
 /// (handoffService.secureStorage.serverUrl) for its reachability check.
+/// Counts what the coordinator asks the capture service to do.
+class _CountingCapture extends SnapshotCaptureService {
+  _CountingCapture(SnapshotStore store)
+    : super(downloader: PageResourceDownloader(), store: store);
+
+  final htmls = <String>[];
+  Completer<void>? gate;
+  CaptureOutcome outcome = const CaptureOutcome(CaptureStatus.saved);
+
+  @override
+  Future<CaptureOutcome> captureAndSave({
+    required String parishId,
+    required String userId,
+    required Uri serverBaseUrl,
+    required String targetPath,
+    required String renderedHtml,
+    int? expectedGeneration,
+  }) async {
+    htmls.add(renderedHtml);
+    await gate?.future;
+    return outcome;
+  }
+}
+
 /// A server that cannot bind (e.g. no loopback), to prove warmUp never throws.
 class _FailingServer extends LocalSnapshotServer {
   _FailingServer() : super(encryptor: _testEncryptor);
@@ -248,6 +272,41 @@ void main() {
       if (await tempRoot.exists()) {
         await tempRoot.delete(recursive: true);
       }
+    });
+
+    test('an offline plan after the app was away: the dead listener is replaced, the URL answers', () async {
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: store,
+        localServer: localServer,
+        handoffService: _FakeHandoffService(SecureStorageService()),
+      );
+      await store.writeSnapshot(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/ranking.php',
+        html: '<html>Ranking</html>',
+        assets: {},
+      );
+      await localServer.start();
+      await localServer.debugKillListenerForTest(); // reclaimed while in the background
+
+      final plan = await coordinator.plan(
+        parishId: 'p',
+        userId: 'u',
+        targetPath: '/public/ranking.php',
+        forceOffline: true,
+      );
+
+      expect(plan, isA<PageLoadOffline>());
+      final url = (plan as PageLoadOffline).url;
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        url.port,
+        timeout: const Duration(seconds: 1),
+      );
+      socket.destroy(); // the plan's address is a live one
     });
 
     test('warmUp starts the loopback server once, however many callers and however early', () async {
@@ -1283,6 +1342,72 @@ void main() {
         formatOfflineBannerText(DateTime(2026, 10, 1, 23, 5)),
         'OFFLINE • ostatnia synchronizacja: 23:05',
       );
+    });
+
+    group('captures of one page do not pile up (F8)', () {
+      late _CountingCapture counting;
+      late OfflinePageCoordinator coordinator;
+
+      setUp(() {
+        fakeStore['server_url'] = 'https://szarlej.ministrant.eu';
+        counting = _CountingCapture(store);
+        coordinator = OfflinePageCoordinator(
+          connectivityProbe: ConnectivityProbe(),
+          captureService: counting,
+          snapshotStore: store,
+          localServer: localServer,
+          handoffService: _FakeHandoffService(SecureStorageService()),
+        );
+      });
+
+      void capture(String html, {String path = '/public/dashboard.php'}) =>
+          coordinator.captureInBackground(
+            parishId: 'p',
+            userId: 'u',
+            targetPath: path,
+            renderedHtml: html,
+          );
+
+      test('captures of the same page queued together: only the NEWEST runs', () async {
+        capture('first');
+        capture('second');
+        capture('third');
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        expect(counting.htmls, ['third']);
+      });
+
+      test('one that is already RUNNING finishes; the newer one waits, the middle one is skipped', () async {
+        counting.gate = Completer<void>();
+        capture('first');
+        await Future<void>.delayed(const Duration(milliseconds: 150));
+        expect(counting.htmls, ['first'], reason: 'running, held at the gate');
+
+        capture('second');
+        capture('third');
+        counting.gate!.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        expect(counting.htmls, ['first', 'third']);
+      });
+
+      test('different pages are never merged', () async {
+        capture('a', path: '/public/dashboard.php');
+        capture('b', path: '/public/ranking.php');
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        expect(counting.htmls, ['a', 'b']);
+      });
+
+      test('how a capture ended is published, and kept', () async {
+        counting.outcome = const CaptureOutcome(
+          CaptureStatus.rejectedIncomplete,
+          missingCritical: ['public/css/style.css'],
+        );
+        final published = coordinator.captureOutcomes.first;
+        capture('x');
+        final outcome = await published.timeout(const Duration(seconds: 2));
+        expect(outcome.status, CaptureStatus.rejectedIncomplete);
+        expect(outcome.missingCritical, ['public/css/style.css']);
+        expect(coordinator.lastCaptureOutcome, same(outcome));
+      });
     });
 
     test('captureInBackground eventually persists a snapshot keyed by targetPath, without the caller awaiting it', () async {

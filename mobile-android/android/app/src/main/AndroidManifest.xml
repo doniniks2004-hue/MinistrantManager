@@ -1,6 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- Network access for activation, sync, heartbeat -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Read-only: lets the app learn when the connection is lost or returns
+         (ConnectivityManager). Without it registering the callback throws. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- QR scanning (mobile_scanner) -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />

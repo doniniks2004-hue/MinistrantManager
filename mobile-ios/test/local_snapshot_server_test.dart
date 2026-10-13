@@ -211,6 +211,63 @@ void main() {
       expect(fresh.isRunning, isFalse);
     });
 
+    group('ensureHealthy: a listener the system closed while the app was away', () {
+      Future<bool> accepts(int port) async {
+        try {
+          final socket = await Socket.connect(
+            InternetAddress.loopbackIPv4,
+            port,
+            timeout: const Duration(seconds: 1),
+          );
+          socket.destroy();
+          return true;
+        } catch (_) {
+          return false;
+        }
+      }
+
+      test('a healthy server is kept: same port, no restart', () async {
+        final fresh = LocalSnapshotServer(encryptor: testEncryptor);
+        addTearDown(fresh.stop);
+        final first = await fresh.start();
+        expect(await fresh.ensureHealthy(), first);
+        expect(await accepts(first), isTrue);
+      });
+
+      test('a server that was never started is started', () async {
+        final fresh = LocalSnapshotServer(encryptor: testEncryptor);
+        addTearDown(fresh.stop);
+        final port = await fresh.ensureHealthy();
+        expect(fresh.isRunning, isTrue);
+        expect(await accepts(port), isTrue);
+      });
+
+      test('REGRESSION: the object says it is running, nothing answers; ensureHealthy brings it back', () async {
+        final fresh = LocalSnapshotServer(encryptor: testEncryptor);
+        addTearDown(fresh.stop);
+        final dead = await fresh.start();
+        await fresh.debugKillListenerForTest(); // what a suspended iOS app comes back to
+
+        expect(fresh.isRunning, isTrue, reason: 'start() would be fooled by this');
+        expect(await accepts(dead), isFalse, reason: 'and nothing is listening');
+        expect(await fresh.start(), dead, reason: 'start() hands the dead port back');
+
+        final port = await fresh.ensureHealthy();
+        expect(await accepts(port), isTrue);
+        expect(fresh.isRunning, isTrue);
+      });
+
+      test('concurrent callers share the one repair', () async {
+        final fresh = LocalSnapshotServer(encryptor: testEncryptor);
+        addTearDown(fresh.stop);
+        await fresh.start();
+        await fresh.debugKillListenerForTest();
+        final ports = await Future.wait([for (var i = 0; i < 5; i++) fresh.ensureHealthy()]);
+        expect(ports.toSet(), hasLength(1));
+        expect(await accepts(ports.first), isTrue);
+      });
+    });
+
     test('the server can be started again after a stop', () async {
       final fresh = LocalSnapshotServer(encryptor: testEncryptor);
       addTearDown(fresh.stop);

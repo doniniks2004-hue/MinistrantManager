@@ -101,6 +101,7 @@ class SnapshotStore {
       userId: userId,
       pagePath: pagePath,
     );
+    await _recoverInterruptedSwap(dir);
     final manifest = await readManifest(dir);
     if (manifest == null ||
         manifest.parishId != parishId ||
@@ -108,6 +109,55 @@ class SnapshotStore {
         manifest.path != pagePath)
       return null;
     return dir;
+  }
+
+  /// Crash recovery for the replacement in [_writeSnapshot].
+  ///
+  /// Replacing a snapshot first moves the old directory aside (`.trash-*`) and
+  /// then moves the new one into its place. Between those two renames the
+  /// page has NO directory, and a process killed there (the OS reclaiming the
+  /// app, a crash, a flat battery) used to leave it that way for good: the
+  /// catch that undoes a failed second rename cannot run in a dead process,
+  /// and the saved copy, complete and intact in the trash directory, was
+  /// never looked at again.
+  ///
+  /// If the page directory is missing and an old copy was set aside, put the
+  /// newest one back, so there is always one COMPLETE copy. Anything half
+  /// written (`.tmp-*`) and any other leftover of that page is deleted: it
+  /// can only be a leftover, because writes and this method share one queue
+  /// ([_serial]), so none can be in progress. Running in that queue also
+  /// means a reader waits for a write that is under way instead of looking at
+  /// the page in the middle of its replacement.
+  Future<void> _recoverInterruptedSwap(Directory realDir) {
+    return _serial(() async {
+      try {
+        if (await realDir.exists()) return;
+        final parent = realDir.parent;
+        if (!await parent.exists()) return;
+        final name = p.basename(realDir.path);
+        final trashed = <Directory>[];
+        final temps = <Directory>[];
+        await for (final entry in parent.list(followLinks: false)) {
+          if (entry is! Directory) continue;
+          final base = p.basename(entry.path);
+          if (base.startsWith('$name.trash-')) trashed.add(entry);
+          if (base.startsWith('$name.tmp-')) temps.add(entry);
+        }
+        if (trashed.isEmpty) return;
+        trashed.sort(
+          (a, b) => b.statSync().modified.compareTo(a.statSync().modified),
+        );
+        await trashed.first.rename(realDir.path);
+        for (final leftover in [...trashed.skip(1), ...temps]) {
+          try {
+            await leftover.delete(recursive: true);
+          } catch (_) {}
+        }
+      } catch (_) {
+        // Recovery is best-effort: failing leaves things exactly as they
+        // were, and the caller reads "no copy" rather than a wrong one.
+      }
+    });
   }
 
   Future<SnapshotManifest?> readManifest(Directory pageDirectory) async {
@@ -141,6 +191,7 @@ class SnapshotStore {
       userId: userId,
       pagePath: pagePath,
     );
+    await _recoverInterruptedSwap(dir);
     final manifest = await readManifest(dir);
     if (manifest?.parishId != parishId ||
         manifest?.userId != userId ||

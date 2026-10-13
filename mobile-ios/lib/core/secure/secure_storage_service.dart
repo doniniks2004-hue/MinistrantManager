@@ -175,6 +175,22 @@ class SecureStorageService {
 
   Future<bool> get isActivated async => (await deviceToken) != null;
 
+  /// Credentials of an activation or a signed-in user are stored.
+  Future<bool> get hasCredentials async =>
+      (await deviceToken) != null || (await mobileUserToken) != null;
+
+  /// What a DELETED install leaves behind: on iOS the Keychain survives an
+  /// uninstall while the app's own files do not. Clears the activation, the
+  /// user session and both encryption keys (the files they protected are
+  /// gone, so the keys are only a liability). Like [clearActivation] it keeps
+  /// installation_id: the identity of this device may be reused when the
+  /// parish is activated again.
+  Future<void> clearAfterDeletedInstall() async {
+    await clearActivation();
+    await deleteDbEncryptionKey();
+    await deleteSnapshotEncryptionKey();
+  }
+
   /// Encryption key for the local SQLCipher database (spec §4 / RODO —
   /// the DB holds altar-server names, attendance, points; a bare
   /// `flutter_secure_storage` for the device token alone is NOT enough,

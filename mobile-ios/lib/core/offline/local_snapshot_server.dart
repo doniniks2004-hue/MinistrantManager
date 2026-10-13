@@ -57,6 +57,7 @@ class LocalSnapshotServer {
   final SnapshotEncryptor encryptor;
 
   HttpServer? _server;
+  int? _boundPort;
   Directory? _rootDirectory;
   String _accessToken = '';
   Directory? get rootDirectory => _rootDirectory;
@@ -82,7 +83,7 @@ class LocalSnapshotServer {
       uri.port == port &&
       uri.path.startsWith('/$_accessToken/');
 
-  int? get port => _server?.port;
+  int? get port => _boundPort;
   bool get isRunning => _server != null;
 
   /// Starts the server if not already running and returns the port it's
@@ -91,7 +92,7 @@ class LocalSnapshotServer {
   /// "did I already start this" themselves.
   Future<int> start() {
     final existing = _server;
-    if (existing != null) return Future.value(existing.port);
+    if (existing != null) return Future.value(_boundPort!);
     // Concurrent callers share ONE bind. Without this, two calls made before
     // the first bind finished both saw "not running", both bound a port, the
     // second overwrote _server and the first server was orphaned on a port
@@ -104,9 +105,61 @@ class LocalSnapshotServer {
 
   Future<int>? _starting;
 
+  /// The port, with the guarantee that the listener ACTUALLY accepts
+  /// connections right now.
+  ///
+  /// start() trusts that a server it started is still listening. iOS suspends
+  /// a backgrounded app and may reclaim its sockets: after the app comes back
+  /// the object is still there ([isRunning] is true) while nothing answers on
+  /// its port, and every page loaded from it fails. A loopback connection
+  /// costs a millisecond; if it is refused the listener is replaced (a new
+  /// port; every URL is built from the port at planning time, so nothing
+  /// else needs to know).
+  Future<int> ensureHealthy() {
+    // One check-and-repair at a time, shared by every caller: two callers
+    // that each found the socket dead and each called stop() + start() would
+    // stop one another's fresh server.
+    return _repairing ??= _checkAndRepair().whenComplete(() {
+      _repairing = null;
+    });
+  }
+
+  Future<int>? _repairing;
+
+  Future<int> _checkAndRepair() async {
+    final starting = _starting;
+    if (starting != null) return starting;
+    final current = _server;
+    if (current == null) return start();
+    if (_boundPort != null && await _accepts(_boundPort!)) return _boundPort!;
+    await stop();
+    return start();
+  }
+
+  static Future<bool> _accepts(int port) async {
+    try {
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        port,
+        timeout: const Duration(milliseconds: 500),
+      );
+      socket.destroy();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Closes the underlying listener WITHOUT forgetting it, which is what the
+  /// operating system does to a suspended app's sockets. For tests only.
+  Future<void> debugKillListenerForTest() async {
+    await _server?.close(force: true);
+  }
+
   Future<int> _bind() async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     _server = server;
+    _boundPort = server.port;
     server.listen(
       _handleRequest,
       onError: (_) {
@@ -130,6 +183,7 @@ class LocalSnapshotServer {
     }
     final server = _server;
     _server = null;
+    _boundPort = null;
     rootDirectory = null;
     await server?.close(force: true);
   }

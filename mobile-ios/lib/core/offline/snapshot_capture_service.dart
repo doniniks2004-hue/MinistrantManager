@@ -30,6 +30,45 @@ import 'snapshot_store.dart';
 /// and whatever snapshot already existed for this page is left exactly
 /// as it was — no explicit catch/rollback needed in this class, because
 /// there is nothing here to roll back.
+enum CaptureStatus {
+  /// The page was written and is now the saved copy.
+  saved,
+
+  /// A critical resource (stylesheet, script) is missing: the page was NOT
+  /// written, and the previous saved copy, if any, is untouched.
+  rejectedIncomplete,
+
+  /// Not a page that is saved at all (login, handoff, ...).
+  notCapturable,
+}
+
+/// What a capture ended in. Carries enough to tell, from the outside, whether
+/// a saved copy was replaced and what it was missing — it has no page
+/// content, no address with a query and nothing about the user.
+class CaptureOutcome {
+  const CaptureOutcome(
+    this.status, {
+    this.missingCritical = const [],
+    this.missingOptional = const [],
+    this.externalHosts = const [],
+    this.budgetExhausted = false,
+  });
+
+  final CaptureStatus status;
+  final List<String> missingCritical;
+  final List<String> missingOptional;
+  final List<String> externalHosts;
+  final bool budgetExhausted;
+
+  @override
+  String toString() =>
+      'capture: ${status.name}'
+      '${missingCritical.isEmpty ? '' : '; missing critical: ${missingCritical.join(', ')}'}'
+      '${missingOptional.isEmpty ? '' : '; missing optional: ${missingOptional.length}'}'
+      '${externalHosts.isEmpty ? '' : '; external: ${externalHosts.join(', ')}'}'
+      '${budgetExhausted ? '; budget exhausted' : ''}';
+}
+
 class SnapshotCaptureService {
   SnapshotCaptureService({required this.downloader, required this.store});
 
@@ -54,7 +93,7 @@ class SnapshotCaptureService {
   /// — resolving them against the handoff script's location instead
   /// would silently produce wrong paths for every relative reference on
   /// the page.
-  Future<void> captureAndSave({
+  Future<CaptureOutcome> captureAndSave({
     required String parishId,
     required String userId,
     required Uri serverBaseUrl,
@@ -64,12 +103,24 @@ class SnapshotCaptureService {
   }) async {
     final captureGeneration = expectedGeneration ?? store.generation;
     final path = snapshotPagePath(Uri.parse(targetPath));
-    if (path == null) return;
+    if (path == null) return const CaptureOutcome(CaptureStatus.notCapturable);
     final pageUrl = serverBaseUrl.resolve(path);
     final captured = await downloader.capture(
       pageUrl: pageUrl,
       renderedHtml: renderedHtml,
     );
+    // A page that lacks a stylesheet or a script is not the page. Writing it
+    // would REPLACE a working copy with a broken one, which is worse than
+    // keeping the old one: so it is refused, before anything is touched.
+    if (captured.missingCritical.isNotEmpty) {
+      return CaptureOutcome(
+        CaptureStatus.rejectedIncomplete,
+        missingCritical: captured.missingCritical,
+        missingOptional: captured.missingOptional,
+        externalHosts: captured.externalHosts,
+        budgetExhausted: captured.budgetExhausted,
+      );
+    }
     await store.writeSnapshot(
       parishId: parishId,
       userId: userId,
@@ -77,6 +128,13 @@ class SnapshotCaptureService {
       html: captured.html,
       expectedGeneration: captureGeneration,
       assets: captured.assets,
+    );
+    // Reached only after the store has finished: this is the durable end.
+    return CaptureOutcome(
+      CaptureStatus.saved,
+      missingOptional: captured.missingOptional,
+      externalHosts: captured.externalHosts,
+      budgetExhausted: captured.budgetExhausted,
     );
   }
 }

@@ -30,22 +30,64 @@ import 'package:html/parser.dart' as html_parser;
 /// CDN is never guaranteed reachable later, so depending on it for an
 /// offline-capable snapshot would be self-defeating.
 class PageResourceDownloader {
-  PageResourceDownloader({HttpClient? httpClient})
-    : _httpClient = httpClient ?? HttpClient();
+  PageResourceDownloader({
+    HttpClient? httpClient,
+    this.totalBudget = const Duration(seconds: 15),
+    this.maxTotalBytes = 40 * 1024 * 1024,
+  }) : _httpClient = httpClient ?? HttpClient();
   final HttpClient _httpClient;
+
+  /// Time allowed for the WHOLE capture of one page (each resource has its
+  /// own 3 s on top of this, never more than what is left). Without it a
+  /// page with many slow resources could keep a capture running for minutes.
+  final Duration totalBudget;
+
+  /// Bytes allowed for all the resources of one page together.
+  final int maxTotalBytes;
+
   Future<CapturedPage> capture({
     required Uri pageUrl,
     required String renderedHtml,
-  }) =>
-      _ResourceCapture(httpClient: _httpClient)
-          .capture(pageUrl: pageUrl, renderedHtml: renderedHtml);
+  }) => _ResourceCapture(
+    httpClient: _httpClient,
+    totalBudget: totalBudget,
+    maxTotalBytes: maxTotalBytes,
+  ).capture(pageUrl: pageUrl, renderedHtml: renderedHtml);
 }
 
 class _ResourceCapture {
-  _ResourceCapture({HttpClient? httpClient})
-    : _httpClient = httpClient ?? HttpClient();
+  _ResourceCapture({
+    HttpClient? httpClient,
+    required this.totalBudget,
+    required this.maxTotalBytes,
+  }) : _httpClient = httpClient ?? HttpClient();
 
   final HttpClient _httpClient;
+  final Duration totalBudget;
+  final int maxTotalBytes;
+
+  // What the page needs, sorted by how much its absence matters.
+  //
+  // CRITICAL (a page without them is not the page): same-origin stylesheets,
+  // same-origin scripts, and what a stylesheet @imports. Taken from the real
+  // pages of the parish panel: /public/css/style.css and /public/js/script.js
+  // are loaded by every page; without the first the page is unstyled, without
+  // the second the menu and the interactive parts do not work.
+  //
+  // OPTIONAL (a page without them is still the page): images, the icon, url()
+  // references inside CSS. The logo (/public/ikona.png) is the real example.
+  //
+  // EXTERNAL (never captured, and never a reason to refuse a page): another
+  // origin. The real dashboard @imports Google Fonts (Poppins). Offline the
+  // local page's policy blocks every other origin, so the page uses its
+  // fallback font by design.
+  final _missingCritical = <String>[];
+  final _missingOptional = <String>[];
+  final _externalHosts = <String>{};
+  final _failedKeys = <String>{};
+  final _clock = Stopwatch();
+  var _totalBytes = 0;
+  var _budgetExhausted = false;
 
   static final RegExp _cssUrlPattern = RegExp(
     r'url\(\s*([^)]+?)\s*\)',
@@ -71,6 +113,9 @@ class _ResourceCapture {
     _assets = <String, List<int>>{};
     _cssAlreadyProcessed = <String>{};
     _currentPage = pageUrl;
+    _clock
+      ..reset()
+      ..start();
 
     final document = html_parser.parse(renderedHtml);
 
@@ -81,7 +126,7 @@ class _ResourceCapture {
       if (href == null || href.isEmpty) continue;
       final resolved = _resolve(pageUrl, href);
       if (resolved == null) continue;
-      final key = await _fetchAndStore(resolved);
+      final key = await _fetchAndStore(resolved, critical: true);
       if (key == null) continue;
       await _processCssAsset(key, resolved);
       link.attributes['href'] = '/assets/$key';
@@ -106,7 +151,7 @@ class _ResourceCapture {
       if (src == null || src.isEmpty) continue;
       final resolved = _resolve(pageUrl, src);
       if (resolved == null) continue;
-      final key = await _fetchAndStore(resolved);
+      final key = await _fetchAndStore(resolved, critical: true);
       if (key != null) script.attributes['src'] = '/assets/$key';
     }
 
@@ -154,7 +199,14 @@ class _ResourceCapture {
     for (final input in document.querySelectorAll('input[type="password"]')) {
       input.attributes.remove('value');
     }
-    return CapturedPage(html: document.outerHtml, assets: _assets);
+    return CapturedPage(
+      html: document.outerHtml,
+      assets: _assets,
+      missingCritical: List.unmodifiable(_missingCritical),
+      missingOptional: List.unmodifiable(_missingOptional),
+      externalHosts: List.unmodifiable(_externalHosts.toList()..sort()),
+      budgetExhausted: _budgetExhausted,
+    );
   }
 
   /// Fetches a same-origin resource if not already fetched this
@@ -163,20 +215,37 @@ class _ResourceCapture {
   /// docblock) or genuinely unreachable (left alone so the page still
   /// renders, just without that one resource, same as a browser
   /// showing a broken image rather than failing the whole page).
-  Future<String?> _fetchAndStore(Uri resourceUrl) async {
+  Future<String?> _fetchAndStore(Uri resourceUrl, {bool critical = false}) async {
     if (resourceUrl.scheme != _currentPage.scheme ||
         resourceUrl.host != _currentPage.host ||
         resourceUrl.port != _currentPage.port) {
+      // Another origin: recorded, never fetched, never a missing resource.
+      _externalHosts.add(resourceUrl.host);
       return null;
     }
     final key = _keyFor(resourceUrl);
     if (_assets.containsKey(key)) {
       return key;
     }
+    if (_failedKeys.contains(key)) {
+      // Already tried and failed; if THIS use of it is critical, say so.
+      if (critical) _recordMissing(key, critical: true);
+      return null;
+    }
     final bytes = await _fetch(resourceUrl);
-    if (bytes == null) return null;
+    if (bytes == null) {
+      _failedKeys.add(key);
+      _recordMissing(key, critical: critical);
+      return null;
+    }
+    _totalBytes += bytes.length;
     _assets[key] = bytes;
     return key;
+  }
+
+  void _recordMissing(String key, {required bool critical}) {
+    final list = critical ? _missingCritical : _missingOptional;
+    if (!list.contains(key)) list.add(key);
   }
 
   /// Downloads the stylesheet already stored under [key] (fetched by
@@ -238,7 +307,7 @@ class _ResourceCapture {
       final rawUrl = _stripQuotes(match.group(1)!.trim());
       final resolved = _resolve(baseUrl, rawUrl);
       if (resolved == null) continue;
-      final key = await _fetchAndStore(resolved);
+      final key = await _fetchAndStore(resolved, critical: true);
       if (key == null) continue;
       if (recurseIntoImports) {
         await _processCssAsset(key, resolved);
@@ -327,6 +396,13 @@ class _ResourceCapture {
   }
 
   Future<List<int>?> _fetch(Uri url) async {
+    final remaining = totalBudget - _clock.elapsed;
+    if (remaining <= Duration.zero) {
+      _budgetExhausted = true;
+      return null;
+    }
+    const perResource = Duration(seconds: 3);
+    final limit = remaining < perResource ? remaining : perResource;
     HttpClientRequest? pending;
     try {
       return await (() async {
@@ -341,13 +417,19 @@ class _ResourceCapture {
         final bytes = <int>[];
         await for (final chunk in response) {
           bytes.addAll(chunk);
-          if (bytes.length > 10 * 1024 * 1024)
+          if (bytes.length > 10 * 1024 * 1024) {
             throw const FormatException('Snapshot asset too large.');
+          }
+          if (_totalBytes + bytes.length > maxTotalBytes) {
+            _budgetExhausted = true;
+            throw const FormatException('Snapshot page too large.');
+          }
         }
         return bytes;
-      })().timeout(const Duration(seconds: 3));
+      })().timeout(limit);
     } catch (_) {
       pending?.abort();
+      if (_clock.elapsed >= totalBudget) _budgetExhausted = true;
       return null;
     }
   }
@@ -357,8 +439,29 @@ class _ResourceCapture {
 /// write as `snapshot.html`, assets is ready to pass straight to
 /// [SnapshotStore.writeSnapshot]'s own `assets` parameter.
 class CapturedPage {
-  const CapturedPage({required this.html, required this.assets});
+  const CapturedPage({
+    required this.html,
+    required this.assets,
+    this.missingCritical = const [],
+    this.missingOptional = const [],
+    this.externalHosts = const [],
+    this.budgetExhausted = false,
+  });
 
   final String html;
   final Map<String, List<int>> assets;
+
+  /// Keys of stylesheets, scripts and @imports that could not be fetched. A
+  /// page missing any of them is not complete (see SnapshotCaptureService).
+  final List<String> missingCritical;
+
+  /// Keys of images and url() references that could not be fetched; the page
+  /// is still complete.
+  final List<String> missingOptional;
+
+  /// Other origins the page refers to (never captured).
+  final List<String> externalHosts;
+
+  /// The total time or size allowed for the page ran out.
+  final bool budgetExhausted;
 }

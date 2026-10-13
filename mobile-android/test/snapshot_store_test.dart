@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
+import 'package:ministrant_manager/core/offline/snapshot_manifest.dart';
 import 'package:ministrant_manager/core/offline/snapshot_store.dart';
 
 /// Offline-architecture milestone, P8.2: SnapshotStore now requires a
@@ -217,7 +218,7 @@ void main() {
       final parentDir = dir.parent;
       final siblingNames = parentDir
           .listSync()
-          .map((e) => _basename(e.path))
+          .map((e) => e.path.split(Platform.pathSeparator).last)
           .toList();
       expect(
         siblingNames.where((n) => n.contains('.tmp-') || n.contains('.trash-')),
@@ -408,6 +409,113 @@ void main() {
       );
     });
   });
-}
 
-String _basename(String path) => path.split(Platform.pathSeparator).last;
+  group('F6: a process killed in the middle of replacing a snapshot', () {
+    Future<Directory> saved(String html) async {
+      await store.writeSnapshot(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/dashboard.php',
+        html: html,
+        assets: {},
+      );
+      return (await store.getPageDirectoryIfReady(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/dashboard.php',
+      ))!;
+    }
+
+    Future<SnapshotManifest?> manifest() => store.readManifestFor(
+      parishId: 'p',
+      userId: 'u',
+      pagePath: '/public/dashboard.php',
+    );
+
+    test('the old copy set aside before the crash comes back, complete', () async {
+      final real = await saved('old copy');
+      // The state a kill between the two renames leaves: the old directory
+      // moved aside, the new one not yet in place (a half-written temp one
+      // is lying around too).
+      final trash = Directory('${real.path}.trash-abc123');
+      await real.rename(trash.path);
+      await Directory('${real.path}.tmp-def456').create();
+      expect(await real.exists(), isFalse);
+
+      expect(await manifest(), isNotNull, reason: 'the copy is readable again');
+      expect(await real.exists(), isTrue);
+      expect(await trash.exists(), isFalse);
+      expect(
+        await Directory('${real.path}.tmp-def456').exists(),
+        isFalse,
+        reason: 'the half-written leftover is gone',
+      );
+    });
+
+    test('the page directory is reported ready after recovery, with the same content', () async {
+      final real = await saved('old copy');
+      await real.rename('${real.path}.trash-1');
+
+      final dir = await store.getPageDirectoryIfReady(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/dashboard.php',
+      );
+      expect(dir?.path, real.path);
+    });
+
+    test('with several set-aside copies the newest one is restored', () async {
+      final real = await saved('first');
+      final older = Directory('${real.path}.trash-older');
+      await real.rename(older.path);
+      // "newer" is created and written strictly after "older" last changed.
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      final newer = Directory('${real.path}.trash-newer');
+      await newer.create();
+      await File('${newer.path}/marker').writeAsString('newer');
+
+      await store.readManifestFor(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/dashboard.php',
+      );
+      expect(await File('${real.path}/marker').exists(), isTrue);
+      expect(await older.exists(), isFalse);
+    });
+
+    test('no set-aside copy: nothing is invented', () async {
+      expect(await manifest(), isNull);
+      expect(
+        await store.getPageDirectoryIfReady(
+          parishId: 'p',
+          userId: 'u',
+          pagePath: '/public/dashboard.php',
+        ),
+        isNull,
+      );
+    });
+
+    test('a healthy page is left alone, trash and all', () async {
+      final real = await saved('healthy');
+      final stray = Directory('${real.path}.trash-stray')..createSync();
+      expect(await manifest(), isNotNull);
+      expect(await real.exists(), isTrue);
+      expect(await stray.exists(), isTrue, reason: 'only a MISSING page triggers recovery');
+    });
+
+    test('a reader waits for a write under way instead of seeing its middle', () async {
+      await saved('v1');
+      final write = store.writeSnapshot(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/dashboard.php',
+        html: 'v2',
+        assets: {},
+      );
+      // Asked while the write is in the queue: must answer from a complete copy.
+      final read = manifest();
+      await write;
+      expect(await read, isNotNull);
+    });
+  });
+}

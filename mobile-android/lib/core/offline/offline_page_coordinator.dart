@@ -6,6 +6,8 @@ import 'package:flutter/foundation.dart';
 import 'page_identity.dart';
 
 import '../../features/webview/webview_handoff_service.dart';
+import '../network/network_signal.dart';
+import 'connectivity_monitor.dart';
 import 'connectivity_probe.dart';
 import 'local_snapshot_server.dart';
 import 'server_reachability.dart';
@@ -47,7 +49,19 @@ class OfflinePageCoordinator {
     this.onlineTimeout = const Duration(milliseconds: 1500),
     this.offlinePlanTimeout = const Duration(milliseconds: 1500),
     this.reachability = const ServerReachability(),
-  });
+    ConnectivityMonitor? connectivity,
+  }) : connectivity = connectivity ?? ConnectivityMonitor(PlatformNetworkSignal());
+
+  /// What the operating system says about the device's connection, turned
+  /// into decisions (lost / doubtful / returned). It says nothing about the
+  /// server: "returned" only means "ask the server now".
+  final ConnectivityMonitor connectivity;
+
+  /// A line for the debug log (never in release builds): used to measure
+  /// the time from a loss of connection to the saved copy being visible.
+  void trace(String message) {
+    if (kDebugMode) debugPrint(message);
+  }
 
   final ConnectivityProbe connectivityProbe;
 
@@ -95,6 +109,15 @@ class OfflinePageCoordinator {
   /// Bumped at the start of every plan() — "a NEWER plan exists".
   int _planGeneration = 0;
   Future<void> _captureQueue = Future<void>.value();
+
+  final _captureTokens = <String, int>{};
+  final _captureOutcomes = StreamController<CaptureOutcome>.broadcast();
+
+  /// How each capture ended: written, or refused for a missing critical
+  /// resource (and which). For diagnostics and acceptance; nothing in it is
+  /// page content or user data.
+  Stream<CaptureOutcome> get captureOutcomes => _captureOutcomes.stream;
+  CaptureOutcome? lastCaptureOutcome;
   final SnapshotCaptureService captureService;
   final SnapshotStore snapshotStore;
   final LocalSnapshotServer localServer;
@@ -314,7 +337,9 @@ class OfflinePageCoordinator {
       return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage);
     }
 
-    await localServer.start();
+    // Not start(): after the app was in the background the server object can
+    // exist while its socket is gone (iOS reclaims them).
+    await localServer.ensureHealthy();
     // Re-checked after the LAST await, immediately before the one
     // assignment that has a side effect outside this plan.
     if (_isStale(ticket)) {
@@ -353,12 +378,21 @@ class OfflinePageCoordinator {
     required String renderedHtml,
   }) {
     final generation = snapshotStore.generation;
+    // A page is captured right after it loads and again shortly after, to
+    // catch what the page's scripts add. Both used to be queued in full. A
+    // capture still WAITING when a newer one of the same page is queued
+    // behind it is skipped: the newer one has the later content, and a page
+    // that is slow to fetch cannot pile up a queue of captures of itself.
+    final key = '$parishId|$userId|$targetPath';
+    final token = (_captureTokens[key] ?? 0) + 1;
+    _captureTokens[key] = token;
     _captureQueue = _captureQueue.then((_) async {
       try {
+        if (_captureTokens[key] != token) return;
         if (snapshotStore.generation != generation) return;
         final serverUrlString = await handoffService.secureStorage.serverUrl;
         if (serverUrlString == null) return;
-        await captureService.captureAndSave(
+        final outcome = await captureService.captureAndSave(
           parishId: parishId,
           userId: userId,
           serverBaseUrl: Uri.parse(serverUrlString),
@@ -366,6 +400,9 @@ class OfflinePageCoordinator {
           renderedHtml: renderedHtml,
           expectedGeneration: generation,
         );
+        lastCaptureOutcome = outcome;
+        if (kDebugMode) debugPrint(outcome.toString());
+        if (!_captureOutcomes.isClosed) _captureOutcomes.add(outcome);
       } catch (_) {
         // A failed capture leaves the previous snapshot intact.
       }

@@ -1,6 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ministrant_manager/core/network/api_client.dart';
+import 'package:ministrant_manager/core/network/network_signal.dart';
+import 'package:ministrant_manager/core/offline/connectivity_monitor.dart';
 import 'package:ministrant_manager/core/offline/connectivity_probe.dart';
 import 'package:ministrant_manager/core/offline/local_snapshot_server.dart';
 import 'package:ministrant_manager/core/offline/offline_page_coordinator.dart';
@@ -123,10 +127,16 @@ class _FakeController extends PlatformWebViewController {
   bool jsThrows = false;
   int jsChecks = 0;
 
+  /// When set, the check does not answer until this completes (a web view
+  /// that is slow, or never answers at all).
+  Completer<Object>? jsGate;
+
   @override
   Future<Object> runJavaScriptReturningResult(String javaScript) async {
     jsChecks++;
     if (jsThrows) throw StateError('no page');
+    final gate = jsGate;
+    if (gate != null) return gate.future;
     return jsResult;
   }
 
@@ -222,11 +232,13 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
     Future<PageLoadPlan> Function(bool forceOffline) script, {
     Future<OnlineProbeResult> Function(int call)? probe,
     Future<Reachability> Function(int call)? reachability,
+    NetworkSignal? signal,
   }) => _ScriptedCoordinator._(
     SnapshotStore(encryptor: _encryptor),
     script,
     probe ?? (_) async => const OnlineProbeUnavailable(),
     reachability ?? (_) async => Reachability.reachable,
+    signal ?? const NoNetworkSignal(),
   );
 
   _ScriptedCoordinator._(
@@ -234,8 +246,10 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
     this.script,
     this.probeScript,
     this.reachabilityScript,
+    NetworkSignal signal,
   )
     : super(
+        connectivity: ConnectivityMonitor(signal),
         connectivityProbe: ConnectivityProbe(),
         captureService: SnapshotCaptureService(
           downloader: PageResourceDownloader(),
@@ -348,13 +362,15 @@ Widget _host(
   OfflinePageCoordinator coordinator, {
   Future<void> Function()? onLogout,
   bool forceOffline = false,
+  String parishId = 'p',
+  String userId = 'u',
 }) => MaterialApp(
   home: OfflineAwarePageScreen(
     title: 'Panel',
     targetPath: '/public/dashboard.php',
     allowedHost: 'szarlej.ministrant.eu',
-    parishId: 'p',
-    userId: 'u',
+    parishId: parishId,
+    userId: userId,
     coordinator: coordinator,
     onLogout: onLogout,
     forceOffline: forceOffline,
@@ -773,6 +789,178 @@ void main() {
     expect(find.textContaining('OFFLINE •'), findsNothing);
   });
 
+  group('F4: a callback belongs to the navigation it was reported for', () {
+    const host = 'https://szarlej.ministrant.eu';
+    const dashboardUrl = '$host/public/dashboard.php';
+    const rankingUrl = '$host/public/ranking.php';
+    const pointsUrl = '$host/public/points.php';
+
+    Future<void> ms(WidgetTester tester, int millis) => tester.pump(Duration(milliseconds: millis));
+
+    WebResourceError mainFrameError(String? url) => WebResourceError(
+      errorCode: -2,
+      description: 'net::ERR_INTERNET_DISCONNECTED',
+      isForMainFrame: true,
+      url: url,
+    );
+
+    _ScriptedCoordinator scripted({Future<OnlineProbeResult> Function(int call)? probe}) =>
+        _ScriptedCoordinator(
+          (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+          probe: probe,
+        );
+
+    Future<void> liveReady(WidgetTester tester) async {
+      await ms(tester, 10);
+      platform.delegates.single.onPageFinished!(dashboardUrl);
+      await ms(tester, 10);
+    }
+
+    testWidgets('A started -> B started -> the late finish of A does not become the current page', (
+      tester,
+    ) async {
+      final coordinator = scripted();
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      final d = platform.delegates.single;
+      final c = platform.controllers.single;
+
+      d.onPageStarted!(rankingUrl);
+      d.onPageStarted!(pointsUrl);
+      final scriptsBefore = c.scripts.length;
+      d.onPageFinished!(rankingUrl); // the engine reports A's end late
+      await ms(tester, 10);
+      expect(c.scripts.length, scriptsBefore, reason: 'the stale finish captured nothing');
+
+      // If B now fails, it is B that the copy must be opened for.
+      d.onWebResourceError!(mainFrameError(pointsUrl));
+      await ms(tester, 10);
+      expect(coordinator.planRequests.last.$1, '/public/points.php');
+    });
+
+    testWidgets('B\'s own finish is accepted and captured', (tester) async {
+      final coordinator = scripted();
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      final d = platform.delegates.single;
+      final c = platform.controllers.single;
+      d.onPageStarted!(rankingUrl);
+      d.onPageStarted!(pointsUrl);
+      d.onPageFinished!(rankingUrl);
+      final scriptsBefore = c.scripts.length;
+      d.onPageFinished!(pointsUrl);
+      await ms(tester, 10);
+      expect(c.scripts.length, greaterThan(scriptsBefore), reason: 'B is a real page and is captured');
+    });
+
+    testWidgets('the late error of a REPLACED navigation does not send the screen to the copy', (
+      tester,
+    ) async {
+      final coordinator = scripted();
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      final d = platform.delegates.single;
+      d.onPageStarted!(rankingUrl);
+      d.onPageStarted!(pointsUrl);
+
+      d.onWebResourceError!(mainFrameError(rankingUrl)); // A's, late
+      await ms(tester, 10);
+      expect(coordinator.planCalls, 1, reason: 'ignored');
+      expect(platform.controllers.single.loaded, [_ticketUrl]);
+
+      d.onWebResourceError!(mainFrameError(pointsUrl)); // the current one's
+      await ms(tester, 10);
+      expect(coordinator.planCalls, 2, reason: 'a failure of the CURRENT navigation counts');
+    });
+
+    testWidgets('a page started again is current again', (tester) async {
+      final coordinator = scripted();
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      final d = platform.delegates.single;
+      d.onPageStarted!(rankingUrl);
+      d.onPageStarted!(pointsUrl); // ranking replaced
+      d.onPageStarted!(rankingUrl); // and opened again
+      d.onWebResourceError!(mainFrameError(rankingUrl));
+      await ms(tester, 10);
+      expect(coordinator.planCalls, 2);
+    });
+
+    testWidgets('a redirect (a finish for a page that never had a start) still completes the load', (
+      tester,
+    ) async {
+      final coordinator = scripted();
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      final d = platform.delegates.single;
+      final c = platform.controllers.single;
+      d.onPageStarted!(rankingUrl);
+      final scriptsBefore = c.scripts.length;
+      d.onPageFinished!(pointsUrl); // the server redirected ranking -> points
+      await ms(tester, 10);
+      expect(c.scripts.length, greaterThan(scriptsBefore), reason: 'accepted: nothing replaced it');
+    });
+
+    testWidgets('OFFLINE -> ONLINE -> the old copy\'s error arrives: not a lost connection', (
+      tester,
+    ) async {
+      final coordinator = scripted(probe: (_) async => OnlineProbeRecovered(_onlinePlan()));
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      final d = platform.delegates.single;
+
+      d.onWebResourceError!(mainFrameError(dashboardUrl)); // the live page fails
+      await ms(tester, 10);
+      d.onPageFinished!(_localUrl.toString());
+      await ms(tester, 10);
+      await ms(tester, 2100); // the server answers: back online
+      expect(platform.controllers.single.loaded.last, _ticketUrl);
+      d.onPageFinished!(dashboardUrl);
+      await ms(tester, 10);
+      final plans = coordinator.planCalls;
+
+      d.onWebResourceError!(mainFrameError(_localUrl.toString())); // the copy's, late
+      await ms(tester, 10);
+      await ms(tester, 3000);
+
+      expect(coordinator.planCalls, plans, reason: 'no fallback, no flap');
+      expect(platform.controllers.single.loaded.last, _ticketUrl);
+      expect(find.textContaining('OFFLINE •'), findsNothing);
+    });
+
+    testWidgets('another parish or user: the screen starts over, nothing of the old identity stays', (
+      tester,
+    ) async {
+      final coordinator = scripted();
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      expect(find.byType(CircularProgressIndicator), findsNothing);
+
+      await tester.pumpWidget(_host(coordinator, parishId: 'other', userId: 'u2'));
+      await ms(tester, 10);
+
+      expect(coordinator.planCalls, 2, reason: 'a new load for the new identity');
+      expect(platform.controllers.single.loaded, [_ticketUrl, _ticketUrl]);
+      expect(find.byType(CircularProgressIndicator), findsOneWidget, reason: 'loading again, not showing the old page');
+    });
+
+    testWidgets('events after the screen is gone are ignored', (tester) async {
+      final coordinator = scripted();
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      final d = platform.delegates.single;
+      await tester.pumpWidget(const SizedBox());
+      final plans = coordinator.planCalls;
+
+      d.onPageStarted!(rankingUrl);
+      d.onPageFinished!(rankingUrl);
+      d.onWebResourceError!(mainFrameError(rankingUrl));
+      await ms(tester, 10);
+      await tester.pump(const Duration(seconds: 30));
+      expect(coordinator.planCalls, plans);
+    });
+  });
+
   group('first switch to the saved copy', () {
     Future<void> ms(WidgetTester tester, int millis) =>
         tester.pump(Duration(milliseconds: millis));
@@ -1063,6 +1251,103 @@ void main() {
       await ms(tester, 10);
       expect(platform.controllers.single.loaded, [_ticketUrl, _localUrl]);
       expect(find.text('POKAŻ ZAPISANĄ WERSJĘ'), findsNothing);
+    });
+
+    testWidgets(
+      'F3: a web view that never answers the unsaved-input question defers instead of freezing',
+      (tester) async {
+        final coordinator = scripted((_) async => Reachability.noRoute);
+        await tester.pumpWidget(_host(coordinator));
+        await liveReady(tester);
+        platform.controllers.single.jsGate = Completer<Object>(); // never completed
+
+        await ms(tester, 1600);
+        expect(platform.controllers.single.loaded, [_ticketUrl], reason: 'still asking');
+
+        await ms(tester, 900); // past the limit for the answer
+        expect(find.text('POKAŻ ZAPISANĄ WERSJĘ'), findsOneWidget, reason: 'deferred, with an action');
+        expect(platform.controllers.single.loaded, [_ticketUrl], reason: 'nothing was swapped blindly');
+
+        await tester.tap(find.text('POKAŻ ZAPISANĄ WERSJĘ'));
+        await ms(tester, 10);
+        expect(platform.controllers.single.loaded, [_ticketUrl, _localUrl]);
+      },
+    );
+
+    testWidgets('F3: a late answer for a page that is gone changes nothing', (tester) async {
+      final coordinator = scripted((_) async => Reachability.noRoute);
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      final gate = Completer<Object>();
+      platform.controllers.single.jsGate = gate;
+
+      await ms(tester, 1520); // the check ran, the page is being asked
+      await tester.pumpWidget(_host(coordinator, forceOffline: true)); // a new load
+      await ms(tester, 10);
+      final plans = coordinator.planCalls;
+      gate.complete(false); // the old answer arrives now
+      await ms(tester, 10);
+
+      expect(coordinator.planCalls, plans, reason: 'the old answer started nothing');
+      expect(find.text('POKAŻ ZAPISANĄ WERSJĘ'), findsNothing);
+    });
+
+    testWidgets(
+      'F2: a check that ends after the page changed does not take the watch with it',
+      (tester) async {
+        final first = Completer<Reachability>();
+        final coordinator = scripted(
+          (call) => call == 1
+              ? first.future
+              : Future.value(call == 2 ? Reachability.noRoute : Reachability.reachable),
+        );
+        await tester.pumpWidget(_host(coordinator));
+        await liveReady(tester);
+        await ms(tester, 1500); // check #1 is running, unanswered
+
+        // The page is reloaded and the new live page finishes.
+        await tester.pumpWidget(_host(coordinator, forceOffline: true));
+        await ms(tester, 10);
+        await tester.pumpWidget(_host(coordinator));
+        await ms(tester, 10);
+        platform.delegates.single.onPageFinished!(dashboardUrl);
+        await ms(tester, 10);
+
+        // The new page's timer fires while check #1 is still running and is
+        // dropped as "already in flight".
+        await ms(tester, 1600);
+        expect(coordinator.reachabilityCalls, 1);
+
+        first.complete(Reachability.reachable); // the old check ends: stale
+        await ms(tester, 10);
+
+        // The watch must still be alive: the next check finds no route.
+        await ms(tester, 1600);
+        expect(coordinator.reachabilityCalls, greaterThanOrEqualTo(2));
+        expect(platform.controllers.single.loaded.last, _localUrl);
+      },
+    );
+
+    testWidgets('F2: a check that ends while the app is in the background switches nothing', (
+      tester,
+    ) async {
+      final first = Completer<Reachability>();
+      final coordinator = scripted(
+        (call) => call == 1 ? first.future : Future.value(Reachability.reachable),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      await ms(tester, 1500); // check #1 running
+
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      first.complete(Reachability.noRoute);
+      await ms(tester, 10);
+      expect(platform.controllers.single.loaded, [_ticketUrl], reason: 'no switch while away');
+
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await ms(tester, 1600);
+      expect(coordinator.reachabilityCalls, greaterThanOrEqualTo(2), reason: 'watching resumes');
+      expect(platform.controllers.single.loaded, [_ticketUrl]);
     });
 
     testWidgets('a reachable server leaves the page alone, however long it stays', (
@@ -1924,4 +2209,208 @@ void main() {
     await tester.pump(const Duration(seconds: 10));
     expect(find.text('SPRÓBUJ PONOWNIE'), findsNothing);
   });
+
+  group('native network signal (F1)', () {
+    final createdMonitors = <ConnectivityMonitor>[];
+
+    void networkScreenTest(String label, Future<void> Function(WidgetTester) body) {
+      testWidgets(label, (tester) async {
+        try {
+          await body(tester);
+        } finally {
+          await tester.pumpWidget(const SizedBox());
+          for (final monitor in createdMonitors) { monitor.dispose(); }
+          await tester.pump();
+        }
+      });
+    }
+    const dashboardUrl = 'https://szarlej.ministrant.eu/public/dashboard.php';
+    const wifi = NetworkState(hasInterface: true, validated: true, transport: NetworkTransport.wifi);
+    const cell = NetworkState(hasInterface: true, validated: true, transport: NetworkTransport.cellular);
+    const none = NetworkState(hasInterface: false, transport: NetworkTransport.none);
+    const wifiNoInternet = NetworkState(hasInterface: true, validated: false, transport: NetworkTransport.wifi);
+
+    Future<void> ms(WidgetTester tester, int millis) => tester.pump(Duration(milliseconds: millis));
+
+    late _TestSignal signal;
+    setUp(() => signal = _TestSignal()..now = wifi);
+
+    _ScriptedCoordinator scripted({
+      Future<OnlineProbeResult> Function(int call)? probe,
+      Future<Reachability> Function(int call)? reachability,
+    }) { final c = _ScriptedCoordinator(
+      (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+      probe: probe,
+      reachability: reachability,
+      signal: signal,
+    );
+      createdMonitors.add(c.connectivity);
+      return c;
+    }
+
+    Future<void> liveReady(WidgetTester tester) async {
+      await ms(tester, 10);
+      platform.delegates.single.onPageFinished!(dashboardUrl);
+      await ms(tester, 10);
+    }
+
+    networkScreenTest('ACCEPTANCE: the interface goes away -> the saved copy is opened within 2 s, MEASURED', (
+      tester,
+    ) async {
+      final coordinator = scripted();
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      expect(platform.controllers.single.loaded, [_ticketUrl]);
+
+      signal.emit(none);
+      var elapsed = 0;
+      while (platform.controllers.single.loaded.length < 2 && elapsed < 2000) {
+        await ms(tester, 10);
+        elapsed += 10;
+      }
+      expect(platform.controllers.single.loaded, [_ticketUrl, _localUrl]);
+      expect(elapsed, lessThanOrEqualTo(500), reason: 'the system signal needs no server check');
+      expect(coordinator.reachabilityCalls, 0, reason: 'decided by the signal, not by the TCP check');
+      expect(coordinator.planReasons.last, OfflineReason.noNetwork);
+
+      platform.delegates.single.onPageFinished!(_localUrl.toString());
+      await ms(tester, 10);
+      expect(find.textContaining('OFFLINE •'), findsOneWidget);
+    });
+
+    networkScreenTest('a handover to another network is not an outage', (tester) async {
+      final coordinator = scripted();
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      signal.emit(none);
+      await ms(tester, 100);
+      signal.emit(cell);
+      await ms(tester, 5000);
+      expect(platform.controllers.single.loaded, [_ticketUrl]);
+      expect(coordinator.planCalls, 1);
+    });
+
+    networkScreenTest('unsaved input: the loss is reported to the user, the page is not swapped', (tester) async {
+      final coordinator = scripted();
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      platform.controllers.single.jsResult = true;
+
+      signal.emit(none);
+      await ms(tester, 400);
+      expect(platform.controllers.single.loaded, [_ticketUrl]);
+      expect(find.text('POKAŻ ZAPISANĄ WERSJĘ'), findsOneWidget);
+    });
+
+    networkScreenTest('a loss while the live page is still loading goes straight to the copy', (tester) async {
+      final coordinator = scripted();
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10); // ticket requested, page not finished
+      signal.emit(none);
+      await ms(tester, 400);
+      expect(platform.controllers.single.loaded.last, _localUrl);
+    });
+
+    networkScreenTest('the network returning asks the SERVER at once, and only its answer brings the live page back', (
+      tester,
+    ) async {
+      final coordinator = scripted(probe: (_) async => OnlineProbeRecovered(_onlinePlan()));
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      signal.emit(none);
+      await ms(tester, 400);
+      platform.delegates.single.onPageFinished!(_localUrl.toString());
+      await ms(tester, 10);
+      expect(coordinator.probeCalls, 0, reason: 'no probe before the network is back');
+
+      signal.emit(cell);
+      await ms(tester, 50); // far less than the back-off
+      expect(coordinator.probeCalls, 1);
+      expect(platform.controllers.single.loaded, [_ticketUrl, _localUrl, _ticketUrl]);
+    });
+
+    networkScreenTest('network back but the SERVER silent: the copy stays, with the usual back-off, no loop', (
+      tester,
+    ) async {
+      final coordinator = scripted(); // probe: unavailable
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      signal.emit(none);
+      await ms(tester, 400);
+      platform.delegates.single.onPageFinished!(_localUrl.toString());
+      await ms(tester, 10);
+
+      signal.emit(cell);
+      await ms(tester, 50);
+      expect(coordinator.probeCalls, 1, reason: 'asked once, at once');
+      expect(platform.controllers.single.loaded, [_ticketUrl, _localUrl], reason: 'and stays on the copy');
+
+      await ms(tester, 1000);
+      expect(coordinator.probeCalls, 1, reason: 'the next ask waits out the back-off');
+      await tester.pump(const Duration(minutes: 1));
+      expect(platform.controllers.single.loaded, [_ticketUrl, _localUrl]);
+    });
+
+    networkScreenTest('Wi-Fi without internet: the server is checked at once, not at the next interval', (
+      tester,
+    ) async {
+      final coordinator = scripted(reachability: (_) async => Reachability.noRoute);
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+
+      signal.emit(wifiNoInternet);
+      await ms(tester, 100); // the periodic check is 1.5 s away
+      expect(coordinator.reachabilityCalls, 1);
+      expect(platform.controllers.single.loaded, [_ticketUrl, _localUrl]);
+    });
+
+    networkScreenTest('a flapping connection cannot drive the screen back and forth', (tester) async {
+      final coordinator = scripted(probe: (_) async => OnlineProbeRecovered(_onlinePlan()));
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      for (var i = 0; i < 10; i++) {
+        signal.emit(none);
+        await ms(tester, 300);
+        signal.emit(i.isEven ? cell : wifi);
+        await ms(tester, 60);
+        // Whatever the page does, the live page finishes when asked to.
+        if (platform.controllers.single.loaded.last != _localUrl) {
+          platform.delegates.single.onPageFinished!(dashboardUrl);
+        } else {
+          platform.delegates.single.onPageFinished!(_localUrl.toString());
+        }
+        await ms(tester, 10);
+      }
+      await tester.pump(const Duration(seconds: 10));
+      // Ten flaps: far fewer page loads than a switch per flap would make.
+      expect(platform.controllers.single.loaded.length, lessThan(14));
+    });
+
+    networkScreenTest('after the screen is gone, signals are ignored', (tester) async {
+      final coordinator = scripted();
+      await tester.pumpWidget(_host(coordinator));
+      await liveReady(tester);
+      await tester.pumpWidget(const SizedBox());
+      final plans = coordinator.planCalls;
+      signal.emit(none);
+      await ms(tester, 1000);
+      expect(coordinator.planCalls, plans);
+    });
+  });
+}
+
+class _TestSignal implements NetworkSignal {
+  final controller = StreamController<NetworkState>.broadcast();
+  NetworkState? now;
+
+  @override
+  Stream<NetworkState> get changes => controller.stream;
+
+  @override
+  Future<NetworkState?> current() async => now;
+
+  void emit(NetworkState state) {
+    now = state;
+    controller.add(state);
+  }
 }

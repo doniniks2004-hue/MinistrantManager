@@ -7,6 +7,7 @@ import 'package:webview_flutter/webview_flutter.dart';
 
 import '../../core/util/startup_trace.dart';
 import '../../core/offline/offline_page_coordinator.dart';
+import '../../core/offline/connectivity_monitor.dart';
 import '../../core/offline/page_identity.dart';
 import '../../core/offline/server_reachability.dart';
 
@@ -110,6 +111,9 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
   static const _heartbeatInterval = Duration(milliseconds: 1500);
   static const _heartbeatConfirmDelay = Duration(milliseconds: 400);
 
+  /// How long the page may take to say whether a field was edited.
+  static const _unsavedInputCheckLimit = Duration(milliseconds: 800);
+
   /// True from the moment a handoff ticket is in hand (PageLoadOnline) —
   /// from then on [_offlineTotalBudget] no longer applies.
   bool _onlineRendering = false;
@@ -190,6 +194,23 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
   /// Carried across offline link taps so they do not reset it.
   OfflineReason _offlineReason = OfflineReason.noNetwork;
 
+  // ---- which ONLINE navigation a callback belongs to ------------------------
+  //
+  // The engine reports starts, finishes and errors without saying which
+  // navigation they are about, and may report them late. A navigation that was
+  // REPLACED by a newer one before it finished is remembered here, and what
+  // arrives for it afterwards is ignored. A redirect is not a replaced
+  // navigation (its target never had a start of its own to be replaced), so
+  // it still goes through: ignoring it would leave the page loading forever.
+
+  /// The page whose navigation started most recently, and whether it has
+  /// finished.
+  String? _lastStartedPath;
+  bool _lastStartedFinished = true;
+
+  /// Pages whose navigation was replaced before it finished.
+  final _supersededPaths = <String>{};
+
   /// Automatic retries of a FAILED first opening of the saved copy. The
   /// first opening is cold (server just started, nothing cached) and the
   /// second, with the same data, worked every time a person tried it, so
@@ -201,6 +222,13 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
   /// reports no address and arrives before this is the abandoned live
   /// navigation's, not this one's.
   bool _offlineDocStarted = false;
+
+  // ---- what the operating system says about the connection ----------------
+  StreamSubscription<ConnectivityEvent>? _connectivitySub;
+
+  /// Running from the moment a loss of connection was reported until the
+  /// saved copy is visible (debug log only).
+  Stopwatch? _lossWatch;
 
   // ---- noticing a lost connection on an idle live page --------------------
   Timer? _heartbeat;
@@ -312,6 +340,21 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
                 return;
               }
             }
+            if (_online) {
+              // Only the failure of the CURRENT live navigation counts.
+              final failed = e.url == null ? null : Uri.tryParse(e.url!);
+              if (failed != null) {
+                // An address that is not this host over https is not a live
+                // page: typically the old saved copy (localhost) whose error
+                // arrives after the switch back online. Treating it as a
+                // lost connection sent the screen back to the copy.
+                if (!_trusted(failed)) return;
+                final failedPath = snapshotPagePath(failed);
+                if (failedPath != null && _supersededPaths.contains(failedPath)) {
+                  return; // a navigation that was already replaced
+                }
+              }
+            }
             _navigationDeadline?.cancel();
             _totalDeadline?.cancel();
             _totalDeadline = null;
@@ -341,6 +384,10 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     // when the first fallback needs it. Not awaited, never fails.
     unawaited(widget.coordinator.warmUp());
     unawaited(_hideScrollBars());
+    widget.coordinator.connectivity.start();
+    _connectivitySub = widget.coordinator.connectivity.events.listen(
+      _onConnectivity,
+    );
     unawaited(_loadPage(forceOffline: widget.forceOffline));
   }
 
@@ -359,6 +406,17 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
   @override
   void didUpdateWidget(covariant OfflineAwarePageScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.parishId != widget.parishId ||
+        oldWidget.userId != widget.userId) {
+      // Another parish or user: nothing of the previous identity may reach
+      // this one, neither a page, nor a copy, nor a late callback.
+      _failedDocuments.clear();
+      _afterHandoffPath = null;
+      _sessionRenewals = 0;
+      _currentPath = widget.targetPath;
+      unawaited(_loadPage(forceOffline: widget.forceOffline));
+      return;
+    }
     if (oldWidget.forceOffline != widget.forceOffline) {
       unawaited(_loadPage(forceOffline: widget.forceOffline));
     }
@@ -372,6 +430,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     _totalDeadline?.cancel();
     _recoveryTimer?.cancel();
     _heartbeat?.cancel();
+    _connectivitySub?.cancel();
     _captureTimer?.cancel();
     super.dispose();
   }
@@ -492,6 +551,15 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
       _failedDocuments.remove(uri.toString());
       final path = snapshotPagePath(uri);
       if (path != null && _afterHandoffPath == null) _currentPath = path;
+      if (path != null) {
+        final previous = _lastStartedPath;
+        if (previous != null && previous != path && !_lastStartedFinished) {
+          _supersededPaths.add(previous); // replaced before it finished
+        }
+        _supersededPaths.remove(path); // started again: it is current now
+        _lastStartedPath = path;
+        _lastStartedFinished = false;
+      }
       _startDeadline();
     }
     unawaited(_controller.runJavaScript(_bridgeShim).catchError((_) {}));
@@ -507,6 +575,16 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
                   _isCurrentOfflineDocument(uri))))
       return;
     if (_failedDocuments.contains(uri.toString())) return;
+    if (_online) {
+      final finishedPath = snapshotPagePath(uri);
+      // The late finish of a navigation that was replaced: not this page.
+      if (finishedPath != null && _supersededPaths.contains(finishedPath)) {
+        return;
+      }
+      if (finishedPath != null && finishedPath == _lastStartedPath) {
+        _lastStartedFinished = true;
+      }
+    }
     if (_online && _afterHandoffPath != null && snapshotPagePath(uri) != null) {
       final target = _afterHandoffPath!;
       _afterHandoffPath = null;
@@ -543,6 +621,13 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     setState(() => _state = _LoadState.ready);
     StartupTrace.mark(_online ? 'page_ready_online' : 'page_ready_offline');
     if (!_online) _offlineAutoRetries = 0;
+    final lossWatch = _lossWatch;
+    if (!_online && lossWatch != null) {
+      widget.coordinator.trace(
+        'net: connection lost -> saved copy visible after ${lossWatch.elapsedMilliseconds} ms',
+      );
+      _lossWatch = null;
+    }
     if (!_online) {
       unawaited(
         _controller
@@ -650,6 +735,55 @@ $_captureChannel.postMessage(JSON.stringify({
     await widget.onLogout!();
   }
 
+  /// The system reports a change of connection. Reacting here is what makes
+  /// the saved copy appear within moments of a loss instead of after the next
+  /// check. It decides nothing about the SERVER: a returned network starts a
+  /// check of the server, and only an answer from the server brings the live
+  /// page back.
+  void _onConnectivity(ConnectivityEvent event) {
+    if (!mounted || _loggingOut) return;
+    switch (event.kind) {
+      case ConnectivityEventKind.lost:
+        if (!_online) return; // already on the copy, or about to be
+        _lossWatch = Stopwatch()..start();
+        widget.coordinator.trace('net: connection lost');
+        if (_state == _LoadState.ready) {
+          // In the background the screen does nothing; on return the
+          // periodic check finds the loss within seconds.
+          if (_appInBackground) return;
+          unawaited(_connectionLost(OfflineReason.noNetwork, _loadGeneration));
+        } else if (_state == _LoadState.loading) {
+          unawaited(
+            _loadPage(
+              forceOffline: true,
+              offlineReason: OfflineReason.noNetwork,
+            ),
+          );
+        }
+      case ConnectivityEventKind.doubtful:
+        // Connected, but the system doubts the internet is reachable: ask the
+        // server now rather than at the next interval.
+        if (_online && _state == _LoadState.ready && !_appInBackground) {
+          _heartbeat?.cancel();
+          _heartbeatMisses = 0;
+          unawaited(_heartbeatTick(_loadGeneration));
+        }
+      case ConnectivityEventKind.returned:
+        if (_online) {
+          _heartbeatMisses = 0;
+          return;
+        }
+        // Ask the server at once instead of waiting out the back-off. The
+        // answer, not the network, decides; a server that does not answer
+        // keeps the saved copy and the usual back-off.
+        if (_recoverable && !_recoveryInFlight) {
+          _recoveryTimer?.cancel();
+          _recoveryAttempts = 0;
+          unawaited(_attemptRecovery(_loadGeneration));
+        }
+    }
+  }
+
   // ---- noticing a lost connection on an idle live page ----------------------
   //
   // Nothing else notices it: a page that is already loaded makes no request,
@@ -688,9 +822,20 @@ $_captureChannel.postMessage(JSON.stringify({
   bool _liveAndCurrent(int generation) =>
       mounted &&
       !_loggingOut &&
+      !_appInBackground &&
       generation == _loadGeneration &&
       _online &&
       _state == _LoadState.ready;
+
+  /// A check that finished for a page that is no longer the current one must
+  /// not take the watch with it: if a live page is on screen now, keep
+  /// checking it. (The timer of the new page may have fired while the old
+  /// check was still running and been dropped as "already in flight".)
+  void _resumeHeartbeatIfLive() {
+    if (mounted && !_loggingOut && _online && _state == _LoadState.ready) {
+      _scheduleHeartbeat(_heartbeatInterval);
+    }
+  }
 
   Future<void> _heartbeatTick(int generation) async {
     if (!_liveAndCurrent(generation) || _heartbeatInFlight) return;
@@ -698,7 +843,10 @@ $_captureChannel.postMessage(JSON.stringify({
     final verdict = await _checkOnce().whenComplete(() {
       _heartbeatInFlight = false;
     });
-    if (!_liveAndCurrent(generation)) return;
+    if (!_liveAndCurrent(generation)) {
+      _resumeHeartbeatIfLive();
+      return;
+    }
 
     switch (verdict) {
       case Reachability.reachable:
@@ -729,15 +877,19 @@ $_captureChannel.postMessage(JSON.stringify({
   Future<void> _connectionLost(OfflineReason reason, int generation) async {
     // Never swap a page the user is typing into for a copy on their own:
     // offer it instead.
-    if (await _hasUnsavedInput()) {
-      if (!_liveAndCurrent(generation)) return;
+    final dirty = await _hasUnsavedInput();
+    if (!_liveAndCurrent(generation)) {
+      // The page changed, or the app left, while the page was being asked.
+      _resumeHeartbeatIfLive();
+      return;
+    }
+    if (dirty) {
       setState(() {
         _connectionLostDeferred = true;
         _lostReason = reason;
       });
       return;
     }
-    if (!_liveAndCurrent(generation)) return;
     await _loadPage(forceOffline: true, offlineReason: reason);
   }
 
@@ -830,9 +982,11 @@ $_captureChannel.postMessage(JSON.stringify({
   /// the user's work.
   Future<bool> _hasUnsavedInput() async {
     try {
-      final result = await _controller.runJavaScriptReturningResult(
-        _unsavedInputScript,
-      );
+      // A web view that never answers must not freeze both automatic
+      // directions: no answer is treated like "there may be unsaved data".
+      final result = await _controller
+          .runJavaScriptReturningResult(_unsavedInputScript)
+          .timeout(_unsavedInputCheckLimit);
       return result == true || result.toString().toLowerCase() == 'true';
     } catch (_) {
       return true;
@@ -926,6 +1080,10 @@ $_captureChannel.postMessage(JSON.stringify({
     _heartbeat?.cancel();
     _connectionLostDeferred = false;
     _offlineDocStarted = false;
+    // Nothing reported from here on belongs to the previous load.
+    _supersededPaths.clear();
+    _lastStartedPath = null;
+    _lastStartedFinished = true;
     // A load the user asked for starts with a fresh allowance of automatic
     // retries; a retry itself (forced offline) does not.
     if (!forceOffline) _offlineAutoRetries = 0;

@@ -9,6 +9,7 @@ import 'core/deeplink/deep_link_service.dart';
 import 'core/network/api_client.dart';
 import 'core/secure/secure_storage_service.dart';
 import 'core/startup/app_services.dart';
+import 'core/startup/install_marker.dart';
 import 'core/util/startup_trace.dart';
 import 'features/activation/activation_screen.dart';
 import 'features/home/home_screen.dart';
@@ -178,6 +179,12 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
     // These two are not optional: without the activation state and the
     // database there is no app to show. Sequential on purpose: a storage
     // that cannot be read must stop here, before a database is opened.
+    // iOS keeps Keychain items across an uninstall and the app's files do not:
+    // a reinstalled app would find credentials for a database that is gone.
+    // Cautious and never throws (see InstallMarker).
+    if (Platform.isIOS) {
+      await InstallMarker().clearCredentialsOfDeletedInstall(_secureStorage);
+    }
     final activated = await _secureStorage.isActivated;
     StartupTrace.mark('activation_read');
     final services = await widget.buildServices(_secureStorage, _api);
@@ -195,7 +202,9 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
   /// carry on without; never for anything that gates access.
   Future<T> _lookup<T>(Future<T> Function() lookup, T fallback) async {
     try {
-      return await lookup();
+      // Optional values must never be able to hold the whole start-up for
+      // its 20 s limit: a lookup that does not answer quickly is skipped.
+      return await lookup().timeout(const Duration(seconds: 2));
     } catch (_) {
       return fallback;
     }
