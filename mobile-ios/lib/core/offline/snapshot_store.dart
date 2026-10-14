@@ -301,7 +301,9 @@ class SnapshotStore {
           throw const FormatException('Invalid snapshot asset path.');
         final assetFile = File(assetPath);
         await assetFile.parent.create(recursive: true);
-        await assetFile.writeAsBytes(await encryptor.encryptBytesInBackground(entry.value));
+        // Fetched without credentials, so public by construction: authenticated,
+        // not encrypted (see SnapshotEncryptor.sealPublic).
+        await assetFile.writeAsBytes(encryptor.sealPublic('assets/${entry.key}', entry.value));
       }
 
       final manifest = SnapshotManifest(
@@ -326,43 +328,81 @@ class SnapshotStore {
         if (await tempDir.exists()) await tempDir.delete(recursive: true);
         return;
       }
-      if (await realDir.exists()) {
-        final trashDir = Directory(
-          p.join(parentDir.path, '$pageSegment.trash-${_randomSuffix()}'),
-        );
-        await realDir.rename(trashDir.path);
-        try {
-          await tempDir.rename(realDir.path);
-        } catch (_) {
-          if (!await realDir.exists() && await trashDir.exists())
-            await trashDir.rename(realDir.path);
-          rethrow;
-        }
-        try {
-          await trashDir.delete(recursive: true);
-        } catch (_) {
-          // Best-effort cleanup only — see this method's own docblock,
-          // step 4: the trashed old copy is already fully unreferenced
-          // by this point, so failing to remove it never affects
-          // correctness, only leaves an orphaned directory for a future
-          // cache-eviction pass to find.
-        }
-      } else {
-        await tempDir.rename(realDir.path);
-      }
+      final swappedIn = await _replaceDirectory(realDir, tempDir, parentDir, pageSegment);
+      if (swappedIn) _reportWritten(realDir, html, assets, writeGeneration);
     } catch (_) {
       // The real snapshot (if any) was never touched until the rename
-      // above, which either fully succeeded or wasn't reached — the
-      // only cleanup needed on any failure is the temp directory itself.
+      // inside _replaceDirectory, which either fully succeeded or wasn't
+      // reached — the only cleanup needed on any failure is the temp
+      // directory itself.
       try {
         await tempDir.delete(recursive: true);
       } catch (_) {
-        // Best-effort cleanup — the real snapshot was never touched
-        // (see the outer catch's own comment), so a failure to remove
-        // the abandoned temp directory here never affects correctness.
+        // Best-effort cleanup — the real snapshot was never touched.
       }
       rethrow;
     }
+  }
+
+  /// Called after a page was written and swapped in, once per file, with the
+  /// file as it now lives and the plaintext that was just written. Lets the
+  /// server remember what it would otherwise have to decrypt: a page that was
+  /// just captured costs nothing to open. Not called when a sign-out happened
+  /// while the write was running.
+  void Function(File file, List<int> plaintext)? onWritten;
+
+  void _reportWritten(
+    Directory realDir,
+    String html,
+    Map<String, List<int>> assets,
+    int writeGeneration,
+  ) {
+    final hook = onWritten;
+    if (hook == null || writeGeneration != generation) return;
+    try {
+      hook(File(p.join(realDir.path, 'snapshot.html')), utf8.encode(html));
+      for (final entry in assets.entries) {
+        hook(File(p.join(realDir.path, 'assets', entry.key)), entry.value);
+      }
+    } catch (_) {
+      // A cache hint: never a reason to fail a write that succeeded.
+    }
+  }
+
+  /// Puts [tempDir] in place of [realDir] by renaming: the old copy is moved
+  /// aside first and put back if the second rename fails, so there is always one
+  /// complete copy (see the crash recovery above for a process killed between
+  /// the two). Returns true once the new directory is in place.
+  Future<bool> _replaceDirectory(
+    Directory realDir,
+    Directory tempDir,
+    Directory parentDir,
+    String pageSegment,
+  ) async {
+    if (await realDir.exists()) {
+      final trashDir = Directory(
+        p.join(parentDir.path, '$pageSegment.trash-${_randomSuffix()}'),
+      );
+      await realDir.rename(trashDir.path);
+      try {
+        await tempDir.rename(realDir.path);
+      } catch (_) {
+        if (!await realDir.exists() && await trashDir.exists()) {
+          await trashDir.rename(realDir.path);
+        }
+        rethrow;
+      }
+      try {
+        await trashDir.delete(recursive: true);
+      } catch (_) {
+        // Best-effort cleanup only: the trashed old copy is already fully
+        // unreferenced, so failing to remove it never affects correctness, only
+        // leaves an orphaned directory for a future cache-eviction pass.
+      }
+    } else {
+      await tempDir.rename(realDir.path);
+    }
+    return true;
   }
 
   /// Logout (review round point 11/19/21): removes every snapshot for

@@ -1,7 +1,9 @@
+import 'dart:convert';
 import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart' show Hmac, sha256;
 import 'package:encrypt/encrypt.dart' as enc;
 
 /// Offline-architecture milestone, P8. Encrypts/decrypts the actual
@@ -30,10 +32,86 @@ import 'package:encrypt/encrypt.dart' as enc;
 class SnapshotEncryptor {
   SnapshotEncryptor({required String hexKey})
     : _hexKey = hexKey,
+      _keyBytes = _keyFromHex(hexKey).bytes,
       _encrypter = enc.Encrypter(enc.AES(_keyFromHex(hexKey), mode: enc.AESMode.gcm));
 
   final String _hexKey;
+  final Uint8List _keyBytes;
   final enc.Encrypter _encrypter;
+
+  // ---- resources the page fetched ANONYMOUSLY: authenticated, not encrypted ----
+  //
+  // AES-GCM here is plain Dart and costs about 66 KB per second in a debug
+  // build on the K12 (measured: logo 158 KB = 2387 ms, page 56 KB = 1301 ms,
+  // stylesheet 22 KB = 842 ms, script 21 KB = 324 ms): the three static
+  // resources are 73% of the time it takes to open a saved dashboard.
+  //
+  // Those three do not need to be SECRET. The downloader sends no cookie and no
+  // authorisation header (a test pins that), so anything it managed to fetch is,
+  // by construction, available to anyone at its public address: encrypting it
+  // hides nothing. What must NOT be lost is INTEGRITY: a script or stylesheet
+  // that someone replaced inside the saved page would run in the page with the
+  // app's bridge. So such a resource is stored as
+  //     "MMA1" + HMAC-SHA256(key', path + 0 + bytes) + bytes
+  // where key' is derived from the same device key, and the path is part of what
+  // is authenticated (a file cannot be swapped for another under a different
+  // name). Checking it is a hash (milliseconds), not a cipher.
+  //
+  // The page itself (personal data) and the manifest stay AES-GCM. Files saved
+  // in the earlier format (every file AES-GCM) are still read: see [openPublic].
+  static const _publicMagic = [0x4d, 0x4d, 0x41, 0x31]; // "MMA1"
+  static const _macLength = 32;
+  static const _publicHeaderLength = 4 + _macLength;
+
+  late final Uint8List _macKey = Uint8List.fromList(
+    Hmac(sha256, _keyBytes).convert(utf8.encode('mm-snapshot-public-asset-mac-v1')).bytes,
+  );
+
+  /// Whether [stored] looks like the authenticated-public format (it may still
+  /// fail to verify: see [openPublic]).
+  bool isPublicFormat(List<int> stored) {
+    if (stored.length < _publicHeaderLength) return false;
+    for (var i = 0; i < _publicMagic.length; i++) {
+      if (stored[i] != _publicMagic[i]) return false;
+    }
+    return true;
+  }
+
+  Uint8List _mac(String label, List<int> bytes) {
+    final labelBytes = utf8.encode(label);
+    final input = Uint8List(labelBytes.length + 1 + bytes.length)
+      ..setRange(0, labelBytes.length, labelBytes)
+      ..setRange(labelBytes.length + 1, labelBytes.length + 1 + bytes.length, bytes);
+    return Uint8List.fromList(Hmac(sha256, _macKey).convert(input).bytes);
+  }
+
+  /// [label] is where the file lives inside its page ("assets/public/ikona.png"),
+  /// and is part of what the checksum covers.
+  List<int> sealPublic(String label, List<int> plaintext) {
+    final out = Uint8List(_publicHeaderLength + plaintext.length)
+      ..setRange(0, 4, _publicMagic)
+      ..setRange(4, _publicHeaderLength, _mac(label, plaintext))
+      ..setRange(_publicHeaderLength, _publicHeaderLength + plaintext.length, plaintext);
+    return out;
+  }
+
+  /// The bytes of a file sealed by [sealPublic] under the SAME [label], or null:
+  /// not that format, a different name, or altered. (Null is also what a
+  /// legacy AES-GCM file whose first four bytes happen to be "MMA1" gives, 1 in
+  /// 2^32, so the caller falls back to decrypting it, and a tampered file fails
+  /// there too.)
+  List<int>? openPublic(String label, List<int> stored) {
+    if (!isPublicFormat(stored)) return null;
+    final body = stored is Uint8List
+        ? Uint8List.sublistView(stored, _publicHeaderLength)
+        : Uint8List.fromList(stored.sublist(_publicHeaderLength));
+    final expected = _mac(label, body);
+    var difference = 0;
+    for (var i = 0; i < _macLength; i++) {
+      difference |= expected[i] ^ stored[4 + i]; // no early exit
+    }
+    return difference == 0 ? body : null;
+  }
 
   /// Below this size the work is cheaper than starting an isolate for it.
   static const _backgroundThresholdBytes = 8 * 1024;

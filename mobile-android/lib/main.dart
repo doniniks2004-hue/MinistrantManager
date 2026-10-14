@@ -137,7 +137,12 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
         _services = data.services;
       });
       StartupTrace.mark('app_ready');
-      if (data.activated) unawaited(_prewarmParishClient());
+      if (data.activated) {
+        unawaited(_prewarmParishClient());
+        // Decrypt the saved dashboard now, while the screens are still being
+        // built, instead of when the screen that shows it is finally on screen.
+        unawaited(data.services.offlinePageCoordinator.prewarmEntryPage());
+      }
     } on TimeoutException {
       if (!mounted || generation != _startupGeneration) return;
       // Abandon this attempt: bump the generation so that if it ever does

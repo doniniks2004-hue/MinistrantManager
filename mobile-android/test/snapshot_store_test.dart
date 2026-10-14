@@ -24,6 +24,15 @@ Future<String> _readDecryptedString(String path) async {
   return utf8.decode(_testEncryptor.decryptBytes(encryptedBytes));
 }
 
+/// A resource the page fetched anonymously is stored authenticated, not
+/// encrypted (SnapshotEncryptor.sealPublic); [label] is where it lives in its page.
+Future<String> _readPublicString(String path, String label) async {
+  final stored = await File(path).readAsBytes();
+  final plain = _testEncryptor.openPublic(label, stored);
+  expect(plain, isNotNull, reason: '$path must verify under "$label"');
+  return utf8.decode(plain!);
+}
+
 void main() {
   late Directory tempRoot;
   late SnapshotStore store;
@@ -155,7 +164,7 @@ void main() {
           '<html><body>Dashboard</body></html>',
         );
         expect(
-          await _readDecryptedString('${dir.path}/assets/css/style.css'),
+          await _readPublicString('${dir.path}/assets/css/style.css', 'assets/css/style.css'),
           'body{color:red}',
         );
 
@@ -203,7 +212,7 @@ void main() {
         '<html>v2</html>',
       );
       expect(
-        await _readDecryptedString('${dir.path}/assets/css/style.css'),
+        await _readPublicString('${dir.path}/assets/css/style.css', 'assets/css/style.css'),
         'y',
       );
       expect(

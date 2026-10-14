@@ -52,6 +52,32 @@ class OfflinePageCoordinator {
     ConnectivityMonitor? connectivity,
   }) : connectivity = connectivity ?? ConnectivityMonitor(PlatformNetworkSignal()) {
     localServer.trace = trace;
+    // A page that has just been written is in memory the moment it is saved:
+    // the server needs no decryption for it.
+    snapshotStore.onWritten = (file, plaintext) {
+      unawaited(localServer.remember(file, plaintext));
+    };
+  }
+
+  /// [prewarmPage] for the page the app opens (the dashboard) of the signed-in
+  /// user, started as soon as the services exist: well before the screen that
+  /// shows it has been built, so that it is ready by the time the first switch
+  /// to the saved copy can happen. Never throws; does nothing before an
+  /// activation and a sign-in.
+  Future<void> prewarmEntryPage() async {
+    try {
+      final storage = handoffService.secureStorage;
+      final parishId = await storage.parishId;
+      final userId = await storage.currentUserId;
+      if (parishId == null || userId == null) return;
+      await prewarmPage(
+        parishId: parishId,
+        userId: userId.toString(),
+        pagePath: '/public/dashboard.php',
+      );
+    } catch (_) {
+      // Best effort.
+    }
   }
 
   /// Decrypts the saved copy of [pagePath] into the server's memory ahead of
