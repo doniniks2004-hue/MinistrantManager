@@ -536,7 +536,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     // abandoned, and opened a second time from scratch. One turn of the event
     // loop lets what has ALREADY arrived run. This is not extra time: nothing
     // that had not happened by the deadline can happen in it.
-    await Future<void>.delayed(Duration.zero);
+    await Future<void>.delayed(const Duration(milliseconds: 1));
     if (!mounted || _loggingOut || generation != _loadGeneration) return;
     if (_onlineRendering || _state != _LoadState.loading) return;
     _loadGeneration++;

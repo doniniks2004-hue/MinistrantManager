@@ -94,7 +94,7 @@ class LocalSnapshotServer {
   int _cacheEpoch = 0;
 
   /// Whether this file's plaintext is in memory (tests, diagnostics).
-  bool hasDecrypted(File file) => _plain.containsKey(file.path);
+  bool hasDecrypted(File file) => _plain.containsKey(p.normalize(file.absolute.path));
 
   void clearDecrypted() {
     _cacheEpoch++;

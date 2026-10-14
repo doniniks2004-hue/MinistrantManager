@@ -1186,7 +1186,7 @@ void main() {
       final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
       await tester.pumpWidget(_host(coordinator));
       await ms(tester, 10);
-      expect(coordinator.events.take(2), ['warmUp', 'plan']);
+      expect(coordinator.events.take(3), ['warmUp', 'prewarm', 'plan']);
     });
 
     testWidgets('the scroll bars are hidden; nothing else about scrolling is touched', (

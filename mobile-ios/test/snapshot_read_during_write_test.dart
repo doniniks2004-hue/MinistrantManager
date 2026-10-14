@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
 import 'package:ministrant_manager/core/offline/snapshot_store.dart';
+import 'package:ministrant_manager/core/offline/snapshot_manifest.dart';
 
 /// A write that can be held half-way, like the one that follows every page
 /// load (the page is captured and encrypted).
