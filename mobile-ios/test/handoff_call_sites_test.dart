@@ -66,7 +66,7 @@ void main() {
   test('the coordinator asks for the page it was told to hand off through, never its target', () {
     final coordinator = File('lib/core/offline/offline_page_coordinator.dart')
         .readAsStringSync();
-    expect(coordinator, contains('.requestHandoffUrl(entryPath)'));
+    expect(coordinator, contains('.requestHandoffUrl(entryPath, timeout: handoffBudget)'));
     // _probe receives the entry page from the screen; it must not widen it.
     expect(coordinator, contains('.requestHandoffUrl(path, timeout: timeout)'));
   });
