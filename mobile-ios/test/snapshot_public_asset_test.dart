@@ -5,6 +5,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as p;
 import 'package:ministrant_manager/core/offline/local_snapshot_server.dart';
 import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
 import 'package:ministrant_manager/core/offline/snapshot_store.dart';
@@ -12,7 +13,7 @@ import 'package:ministrant_manager/core/offline/snapshot_store.dart';
 /// Counts the cipher work the server asks for (a hash-checked public resource
 /// must not ask for any).
 class _CountingEncryptor extends SnapshotEncryptor {
-  _CountingEncryptor({String hexKey = '1' * 64}) : super(hexKey: hexKey);
+  _CountingEncryptor({String? hexKey}) : super(hexKey: hexKey ?? '1' * 64);
   int decrypts = 0;
 
   @override
@@ -275,13 +276,13 @@ void main() {
       await write('<html>Secret parishioner list</html>');
       final dir = await pageDir();
 
-      final html = File('${dir.path}/snapshot.html').readAsBytesSync();
+      final html = File(p.join(dir.path, 'snapshot.html')).readAsBytesSync();
       final manifest = File('${dir.path}/manifest.json').readAsBytesSync();
       expect(latin1.decode(html), isNot(contains('Secret parishioner')), reason: 'personal data is encrypted');
       expect(latin1.decode(manifest), isNot(contains('dashboard')), reason: 'the manifest is encrypted');
       expect(encryptor.isPublicFormat(html), isFalse);
 
-      final css = File('${dir.path}/assets/public/css/style.css').readAsBytesSync();
+      final css = File(p.join(dir.path, 'assets', 'public', 'css', 'style.css')).readAsBytesSync();
       expect(encryptor.isPublicFormat(css), isTrue);
       expect(encryptor.openPublic('assets/public/css/style.css', css), utf8.encode('body{color:red}'));
     });
@@ -289,8 +290,8 @@ void main() {
     test('onWritten reports each file as it now lives, with the plaintext just written', () async {
       await write('<html>v1</html>');
       final dir = await pageDir();
-      expect(reported.keys, containsAll(['${dir.path}/snapshot.html', '${dir.path}/assets/public/css/style.css']));
-      expect(utf8.decode(reported['${dir.path}/snapshot.html']!), '<html>v1</html>');
+      expect(reported.keys.map(p.normalize), containsAll([p.join(dir.path, 'snapshot.html'), p.join(dir.path, 'assets', 'public', 'css', 'style.css')]));
+      expect(utf8.decode(reported[p.join(dir.path, 'snapshot.html')]!), '<html>v1</html>');
     });
 
     test('and the reported files exist at that moment (the swap is done)', () async {
