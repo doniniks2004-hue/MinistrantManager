@@ -19,6 +19,15 @@ Future<String> _readDecryptedString(String path) async {
   return utf8.decode(_testEncryptor.decryptBytes(encryptedBytes));
 }
 
+/// A resource the page fetched anonymously is stored authenticated, not
+/// encrypted (SnapshotEncryptor.sealPublic); [label] is where it lives in its page.
+Future<String> _readPublicString(String path, String label) async {
+  final stored = await File(path).readAsBytes();
+  final plain = _testEncryptor.openPublic(label, stored);
+  expect(plain, isNotNull, reason: '$path must verify under "$label"');
+  return utf8.decode(plain!);
+}
+
 /// Offline-architecture milestone, P5. Review round: "dopiero po P5
 /// będziemy mieli pierwszy kompletny łańcuch offline, a nie tylko
 /// niezależne komponenty" — these tests prove exactly that: a fake
@@ -118,11 +127,11 @@ void main() {
         contains('Dashboard v1'),
       );
       expect(
-        await _readDecryptedString('${dir.path}/assets/assets/style.css'),
+        await _readPublicString('${dir.path}/assets/assets/style.css', 'assets/assets/style.css'),
         'body { color: blue; }',
       );
       expect(
-        await _readDecryptedString('${dir.path}/assets/assets/logo.png'),
+        await _readPublicString('${dir.path}/assets/assets/logo.png', 'assets/assets/logo.png'),
         'PNGDATA',
       );
     });

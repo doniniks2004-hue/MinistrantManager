@@ -94,7 +94,9 @@ class LocalSnapshotServer {
   int _cacheEpoch = 0;
 
   /// Whether this file's plaintext is in memory (tests, diagnostics).
-  bool hasDecrypted(File file) => _plain.containsKey(p.normalize(file.absolute.path));
+  bool hasDecrypted(File file) => _plain.containsKey(_keyOf(file));
+
+  static String _keyOf(File file) => p.normalize(file.absolute.path);
 
   void clearDecrypted() {
     _cacheEpoch++;
@@ -237,37 +239,75 @@ class LocalSnapshotServer {
   /// Returns the plaintext of [file], decrypting it at most once per version
   /// of the file and never on the interface's isolate. Concurrent requests for
   /// the same file share one decryption. Returns null if the file is gone.
-  Future<List<int>?> _plaintextOf(File file) async {
+  /// [base] is the directory of the page the file belongs to: where the file
+  /// lives INSIDE its page is part of what a public resource's checksum covers.
+  Future<List<int>?> _plaintextOf(File file, Directory base) async {
     final stat = await file.stat();
     if (stat.type == FileSystemEntityType.notFound) return null;
 
-    final cached = _plain.remove(file.path);
+    final key = _keyOf(file);
+    final cached = _plain.remove(key);
     if (cached != null && cached.modified == stat.modified && cached.length == stat.size) {
-      _plain[file.path] = cached; // most recently used
+      _plain[key] = cached; // most recently used
       trace?.call('offline-serve: ${p.basename(file.path)} ${stat.size}B memory');
       return cached.bytes;
     }
     if (cached != null) _plainBytes -= cached.bytes.length; // an older version
 
-    final flightKey = '${file.path}|${stat.modified.microsecondsSinceEpoch}|${stat.size}';
-    return _decrypting[flightKey] ??= _decrypt(file, stat).whenComplete(() {
+    final flightKey = '$key|${stat.modified.microsecondsSinceEpoch}|${stat.size}';
+    return _decrypting[flightKey] ??= _decrypt(file, stat, base).whenComplete(() {
       _decrypting.remove(flightKey);
     });
   }
 
-  Future<List<int>> _decrypt(File file, FileStat stat) async {
+  Future<List<int>> _decrypt(File file, FileStat stat, Directory base) async {
     final epoch = _cacheEpoch;
     final watch = Stopwatch()..start();
-    final encrypted = await file.readAsBytes();
+    final stored = await file.readAsBytes();
     final readMs = watch.elapsedMilliseconds;
-    final plain = await encryptor.decryptBytesInBackground(encrypted);
+
+    // A public resource (stylesheet, script, image) is checked, not decrypted:
+    // a hash, not a cipher. A file that claims that format and does not verify
+    // is NOT trusted: it falls through to the decryption below, which refuses it
+    // (a legacy file that merely starts with the same four bytes decrypts fine).
+    List<int>? plain;
+    var how = 'decrypted';
+    if (encryptor.isPublicFormat(stored)) {
+      plain = encryptor.openPublic(_labelWithin(file, base), stored);
+      if (plain != null) how = 'verified';
+    }
+    plain ??= await encryptor.decryptBytesInBackground(stored);
+
     trace?.call(
-      'offline-serve: ${p.basename(file.path)} ${stat.size}B decrypted read=${readMs}ms decrypt=${watch.elapsedMilliseconds - readMs}ms',
+      'offline-serve: ${p.basename(file.path)} ${stat.size}B $how read=${readMs}ms ${how == 'verified' ? 'check' : 'decrypt'}=${watch.elapsedMilliseconds - readMs}ms',
     );
     if (epoch == _cacheEpoch) {
-      _remember(file.path, _Plain(plain, stat.modified, stat.size));
+      _remember(_keyOf(file), _Plain(plain, stat.modified, stat.size));
     }
     return plain;
+  }
+
+  /// "assets/public/ikona.png": where [file] lives inside the page at [base],
+  /// always with forward slashes (it is part of a checksum).
+  static String _labelWithin(File file, Directory base) => p.posix.joinAll(
+    p.split(p.relative(_keyOf(file), from: p.normalize(base.absolute.path))),
+  );
+
+  /// Puts what was JUST WRITTEN into memory, so that a page that has just been
+  /// saved costs nothing to open: the plaintext was in hand a moment ago, and
+  /// decrypting it again to learn what is already known is exactly the work this
+  /// replaces. Silently ignored if the file is gone, or if the cache was
+  /// emptied (sign-out, revocation) while this was waiting for the file system.
+  Future<void> remember(File file, List<int> plaintext) async {
+    final epoch = _cacheEpoch;
+    try {
+      final stat = await file.stat();
+      if (stat.type == FileSystemEntityType.notFound) return;
+      if (epoch != _cacheEpoch) return;
+      _remember(_keyOf(file), _Plain(plaintext, stat.modified, stat.size));
+    } catch (_) {
+      // A hint, never a reason to fail anything.
+    }
   }
 
   void _remember(String path, _Plain entry) {
@@ -297,7 +337,7 @@ class LocalSnapshotServer {
       final sizes = {for (final f in files) f.path: await f.length()};
       files.sort((a, b) => sizes[b.path]!.compareTo(sizes[a.path]!));
       for (var i = 0; i < files.length; i += 3) {
-        await Future.wait(files.skip(i).take(3).map(_plaintextOf));
+        await Future.wait(files.skip(i).take(3).map((f) => _plaintextOf(f, pageDirectory)));
       }
     } catch (_) {
       // Nothing depends on it.
@@ -347,7 +387,7 @@ class LocalSnapshotServer {
       // images for a legacy admin panel, not multi-gigabyte media, so
       // buffering one complete file in memory per request is an
       // acceptable, deliberate trade-off for this specific content.
-      final plain = await _plaintextOf(file);
+      final plain = await _plaintextOf(file, root);
       if (plain == null) {
         response.statusCode = HttpStatus.notFound;
         await response.close();

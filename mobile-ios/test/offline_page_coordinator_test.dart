@@ -1373,6 +1373,25 @@ void main() {
         expect(localServer.hasDecrypted(File('${dir.path}/assets/public/css/style.css')), isTrue);
       });
 
+      test('WRITE-THROUGH is wired: a page that was just captured is already in memory, nothing prewarmed it', () async {
+        await store.writeSnapshot(
+          parishId: 'p',
+          userId: 'u',
+          pagePath: '/public/ranking.php',
+          html: '<html>Ranking</html>',
+          assets: {'public/css/style.css': utf8.encode('body{}')},
+        );
+        final dir = await store.getPageDirectoryIfReady(parishId: 'p', userId: 'u', pagePath: '/public/ranking.php');
+        await Future<void>.delayed(const Duration(milliseconds: 100)); // remember() is not awaited by the store
+
+        expect(localServer.hasDecrypted(File('${dir!.path}/snapshot.html')), isTrue);
+        expect(localServer.hasDecrypted(File('${dir.path}/assets/public/css/style.css')), isTrue);
+      });
+
+      test('prewarmEntryPage before any activation or sign-in does nothing and does not throw', () async {
+        await coordinator.prewarmEntryPage();
+      });
+
       test('prewarmPage for a page that was never saved is silent', () async {
         await coordinator.prewarmPage(parishId: 'p', userId: 'u', pagePath: '/public/never-saved.php');
       });
