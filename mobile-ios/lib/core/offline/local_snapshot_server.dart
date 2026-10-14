@@ -45,7 +45,29 @@ import 'snapshot_encryptor.dart';
 /// point; this class only controls what the filesystem underneath can
 /// ever answer with.
 class LocalSnapshotServer {
-  LocalSnapshotServer({required this.encryptor, this.cacheLimitBytes = 8 * 1024 * 1024});
+  LocalSnapshotServer({
+    required this.encryptor,
+    this.cacheLimitBytes = 8 * 1024 * 1024,
+    Future<bool> Function(int port)? healthProbe,
+  }) : _healthProbe = healthProbe ?? _accepts;
+
+  /// A real loopback connection by default; replaceable so the repair logic can
+  /// be tested without making the operating system close a socket.
+  final Future<bool> Function(int port) _healthProbe;
+
+  // ---- is it SERVING right now? ----------------------------------------------
+  int _activeRequests = 0;
+  DateTime? _lastRequestAt;
+
+  /// A listener that answered a request a moment ago, or is answering one now,
+  /// is not dead, whatever one slow probe says.
+  static const _recentlyServed = Duration(seconds: 10);
+
+  bool get _servedRecently {
+    if (_activeRequests > 0) return true;
+    final last = _lastRequestAt;
+    return last != null && DateTime.now().difference(last) < _recentlyServed;
+  }
 
   /// Offline-architecture milestone, P8.2: every file under
   /// [rootDirectory] is SnapshotStore-encrypted — this MUST be
@@ -178,7 +200,23 @@ class LocalSnapshotServer {
     if (starting != null) return starting;
     final current = _server;
     if (current == null) return start();
-    if (_boundPort != null && await _accepts(_boundPort!)) return _boundPort!;
+    final port = _boundPort;
+    if (port == null) {
+      await stop();
+      return start();
+    }
+    // The repair is destructive: stop() closes the listener under whatever page
+    // is loading from it and forgets its address. A loopback connect that is
+    // merely SLOW (the emulator busy decrypting, rendering, saving) must not be
+    // taken for a dead socket:
+    //  - a server that is serving, or has served within the last seconds, is
+    //    alive by definition and is left alone;
+    //  - otherwise the probe is tried twice, the second time with more patience,
+    //    and only two failures in a row count.
+    if (_servedRecently) return port;
+    if (await _healthProbe(port)) return port;
+    if (_servedRecently) return port;
+    if (await _healthProbe(port)) return port;
     await stop();
     return start();
   }
@@ -188,7 +226,7 @@ class LocalSnapshotServer {
       final socket = await Socket.connect(
         InternetAddress.loopbackIPv4,
         port,
-        timeout: const Duration(milliseconds: 500),
+        timeout: const Duration(milliseconds: 1500),
       );
       socket.destroy();
       return true;
@@ -208,7 +246,16 @@ class LocalSnapshotServer {
     _server = server;
     _boundPort = server.port;
     server.listen(
-      _handleRequest,
+      (request) async {
+        _activeRequests++;
+        _lastRequestAt = DateTime.now();
+        try {
+          await _handleRequest(request);
+        } finally {
+          _activeRequests--;
+          _lastRequestAt = DateTime.now();
+        }
+      },
       onError: (_) {
         // A single malformed connection must never bring the whole
         // server down — dart:io's own listen-level error, distinct from

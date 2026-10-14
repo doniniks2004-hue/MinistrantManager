@@ -124,6 +124,19 @@ class OfflinePageCoordinator {
   final Duration onlineTimeout;
   final Duration firstOnlineTimeout;
 
+  /// The longest PLANNING can legitimately take: the attempt to reach the
+  /// server (the longer of its two budgets), then building the local view, and
+  /// a margin for what happens around them (reading the manifest, waiting for
+  /// the write queue, starting the loopback server). The screen's guard on
+  /// planning follows THIS, not a number of its own: it was a fixed 3.5 s,
+  /// chosen when the handoff was allowed 1.5 s, and when the first handoff
+  /// after a sign-in was given 3 s the two left half a second for everything
+  /// else, so a slow but working first handoff was reported as a failure.
+  Duration get planningBudget =>
+      (onlineTimeout > firstOnlineTimeout ? onlineTimeout : firstOnlineTimeout) +
+      offlinePlanTimeout +
+      const Duration(milliseconds: 1500);
+
   /// Budget for building the LOCAL view (manifest, directory, starting
   /// the loopback server). Normally a few milliseconds; this exists so a
   /// stuck filesystem/server step can never leave the screen waiting

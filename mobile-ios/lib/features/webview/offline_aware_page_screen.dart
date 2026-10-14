@@ -10,6 +10,7 @@ import '../../core/offline/offline_page_coordinator.dart';
 import '../../core/offline/connectivity_monitor.dart';
 import '../../core/offline/page_identity.dart';
 import '../../core/offline/server_reachability.dart';
+import '../../core/util/log_safe.dart';
 
 /// Hosts the real PHP page. Offline replays saved views, without writes.
 class OfflineAwarePageScreen extends StatefulWidget {
@@ -101,10 +102,9 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
   /// OfflinePageCoordinator.onlineTimeout; this bounds showing the copy.
   static const _offlineTotalBudget = Duration(seconds: 2);
 
-  /// Guard for the PLANNING phase only (the attempt to reach the server plus
-  /// reading the saved copy: 1.5 s + 1.5 s at most, with margin). It is
-  /// replaced by [_offlineTotalBudget] as soon as planning decides.
-  static const _planningGuard = Duration(milliseconds: 3500);
+  // Planning is guarded by OfflinePageCoordinator.planningBudget (the longest it
+  // can legitimately take), replaced by [_offlineTotalBudget] as soon as planning
+  // decides to show the saved copy.
 
   /// How often an idle live page checks that the server can still be
   /// reached, and how soon a doubtful result is checked again.
@@ -211,6 +211,33 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
   /// Pages whose navigation was replaced before it finished.
   final _supersededPaths = <String>{};
 
+  // ---- navigation diagnostics ---------------------------------------------------
+  //
+  // One id per load attempt and the time since it began, on every line, so that
+  // a log can be read as a story: which load, what the engine reported, what was
+  // ignored and why, and what ended it. Debug builds only (the coordinator's
+  // trace); changes no behaviour.
+
+  int _navId = 0;
+  final _navWatch = Stopwatch();
+
+  void _tr(String message) {
+    widget.coordinator.trace('nav#$_navId +${_navWatch.elapsedMilliseconds}ms $message');
+  }
+
+  /// Why a finished/started address is, or is not, the document this screen is
+  /// waiting for, without printing the token.
+  String _whyNotCurrent(Uri uri) {
+    final server = widget.coordinator.localServer;
+    if (!_online) {
+      return 'owns=${server.ownsUrl(uri)} '
+          'pathMatches=${_offlineLoadUrl != null && uri.path == _offlineLoadUrl!.path} '
+          'queryMatches=${_offlineLoadUrl != null && uri.query == _offlineLoadUrl!.query} '
+          'expecting=${describeUrlForLog(_offlineLoadUrl?.toString())}';
+    }
+    return 'trusted=${_trusted(uri)}';
+  }
+
   /// Automatic retries of a FAILED first opening of the saved copy. The
   /// first opening is cold (server just started, nothing cached) and the
   /// second, with the same data, worked every time a person tried it, so
@@ -272,6 +299,10 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
           onHttpError: (error) {
             final uri = error.request?.uri;
             if (!mounted || _loggingOut || uri == null) return;
+            _tr(
+              'http-error status=${error.response?.statusCode} ${describeUrlForLog(uri.toString())} '
+              'mode=${_online ? 'live' : 'copy'}',
+            );
             if (!_online) {
               // LocalSnapshotServer answers 5xx when a stored file cannot
               // be decrypted (corrupt cache / lost key). Without this the
@@ -324,7 +355,15 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
           },
           onPageFinished: _onFinished,
           onWebResourceError: (e) {
-            if (!mounted || _loggingOut || e.isForMainFrame != true) return;
+            if (!mounted || _loggingOut) return;
+            // Every failure the engine reports, including those of sub-resources
+            // (which used to be dropped without a word): a stylesheet or an image
+            // of the saved copy that fails is exactly what a log must show.
+            _tr(
+              'resource-error code=${e.errorCode} type=${e.errorType?.name} main=${e.isForMainFrame} '
+              '${describeUrlForLog(e.url)} mode=${_online ? 'live' : 'copy'}',
+            );
+            if (e.isForMainFrame != true) return;
             if (!_online) {
               // An error for a navigation that is no longer the current
               // one (abandoned, or replaced by a retry) must not fail the
@@ -506,6 +545,10 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     if (_navigationDeadline != null) return;
     _navigationDeadline = Timer(_pageRenderBudget, () {
       if (mounted && _online && !_loggingOut) {
+        _tr(
+          'deadline page-render ${_pageRenderBudget.inSeconds}s expired: the LIVE page did not finish; '
+          'leaving it for the saved copy (reason=slowServer)',
+        );
         unawaited(
           _loadPage(forceOffline: true, offlineReason: OfflineReason.slowServer),
         );
@@ -517,8 +560,12 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
   /// in time). Opens it once more, at once, with a fresh plan and a fresh
   /// address. Returns whether a retry was started.
   bool _retryOfflineOnce() {
-    if (_offlineAutoRetries >= 1) return false;
+    if (_offlineAutoRetries >= 1) {
+      _tr('no automatic retry left');
+      return false;
+    }
     _offlineAutoRetries++;
+    _tr('automatic retry of the saved copy');
     unawaited(_loadPage(forceOffline: true));
     return true;
   }
@@ -541,6 +588,10 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     if (_onlineRendering || _state != _LoadState.loading) return;
     _loadGeneration++;
     final wasOpeningACopy = _offlineLoadUrl != null;
+    _tr(
+      'deadline expired phase=${wasOpeningACopy ? 'copy-render' : 'planning'} '
+      'offlineDocStarted=$_offlineDocStarted',
+    );
     // The engine is still running the navigation we are giving up on; its
     // late onPageFinished must not turn this error back into "ready".
     _offlineLoadUrl = null;
@@ -552,7 +603,11 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     if (wasOpeningACopy && _retryOfflineOnce()) return;
     setState(() {
       _state = _LoadState.error;
-      _errorText = 'Zapisana kopia strony nie otworzyła się na czas. Spróbuj ponownie.';
+      // Said honestly: during PLANNING no copy has been opened (there may be
+      // none), so "the saved copy did not open" would be a different failure.
+      _errorText = wasOpeningACopy
+          ? 'Zapisana kopia strony nie otworzyła się na czas. Spróbuj ponownie.'
+          : 'Nie udało się przygotować strony na czas. Spróbuj ponownie.';
     });
     // The bump above invalidated the generation a pending recovery was
     // bound to; without this the screen would stop trying to reconnect.
@@ -563,6 +618,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     if (!mounted || _loggingOut) return;
     _captureTimer?.cancel();
     final uri = Uri.tryParse(url);
+    _tr('started ${describeUrlForLog(url)} mode=${_online ? 'live' : 'copy'}');
     if (!_online &&
         uri != null &&
         widget.coordinator.localServer.ownsUrl(uri) &&
@@ -593,18 +649,27 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
   void _onFinished(String url) {
     if (!mounted || _loggingOut) return;
     final uri = Uri.tryParse(url);
+    _tr('finished ${describeUrlForLog(url)} mode=${_online ? 'live' : 'copy'}');
     if (uri == null ||
         (_online
             ? !_trusted(uri)
             : !(widget.coordinator.localServer.ownsUrl(uri) &&
-                  _isCurrentOfflineDocument(uri))))
+                  _isCurrentOfflineDocument(uri)))) {
+      // Until now this return said nothing, so "the callback never came" and
+      // "it came for an address we did not expect" looked the same in a log.
+      _tr('finished IGNORED: not the document being waited for (${uri == null ? 'unparseable' : _whyNotCurrent(uri)})');
       return;
+    }
     if (!_online) widget.coordinator.trace('offline-render: finish callback');
-    if (_failedDocuments.contains(uri.toString())) return;
+    if (_failedDocuments.contains(uri.toString())) {
+      _tr('finished IGNORED: that document had already failed');
+      return;
+    }
     if (_online) {
       final finishedPath = snapshotPagePath(uri);
       // The late finish of a navigation that was replaced: not this page.
       if (finishedPath != null && _supersededPaths.contains(finishedPath)) {
+        _tr('finished IGNORED: its navigation had been replaced ($finishedPath)');
         return;
       }
       if (finishedPath != null && finishedPath == _lastStartedPath) {
@@ -645,6 +710,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
       return;
     }
     setState(() => _state = _LoadState.ready);
+    _tr('READY mode=${_online ? 'live' : 'copy'}');
     StartupTrace.mark(_online ? 'page_ready_online' : 'page_ready_offline');
     if (!_online) {
       widget.coordinator.trace('offline-render: finished');
@@ -914,6 +980,7 @@ $_captureChannel.postMessage(JSON.stringify({
   }
 
   Future<void> _connectionLost(OfflineReason reason, int generation) async {
+    _tr('connection lost cause=${reason.name}: deciding whether to swap to the saved copy');
     // Never swap a page the user is typing into for a copy on their own:
     // offer it instead.
     final dirty = await _hasUnsavedInput();
@@ -1104,6 +1171,15 @@ $_captureChannel.postMessage(JSON.stringify({
     OfflineReason? offlineReason,
   }) async {
     final generation = ++_loadGeneration;
+    _navId++;
+    _navWatch
+      ..reset()
+      ..start();
+    _tr(
+      'load-start forceOffline=$forceOffline reason=${(offlineReason ?? _offlineReason).name} '
+      'prepared=${prepared != null} path=${describeUrlForLog('https://x$_currentPath')} '
+      'wasOnline=$_online autoRetries=$_offlineAutoRetries',
+    );
     _navigationDeadline?.cancel();
     _navigationDeadline = null;
     _captureTimer?.cancel();
@@ -1134,7 +1210,7 @@ $_captureChannel.postMessage(JSON.stringify({
     // Covers PLANNING only; replaced by the saved copy's own 2 s below as
     // soon as planning has decided to show it.
     _totalDeadline = Timer(
-      _planningGuard,
+      widget.coordinator.planningBudget,
       () => _expireOfflineBudget(generation),
     );
     try {
@@ -1155,8 +1231,12 @@ $_captureChannel.postMessage(JSON.stringify({
         forceOffline: forceOffline,
         offlineReason: offlineReason ?? _offlineReason,
       );
-      if (!mounted || _loggingOut || generation != _loadGeneration) return;
+      if (!mounted || _loggingOut || generation != _loadGeneration) {
+        _tr('plan-result DISCARDED (a newer load exists or the screen is gone): ${plan.runtimeType}');
+        return;
+      }
       StartupTrace.mark('plan_done');
+      _tr('plan-result ${plan.runtimeType}');
       switch (plan) {
         case PageLoadOnline():
           _online = true;

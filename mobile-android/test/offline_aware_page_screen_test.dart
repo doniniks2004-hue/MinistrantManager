@@ -278,6 +278,12 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
     events.add('warmUp');
   }
 
+  /// Every line the screen wrote to the debug trace.
+  final traces = <String>[];
+
+  @override
+  void trace(String message) => traces.add(message);
+
   /// Pages the screen asked to have decrypted ahead of time.
   final prewarmed = <String>[];
 
@@ -526,21 +532,24 @@ void main() {
     'a plan that completes AFTER the deadline cannot bring the abandoned load back',
     (tester) async {
       final coordinator = _ScriptedCoordinator(
-        (_) => _after(const Duration(milliseconds: 4000), _offlinePlan()),
+        (_) => _after(const Duration(milliseconds: 7000), _offlinePlan()),
       );
       await tester.pumpWidget(_host(coordinator));
 
-      // Planning itself has a guard (3.5 s): a plan that hangs is reported.
-      await tester.pump(const Duration(milliseconds: 3600));
-      expect(find.textContaining('nie otworzyła się na czas'), findsOneWidget);
+      // Planning has a guard (the coordinator's planningBudget, 6 s by default):
+      // a plan that hangs is reported, and not as a saved copy that failed to
+      // open, because none was ever opened.
+      await tester.pump(const Duration(milliseconds: 6100));
+      expect(find.textContaining('Nie udało się przygotować strony na czas'), findsOneWidget);
+      expect(find.textContaining('Zapisana kopia'), findsNothing);
 
-      await tester.pump(const Duration(milliseconds: 500)); // plan resolves
+      await tester.pump(const Duration(milliseconds: 1000)); // plan resolves
       expect(
         platform.controllers.single.loaded,
         isEmpty,
         reason: 'the late plan must not start a navigation',
       );
-      expect(find.textContaining('nie otworzyła się na czas'), findsOneWidget);
+      expect(find.textContaining('Nie udało się przygotować strony na czas'), findsOneWidget);
       expect(find.byType(spinner), findsNothing);
     },
   );
@@ -971,6 +980,168 @@ void main() {
       await ms(tester, 10);
       await tester.pump(const Duration(seconds: 30));
       expect(coordinator.planCalls, plans);
+    });
+  });
+
+  group('P0: planning guard and navigation diagnostics', () {
+    const host = 'https://szarlej.ministrant.eu';
+    Future<void> ms(WidgetTester tester, int millis) => tester.pump(Duration(milliseconds: millis));
+
+    testWidgets(
+      'REGRESSION: a slow but WORKING first handoff after a sign-in is not reported as a failure',
+      (tester) async {
+        // The first handoff after a sign-in may take 3 s (no copy to fall back
+        // on). The screen's guard on planning was a fixed 3.5 s, left over from
+        // a 1.5 s handoff: half a second for everything else.
+        final coordinator = _ScriptedCoordinator(
+          (forceOffline) => forceOffline
+              ? Future.value(_offlinePlan())
+              : _after(const Duration(milliseconds: 4200), _onlinePlan()),
+        );
+        await tester.pumpWidget(_host(coordinator));
+
+        await ms(tester, 3700); // past the OLD 3.5 s guard
+        expect(find.byType(spinner), findsOneWidget, reason: 'still planning, not failed');
+        expect(find.textContaining('Nie udało się przygotować'), findsNothing);
+        expect(find.textContaining('Zapisana kopia'), findsNothing);
+
+        await ms(tester, 600); // t = 4300: the handoff answered
+        expect(platform.controllers.single.loaded, [_ticketUrl]);
+        platform.delegates.single.onPageFinished!('$host/public/dashboard.php');
+        await ms(tester, 10);
+        expect(find.byType(spinner), findsNothing);
+        expect(find.text('SPRÓBUJ PONOWNIE'), findsNothing);
+        expect(find.textContaining('OFFLINE'), findsNothing);
+      },
+    );
+
+    testWidgets('a plan that never answers is reported as a PLANNING failure, not as a saved copy', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator((_) => _after(const Duration(seconds: 30), _onlinePlan()));
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 6100);
+      expect(find.textContaining('Nie udało się przygotować strony na czas'), findsOneWidget);
+      expect(find.textContaining('Zapisana kopia'), findsNothing);
+    });
+
+    testWidgets('the coordinator\'s planning budget covers its longest legitimate plan', (tester) async {
+      final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
+      // longer of the two handoff budgets + the local view + a margin
+      expect(
+        coordinator.planningBudget,
+        greaterThan(coordinator.firstOnlineTimeout + coordinator.offlinePlanTimeout),
+      );
+    });
+
+    testWidgets('the trace tells one story per load, with one id, and never carries a secret', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+      platform.delegates.single.onPageStarted!(_ticketUrl.toString());
+      platform.delegates.single.onPageFinished!('$host/public/dashboard.php');
+      await ms(tester, 10);
+
+      final story = coordinator.traces.where((t) => t.startsWith('nav#1 ')).join('\n');
+      expect(story, contains('load-start forceOffline=false'));
+      expect(story, contains('plan-result PageLoadOnline'));
+      expect(story, contains('started $host/public/mobile_handoff.php mode=live'));
+      expect(story, contains('finished $host/public/dashboard.php mode=live'));
+      expect(story, contains('READY mode=live'));
+
+      final all = coordinator.traces.join('\n');
+      for (final secret in ['ticket', 'token', 'cookie', 'password', '?']) {
+        expect(all.toLowerCase(), isNot(contains(secret)), reason: 'a trace line carried "$secret"');
+      }
+      expect(RegExp(r'[A-Fa-f0-9]{24,}').hasMatch(all), isFalse, reason: 'nothing that looks like a token');
+    });
+
+    testWidgets('a finish for an address that is NOT the copy being waited for is IGNORED, and says why', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+
+      // Another token (what a restarted or re-rooted server hands out).
+      platform.delegates.single.onPageFinished!('http://127.0.0.1:1/othertoken/snapshot.html');
+      await ms(tester, 10);
+      final ignored = coordinator.traces.where((t) => t.contains('finished IGNORED')).toList();
+      expect(ignored, hasLength(1));
+      expect(ignored.single, contains('owns=false'));
+      expect(find.byType(spinner), findsOneWidget, reason: 'still waiting for the right document');
+
+      // The right token, the wrong page.
+      platform.delegates.single.onPageFinished!('http://127.0.0.1:1/token/assets/other.html');
+      await ms(tester, 10);
+      expect(coordinator.traces.where((t) => t.contains('pathMatches=false')), isNotEmpty);
+
+      platform.delegates.single.onPageFinished!(_localUrl.toString());
+      await ms(tester, 10);
+      expect(find.byType(spinner), findsNothing);
+      expect(coordinator.traces.any((t) => t.contains('READY mode=copy')), isTrue);
+    });
+
+    testWidgets('a failing SUB-resource is logged (it used to be dropped) and changes nothing', (tester) async {
+      final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+
+      platform.delegates.single.onWebResourceError!(
+        WebResourceError(
+          errorCode: -1,
+          description: 'net::ERR_BLOCKED_BY_CSP',
+          isForMainFrame: false,
+          url: 'http://127.0.0.1:1/token/assets/public/ikona.png',
+        ),
+      );
+      await ms(tester, 10);
+
+      final line = coordinator.traces.singleWhere((t) => t.contains('resource-error'));
+      expect(line, contains('code=-1'));
+      expect(line, contains('main=false'));
+      expect(line, contains('copy:/assets/public/ikona.png'));
+      expect(line, isNot(contains('token')));
+      expect(find.byType(spinner), findsOneWidget, reason: 'a sub-resource does not end the load');
+      expect(coordinator.planCalls, 1);
+    });
+
+    testWidgets('when the LIVE page is abandoned for the copy after 8 s, the trace says that is what happened', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator(
+        (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+      platform.delegates.single.onPageStarted!(_ticketUrl.toString()); // arms the 8 s budget
+      await ms(tester, 8100);
+
+      expect(coordinator.traces.any((t) => t.contains('deadline page-render 8s expired')), isTrue);
+      expect(coordinator.planReasons.last, OfflineReason.slowServer);
+      expect(
+        coordinator.traces.where((t) => t.contains('load-start forceOffline=true reason=slowServer')),
+        isNotEmpty,
+        reason: 'the next load says WHY it is going offline',
+      );
+    });
+
+    testWidgets('a plan result that arrives after a newer load began is reported as discarded', (tester) async {
+      var first = true;
+      final coordinator = _ScriptedCoordinator((forceOffline) {
+        if (first) {
+          first = false;
+          return _after(const Duration(milliseconds: 500), _onlinePlan());
+        }
+        return Future.value(_offlinePlan());
+      });
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 100);
+      await tester.pumpWidget(_host(coordinator, forceOffline: true)); // a newer load
+      await ms(tester, 600);
+      expect(coordinator.traces.any((t) => t.contains('plan-result DISCARDED')), isTrue);
     });
   });
 
