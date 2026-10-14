@@ -101,14 +101,32 @@ class SnapshotStore {
       userId: userId,
       pagePath: pagePath,
     );
-    await _recoverInterruptedSwap(dir);
-    final manifest = await readManifest(dir);
+    final manifest = await _readManifestRecovering(dir);
     if (manifest == null ||
         manifest.parishId != parishId ||
         manifest.userId != userId ||
         manifest.path != pagePath)
       return null;
     return dir;
+  }
+
+  /// Reads the manifest of [dir], waiting for the write queue ONLY when there
+  /// is none to read.
+  ///
+  /// The first version of the crash recovery below made every read go through
+  /// the write queue. A read then waited for any write in progress, and a write
+  /// is in progress right after every page load (the page is captured and
+  /// encrypted), which is exactly when the first switch to the saved copy
+  /// happens: the copy that was lying on disk, complete and readable, was not
+  /// read until the new one had been written. The directory of a page is
+  /// replaced by renaming, so it is only ever missing for the instant between
+  /// two renames, or after a crash; only then is waiting (or recovering)
+  /// needed.
+  Future<SnapshotManifest?> _readManifestRecovering(Directory dir) async {
+    final manifest = await readManifest(dir);
+    if (manifest != null) return manifest;
+    await _recoverInterruptedSwap(dir);
+    return readManifest(dir);
   }
 
   /// Crash recovery for the replacement in [_writeSnapshot].
@@ -191,8 +209,7 @@ class SnapshotStore {
       userId: userId,
       pagePath: pagePath,
     );
-    await _recoverInterruptedSwap(dir);
-    final manifest = await readManifest(dir);
+    final manifest = await _readManifestRecovering(dir);
     if (manifest?.parishId != parishId ||
         manifest?.userId != userId ||
         manifest?.path != pagePath)
@@ -275,7 +292,7 @@ class SnapshotStore {
       // Offline-architecture milestone, P8.2: encrypted BEFORE the bytes
       // ever touch disk — see `encryptor`'s own docblock on this class.
       await File(p.join(tempDir.path, 'snapshot.html'))
-          .writeAsBytes(encryptor.encryptBytes(utf8.encode(html)));
+          .writeAsBytes(await encryptor.encryptBytesInBackground(utf8.encode(html)));
 
       for (final entry in assets.entries) {
         final assetRoot = p.join(tempDir.path, 'assets');
@@ -284,7 +301,7 @@ class SnapshotStore {
           throw const FormatException('Invalid snapshot asset path.');
         final assetFile = File(assetPath);
         await assetFile.parent.create(recursive: true);
-        await assetFile.writeAsBytes(encryptor.encryptBytes(entry.value));
+        await assetFile.writeAsBytes(await encryptor.encryptBytesInBackground(entry.value));
       }
 
       final manifest = SnapshotManifest(

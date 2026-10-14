@@ -45,7 +45,7 @@ import 'snapshot_encryptor.dart';
 /// point; this class only controls what the filesystem underneath can
 /// ever answer with.
 class LocalSnapshotServer {
-  LocalSnapshotServer({required this.encryptor});
+  LocalSnapshotServer({required this.encryptor, this.cacheLimitBytes = 8 * 1024 * 1024});
 
   /// Offline-architecture milestone, P8.2: every file under
   /// [rootDirectory] is SnapshotStore-encrypted — this MUST be
@@ -58,10 +58,55 @@ class LocalSnapshotServer {
 
   HttpServer? _server;
   int? _boundPort;
+
+  /// Debug-only diagnostics (the coordinator wires its own trace here). Gets
+  /// one line per served file: what it was, whether it came from memory, and
+  /// what the read and the decryption cost.
+  void Function(String message)? trace;
+
+  // ---- decrypted pages, kept in memory ----------------------------------------
+  //
+  // Every file of a saved page is encrypted on disk and was decrypted AGAIN
+  // for every request, on the isolate that runs the interface: ~260 KB for a
+  // dashboard (page 56, stylesheet 22, script 21, logo 158), repeated by every
+  // retry, every reload, every return to the page. A retry (which the screen
+  // makes on purpose after a failed first opening) therefore redid all the
+  // work the failed attempt had already done.
+  //
+  // Now: decrypted once per file version, off the interface's isolate, and kept
+  // (PLAINTEXT, in memory only) up to [_cacheLimitBytes]. A file counts as the
+  // same version only while its size and modification time are unchanged, and a
+  // file that no longer exists is never served (the request is answered 404
+  // before the cache is looked at), so a snapshot that was replaced or deleted
+  // (logout, revocation) cannot be served from memory. The cache is emptied
+  // when the root is cleared (sign-out, lease expiry, revoked) and on stop().
+  // The page is shown in the WebView, in memory, the moment it is opened, so
+  // keeping its bytes for a while does not widen what is exposed.
+  /// How much plaintext may be kept (8 MB: a few dozen pages like the dashboard).
+  final int cacheLimitBytes;
+  final _plain = <String, _Plain>{}; // insertion order == least recently used first
+  final _decrypting = <String, Future<List<int>>>{};
+  int _plainBytes = 0;
+
+  /// Bumped every time the cache is emptied. A decryption that was already
+  /// running when that happened (sign-out, revocation) must not put its result
+  /// back afterwards.
+  int _cacheEpoch = 0;
+
+  /// Whether this file's plaintext is in memory (tests, diagnostics).
+  bool hasDecrypted(File file) => _plain.containsKey(p.normalize(file.absolute.path));
+
+  void clearDecrypted() {
+    _cacheEpoch++;
+    _plain.clear();
+    _plainBytes = 0;
+  }
   Directory? _rootDirectory;
   String _accessToken = '';
   Directory? get rootDirectory => _rootDirectory;
   set rootDirectory(Directory? root) {
+    // Sign-out, lease expiry, revocation: nothing decrypted may outlive it.
+    if (root == null) clearDecrypted();
     _rootDirectory = root;
     final random = Random.secure();
     _accessToken = List.generate(
@@ -185,7 +230,78 @@ class LocalSnapshotServer {
     _server = null;
     _boundPort = null;
     rootDirectory = null;
+    clearDecrypted();
     await server?.close(force: true);
+  }
+
+  /// Returns the plaintext of [file], decrypting it at most once per version
+  /// of the file and never on the interface's isolate. Concurrent requests for
+  /// the same file share one decryption. Returns null if the file is gone.
+  Future<List<int>?> _plaintextOf(File file) async {
+    final stat = await file.stat();
+    if (stat.type == FileSystemEntityType.notFound) return null;
+
+    final cached = _plain.remove(file.path);
+    if (cached != null && cached.modified == stat.modified && cached.length == stat.size) {
+      _plain[file.path] = cached; // most recently used
+      trace?.call('offline-serve: ${p.basename(file.path)} ${stat.size}B memory');
+      return cached.bytes;
+    }
+    if (cached != null) _plainBytes -= cached.bytes.length; // an older version
+
+    final flightKey = '${file.path}|${stat.modified.microsecondsSinceEpoch}|${stat.size}';
+    return _decrypting[flightKey] ??= _decrypt(file, stat).whenComplete(() {
+      _decrypting.remove(flightKey);
+    });
+  }
+
+  Future<List<int>> _decrypt(File file, FileStat stat) async {
+    final epoch = _cacheEpoch;
+    final watch = Stopwatch()..start();
+    final encrypted = await file.readAsBytes();
+    final readMs = watch.elapsedMilliseconds;
+    final plain = await encryptor.decryptBytesInBackground(encrypted);
+    trace?.call(
+      'offline-serve: ${p.basename(file.path)} ${stat.size}B decrypted read=${readMs}ms decrypt=${watch.elapsedMilliseconds - readMs}ms',
+    );
+    if (epoch == _cacheEpoch) {
+      _remember(file.path, _Plain(plain, stat.modified, stat.size));
+    }
+    return plain;
+  }
+
+  void _remember(String path, _Plain entry) {
+    final old = _plain.remove(path);
+    if (old != null) _plainBytes -= old.bytes.length;
+    if (entry.bytes.length > cacheLimitBytes) return; // too big to keep
+    _plain[path] = entry;
+    _plainBytes += entry.bytes.length;
+    while (_plainBytes > cacheLimitBytes && _plain.isNotEmpty) {
+      final oldest = _plain.keys.first;
+      _plainBytes -= _plain.remove(oldest)!.bytes.length;
+    }
+  }
+
+  /// Decrypts every file of a saved page ahead of time, a few at a time, so
+  /// that the first request for it costs nothing. For the moment the copy is
+  /// NOT needed: while the live page is loading, or just after it was saved.
+  /// Best effort and silent.
+  Future<void> prewarm(Directory pageDirectory) async {
+    try {
+      final files = <File>[];
+      await for (final entity in pageDirectory.list(recursive: true, followLinks: false)) {
+        // The manifest is read by the store, never served.
+        if (entity is File && p.basename(entity.path) != 'manifest.json') files.add(entity);
+      }
+      // Largest first: the logo is the long pole, start it before the rest.
+      final sizes = {for (final f in files) f.path: await f.length()};
+      files.sort((a, b) => sizes[b.path]!.compareTo(sizes[a.path]!));
+      for (var i = 0; i < files.length; i += 3) {
+        await Future.wait(files.skip(i).take(3).map(_plaintextOf));
+      }
+    } catch (_) {
+      // Nothing depends on it.
+    }
   }
 
   Future<void> _handleRequest(HttpRequest request) async {
@@ -231,8 +347,13 @@ class LocalSnapshotServer {
       // images for a legacy admin panel, not multi-gigabyte media, so
       // buffering one complete file in memory per request is an
       // acceptable, deliberate trade-off for this specific content.
-      final encryptedBytes = await file.readAsBytes();
-      var decryptedBytes = encryptor.decryptBytes(encryptedBytes);
+      final plain = await _plaintextOf(file);
+      if (plain == null) {
+        response.statusCode = HttpStatus.notFound;
+        await response.close();
+        return;
+      }
+      var decryptedBytes = plain;
       if (requestToken != _accessToken || root != rootDirectory) {
         response.statusCode = HttpStatus.notFound;
         await response.close();
@@ -374,4 +495,11 @@ class LocalSnapshotServer {
         mimeType == 'application/xml';
     return ContentType(primary, sub, charset: isText ? 'utf-8' : null);
   }
+}
+
+class _Plain {
+  const _Plain(this.bytes, this.modified, this.length);
+  final List<int> bytes;
+  final DateTime modified;
+  final int length;
 }

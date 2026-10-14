@@ -1344,6 +1344,54 @@ void main() {
       );
     });
 
+    group('the saved copy is decrypted ahead of time', () {
+      late OfflinePageCoordinator coordinator;
+
+      setUp(() {
+        coordinator = OfflinePageCoordinator(
+          connectivityProbe: ConnectivityProbe(),
+          captureService: captureService,
+          snapshotStore: store,
+          localServer: localServer,
+          handoffService: _FakeHandoffService(SecureStorageService()),
+        );
+      });
+
+      test('prewarmPage puts every file of the page into the server\'s memory', () async {
+        await store.writeSnapshot(
+          parishId: 'p',
+          userId: 'u',
+          pagePath: '/public/ranking.php',
+          html: '<html>Ranking</html>',
+          assets: {'public/css/style.css': utf8.encode('body{}')},
+        );
+        final dir = await store.getPageDirectoryIfReady(parishId: 'p', userId: 'u', pagePath: '/public/ranking.php');
+
+        await coordinator.prewarmPage(parishId: 'p', userId: 'u', pagePath: '/public/ranking.php');
+
+        expect(localServer.hasDecrypted(File('${dir!.path}/snapshot.html')), isTrue);
+        expect(localServer.hasDecrypted(File('${dir.path}/assets/public/css/style.css')), isTrue);
+      });
+
+      test('prewarmPage for a page that was never saved is silent', () async {
+        await coordinator.prewarmPage(parishId: 'p', userId: 'u', pagePath: '/public/never-saved.php');
+      });
+
+      test('planning the offline view decrypts nothing: that happens when the page is requested', () async {
+        await store.writeSnapshot(
+          parishId: 'p',
+          userId: 'u',
+          pagePath: '/public/ranking.php',
+          html: '<html>Ranking</html>',
+          assets: {},
+        );
+        final lines = <String>[];
+        localServer.trace = lines.add;
+        await coordinator.plan(parishId: 'p', userId: 'u', targetPath: '/public/ranking.php', forceOffline: true);
+        expect(lines, isEmpty, reason: 'the server served and decrypted nothing during planning');
+      });
+    });
+
     group('captures of one page do not pile up (F8)', () {
       late _CountingCapture counting;
       late OfflinePageCoordinator coordinator;

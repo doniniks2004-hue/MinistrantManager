@@ -278,6 +278,19 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
     events.add('warmUp');
   }
 
+  /// Pages the screen asked to have decrypted ahead of time.
+  final prewarmed = <String>[];
+
+  @override
+  Future<void> prewarmPage({
+    required String parishId,
+    required String userId,
+    required String pagePath,
+  }) async {
+    events.add('prewarm');
+    prewarmed.add('$parishId/$userId$pagePath');
+  }
+
   @override
   Future<Reachability> checkReachability(String host) {
     reachabilityCalls++;
@@ -961,6 +974,62 @@ void main() {
     });
   });
 
+  group('FIRST OFFLINE OPENING on the K12 (4445 ms, then 5 of 5 cold starts over the limit)', () {
+    Future<void> ms(WidgetTester tester, int millis) => tester.pump(Duration(milliseconds: millis));
+
+    testWidgets(
+      'REGRESSION: a page that finishes in the very instant of the deadline is not abandoned and reopened',
+      (tester) async {
+        final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
+        await tester.pumpWidget(_host(coordinator));
+        await ms(tester, 1); // planned; the 2 s budget is running
+
+        // The page finishes at the same instant the budget ends: both are
+        // due together, and the budget's timer was queued first, so it used
+        // to run first, declare the page late, throw the load away and start
+        // a second one, even though the callback that said "finished" was
+        // already waiting behind it.
+        Timer(const Duration(milliseconds: 2000), () {
+          platform.delegates.single.onPageFinished!(_localUrl.toString());
+        });
+        await ms(tester, 2100);
+
+        expect(find.textContaining('OFFLINE •'), findsOneWidget, reason: 'the page it finished is shown');
+        expect(find.textContaining('nie otworzyła się na czas'), findsNothing);
+        expect(find.byType(CircularProgressIndicator), findsNothing);
+        expect(coordinator.planCalls, 1, reason: 'no second opening was started');
+        expect(platform.controllers.single.loaded, [_localUrl]);
+      },
+    );
+
+    testWidgets('the deadline still fires when nothing finishes (the guard is not gone)', (tester) async {
+      final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 1);
+      await ms(tester, 2100);
+      expect(coordinator.planCalls, 2, reason: 'one automatic retry');
+      await ms(tester, 2100);
+      expect(find.textContaining('nie otworzyła się na czas'), findsOneWidget);
+    });
+
+    testWidgets('the saved copy of the page is prepared at start, before the first plan needs it', (tester) async {
+      final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+      expect(coordinator.prewarmed, ['p/u/public/dashboard.php']);
+      expect(coordinator.events.indexOf('prewarm'), lessThan(coordinator.events.indexOf('plan')));
+    });
+
+    testWidgets('and again for the page that finished loading online', (tester) async {
+      final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+      platform.delegates.single.onPageFinished!('https://szarlej.ministrant.eu/public/ranking.php');
+      await ms(tester, 10);
+      expect(coordinator.prewarmed, contains('p/u/public/ranking.php'));
+    });
+  });
+
   group('first switch to the saved copy', () {
     Future<void> ms(WidgetTester tester, int millis) =>
         tester.pump(Duration(milliseconds: millis));
@@ -1117,7 +1186,7 @@ void main() {
       final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
       await tester.pumpWidget(_host(coordinator));
       await ms(tester, 10);
-      expect(coordinator.events.take(2), ['warmUp', 'plan']);
+      expect(coordinator.events.take(3), ['warmUp', 'prewarm', 'plan']);
     });
 
     testWidgets('the scroll bars are hidden; nothing else about scrolling is touched', (
