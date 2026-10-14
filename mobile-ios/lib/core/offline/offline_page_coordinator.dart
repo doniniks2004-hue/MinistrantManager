@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
@@ -630,7 +631,10 @@ class HandoffFailure {
         'invalid_response',
       );
     }
-    return const HandoffFailure._(HandoffFailureKind.transport, null, null);
+    if (error is SocketException || error is TimeoutException) {
+      return const HandoffFailure._(HandoffFailureKind.transport, null, null);
+    }
+    return const HandoffFailure._(HandoffFailureKind.serverUnavailable, null, null);
   }
 }
 
