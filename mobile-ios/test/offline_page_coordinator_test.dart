@@ -407,6 +407,7 @@ void main() {
         localServer: localServer,
         handoffService: handoff,
         onlineTimeout: const Duration(milliseconds: 100),
+        firstOnlineTimeout: const Duration(milliseconds: 100),
       );
       final clock = Stopwatch()..start();
       final plan = await coordinator.plan(

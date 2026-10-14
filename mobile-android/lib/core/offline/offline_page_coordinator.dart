@@ -48,6 +48,7 @@ class OfflinePageCoordinator {
     required this.localServer,
     required this.handoffService,
     this.onlineTimeout = const Duration(milliseconds: 1500),
+    this.firstOnlineTimeout = const Duration(seconds: 3),
     this.offlinePlanTimeout = const Duration(milliseconds: 1500),
     this.reachability = const ServerReachability(),
     ConnectivityMonitor? connectivity,
@@ -121,6 +122,7 @@ class OfflinePageCoordinator {
   /// ticket actually exists (a slow-but-working server must not be
   /// mistaken for "no network" just because the ticket took a while).
   final Duration onlineTimeout;
+  final Duration firstOnlineTimeout;
 
   /// Budget for building the LOCAL view (manifest, directory, starting
   /// the loopback server). Normally a few milliseconds; this exists so a
@@ -221,10 +223,15 @@ class OfflinePageCoordinator {
     // for a failed handoff it is worked out below from what came back.
     var reason = offlineReason;
     if (!forceOffline) {
+      // The fast timeout protects an EXISTING saved copy. On a fresh login
+      // there is no copy to fall back to, so give a reachable server time
+      // to issue the first handoff rather than showing a false offline page.
+      final hasCopy = await _hasSnapshot(parishId, userId, path);
+      final handoffBudget = hasCopy ? onlineTimeout : firstOnlineTimeout;
       try {
         final handoffUrl = await handoffService
-            .requestHandoffUrl(entryPath)
-            .timeout(onlineTimeout);
+            .requestHandoffUrl(entryPath, timeout: handoffBudget)
+            .timeout(handoffBudget);
         return PageLoadOnline(url: handoffUrl, targetPath: path);
       } catch (e) {
         final failure = HandoffFailure.of(e);
