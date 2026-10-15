@@ -14,6 +14,7 @@ import 'package:ministrant_manager/core/offline/snapshot_capture_service.dart';
 import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
 import 'package:ministrant_manager/core/offline/snapshot_store.dart';
 import 'package:ministrant_manager/core/secure/secure_storage_service.dart';
+import 'package:ministrant_manager/core/util/startup_trace.dart';
 import 'package:ministrant_manager/features/webview/offline_aware_page_screen.dart';
 import 'package:ministrant_manager/features/webview/webview_handoff_service.dart';
 import 'package:webview_flutter/webview_flutter.dart' show WebViewWidget;
@@ -75,10 +76,15 @@ class _FakeController extends PlatformWebViewController {
   @override
   Future<void> setJavaScriptMode(JavaScriptMode javaScriptMode) async {}
 
+  /// The page-to-app channels the screen registered, by name.
+  final channels = <String, void Function(JavaScriptMessage)>{};
+
   @override
   Future<void> addJavaScriptChannel(
     JavaScriptChannelParams javaScriptChannelParams,
-  ) async {}
+  ) async {
+    channels[javaScriptChannelParams.name] = javaScriptChannelParams.onMessageReceived;
+  }
 
   @override
   Future<void> setPlatformNavigationDelegate(
@@ -1142,6 +1148,195 @@ void main() {
       await tester.pumpWidget(_host(coordinator, forceOffline: true)); // a newer load
       await ms(tester, 600);
       expect(coordinator.traces.any((t) => t.contains('plan-result DISCARDED')), isTrue);
+    });
+  });
+
+  group('P0: cold start offline, and when the panel is really visible', () {
+    const host = 'https://szarlej.ministrant.eu';
+    const none = NetworkState(hasInterface: false, transport: NetworkTransport.none);
+    const wifi = NetworkState(hasInterface: true, validated: true, transport: NetworkTransport.wifi);
+    Future<void> ms(WidgetTester tester, int millis) => tester.pump(Duration(milliseconds: millis));
+
+    _ScriptedCoordinator scripted(
+      _TestSignal signal, {
+      Future<OnlineProbeResult> Function(int call)? probe,
+    }) => _ScriptedCoordinator(
+      (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+      signal: signal,
+      probe: probe,
+    );
+
+    testWidgets('REGRESSION: opened with no network, the app does not first try to reach the server', (tester) async {
+      // With a saved copy the attempt to reach the server is allowed 1.5 s before
+      // the copy is even looked for. The system already knew there was no network.
+      final coordinator = scripted(_TestSignal()..now = none);
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 50);
+
+      expect(coordinator.planCalls, 1);
+      expect(coordinator.planReasons.single, OfflineReason.noNetwork);
+      expect(platform.controllers.single.loaded, [_localUrl], reason: 'straight to the copy: no handoff was requested');
+      expect(coordinator.traces.any((t) => t.contains('skipping the online attempt')), isTrue);
+      expect(coordinator.traces.any((t) => t.contains('load-start forceOffline=true reason=noNetwork')), isTrue);
+    });
+
+    testWidgets('and it is a normal offline load: when the server answers, the live page comes back by itself', (
+      tester,
+    ) async {
+      final coordinator = scripted(_TestSignal()..now = none, probe: (_) async => OnlineProbeRecovered(_onlinePlan()));
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 50);
+      platform.delegates.single.onPageFinished!(_localUrl.toString());
+      await ms(tester, 10);
+      expect(find.textContaining('OFFLINE •'), findsOneWidget);
+
+      await ms(tester, 2200); // the reconnect check is due and the server answers
+      expect(platform.controllers.single.loaded, [_localUrl, _ticketUrl]);
+    });
+
+    testWidgets('a connected phone is NOT forced offline', (tester) async {
+      final coordinator = scripted(_TestSignal()..now = wifi);
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 50);
+      expect(coordinator.planReasons, anyOf(isEmpty, everyElement(isNot(OfflineReason.noNetwork))));
+      expect(platform.controllers.single.loaded, [_ticketUrl]);
+    });
+
+    testWidgets('when the system cannot say, the online attempt is made as before', (tester) async {
+      final coordinator = _ScriptedCoordinator((_) async => _onlinePlan()); // NoNetworkSignal
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 50);
+      expect(platform.controllers.single.loaded, [_ticketUrl]);
+    });
+
+    testWidgets('the screen asks the page for a drawn frame after it finished, and says which load', (tester) async {
+      final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+      platform.delegates.single.onPageFinished!('$host/public/dashboard.php');
+      await ms(tester, 10);
+
+      final probe = platform.controllers.single.scripts.singleWhere((s) => s.contains('MM_Paint.postMessage'));
+      expect(probe, contains('nav: 1'));
+      expect(probe, contains('requestAnimationFrame'));
+      expect(probe, contains('first-contentful-paint'));
+    });
+
+    testWidgets('REGRESSION: "visible" is measured, not assumed: the drawn frame is a mark and a trace line', (
+      tester,
+    ) async {
+      StartupTrace.reset();
+      final coordinator = scripted(_TestSignal()..now = none);
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 50);
+      platform.delegates.single.onPageFinished!(_localUrl.toString());
+      await ms(tester, 10);
+      expect(StartupTrace.marks.map((m) => m.$1), isNot(contains('panel_painted_copy')), reason: 'finished is not visible');
+
+      platform.controllers.single.channels['MM_Paint']!(
+        JavaScriptMessage(message: '{"nav":1,"fcp":321,"at":412}'),
+      );
+      await ms(tester, 1);
+
+      expect(StartupTrace.marks.map((m) => m.$1), containsAll(['screen_init', 'load_request', 'plan_done', 'panel_painted_copy']));
+      final line = coordinator.traces.singleWhere((t) => t.contains('PAINTED'));
+      expect(line, allOf(contains('mode=copy'), contains('first-contentful-paint=321 ms'), contains('page-clock=412 ms')));
+    });
+
+    testWidgets('the drawn-frame report says what was ON the page: state, images, stylesheets, panel size', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+      platform.delegates.single.onPageFinished!('$host/public/dashboard.php');
+      await ms(tester, 10);
+
+      platform.controllers.single.channels['MM_Paint']!(
+        JavaScriptMessage(
+          message: '{"nav":1,"fcp":210,"at":480,"ready":"complete","shown":"visible",'
+              '"img":"3/3","sheets":1,"w":1180,"h":2300}',
+        ),
+      );
+      await ms(tester, 1);
+
+      final line = coordinator.traces.singleWhere((t) => t.contains('PAINTED'));
+      expect(
+        line,
+        allOf(
+          contains('readyState=complete'),
+          contains('visibility=visible'),
+          contains('images=3/3'),
+          contains('stylesheets=1'),
+          contains('main=1180x2300px'),
+        ),
+      );
+    });
+
+    testWidgets('a half-drawn page is VISIBLE in that report (images missing, no stylesheet, empty panel)', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+      platform.delegates.single.onPageFinished!('$host/public/dashboard.php');
+      await ms(tester, 10);
+
+      platform.controllers.single.channels['MM_Paint']!(
+        JavaScriptMessage(
+          message: '{"nav":1,"fcp":-1,"at":1500,"ready":"interactive","shown":"visible",'
+              '"img":"0/1","sheets":0,"w":0,"h":0}',
+        ),
+      );
+      await ms(tester, 1);
+
+      final line = coordinator.traces.singleWhere((t) => t.contains('PAINTED'));
+      expect(line, allOf(contains('readyState=interactive'), contains('images=0/1'), contains('stylesheets=0'), contains('main=0x0px')));
+    });
+
+    testWidgets('only short words and small numbers from the page are ever repeated in the trace', (tester) async {
+      final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+      platform.delegates.single.onPageFinished!('$host/public/dashboard.php');
+      await ms(tester, 10);
+
+      platform.controllers.single.channels['MM_Paint']!(
+        JavaScriptMessage(
+          message: '{"nav":1,"fcp":5,"at":5,"ready":"<script>alert(1)</script>","shown":"a very long word that is not one",'
+              '"img":"<b>x</b>","sheets":"many","w":{"x":1},"h":[1]}',
+        ),
+      );
+      await ms(tester, 1);
+
+      final line = coordinator.traces.singleWhere((t) => t.contains('PAINTED'));
+      expect(line, allOf(contains('readyState=n/a'), contains('visibility=n/a'), contains('images=n/a'), contains('stylesheets=n/a')));
+      for (final bad in ['<', '>', 'script', 'alert', 'very long']) {
+        expect(line, isNot(contains(bad)));
+      }
+    });
+
+    testWidgets('a paint report for an OLD load, or one that is not ours, changes nothing', (tester) async {
+      StartupTrace.reset();
+      final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 10);
+      platform.delegates.single.onPageFinished!('$host/public/dashboard.php');
+      await ms(tester, 10);
+      final report = platform.controllers.single.channels['MM_Paint']!;
+
+      report(JavaScriptMessage(message: '{"nav":99,"fcp":1,"at":1}')); // another load
+      report(JavaScriptMessage(message: 'not json at all'));
+      report(JavaScriptMessage(message: '[1,2,3]'));
+      report(JavaScriptMessage(message: '{"nav":1,"fcp":"<script>","at":{}}')); // our load, hostile numbers
+      await ms(tester, 1);
+
+      final painted = coordinator.traces.where((t) => t.contains('PAINTED')).toList();
+      expect(painted, hasLength(1), reason: 'only the report for this load, and only its numbers');
+      expect(painted.single, allOf(contains('first-contentful-paint=n/a'), contains('page-clock=n/a')));
+      expect(painted.single, isNot(contains('script')));
+      expect(find.byType(spinner), findsNothing);
+      expect(coordinator.planCalls, 1);
     });
   });
 

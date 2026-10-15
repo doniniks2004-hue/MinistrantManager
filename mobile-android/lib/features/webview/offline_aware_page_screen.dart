@@ -61,6 +61,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     with WidgetsBindingObserver {
   static const _captureChannel = 'MMPageCapture';
   static const _bridgeChannel = 'MinistrantBridge';
+  static const _paintChannel = 'MM_Paint';
   static const _bridgeShim = '''
 (function() {
   if (!window.MinistrantBridge || window.MinistrantBridge.__mmShimmed) return;
@@ -288,11 +289,13 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
   @override
   void initState() {
     super.initState();
+    StartupTrace.mark('screen_init');
     _currentPath = widget.targetPath;
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..addJavaScriptChannel(_captureChannel, onMessageReceived: _onCapture)
       ..addJavaScriptChannel(_bridgeChannel, onMessageReceived: _onBridge)
+      ..addJavaScriptChannel(_paintChannel, onMessageReceived: _onPaint)
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageStarted: _onStarted,
@@ -437,7 +440,105 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     _connectivitySub = widget.coordinator.connectivity.events.listen(
       _onConnectivity,
     );
-    unawaited(_loadPage(forceOffline: widget.forceOffline));
+    unawaited(_firstLoad());
+  }
+
+  Future<void> _loadRequestTraced(Uri url) {
+    StartupTrace.mark('load_request');
+    _tr('loadRequest ${describeUrlForLog(url.toString())} mode=${_online ? 'live' : 'copy'}');
+    return _controller.loadRequest(url);
+  }
+
+  /// The first load of this screen. If the system ALREADY says there is no
+  /// network (the app was opened offline), the attempt to reach the server is
+  /// skipped: it cannot succeed, and until it fails (up to 1.5 s with a saved
+  /// copy) the user waits for a copy that is already there. Nothing is lost if
+  /// the system is wrong: the load is a normal "offline" one, so the
+  /// reconnect logic asks the server and brings the live page back.
+  Future<void> _firstLoad() async {
+    var forceOffline = widget.forceOffline;
+    OfflineReason? reason;
+    if (!forceOffline) {
+      final state = await widget.coordinator.connectivity.currentState();
+      if (!mounted || _loggingOut) return;
+      if (state != null && !state.hasInterface) {
+        forceOffline = true;
+        reason = OfflineReason.noNetwork;
+        widget.coordinator.trace('start: the system reports no network; skipping the online attempt');
+      }
+    }
+    await _loadPage(forceOffline: forceOffline, offlineReason: reason);
+  }
+
+  /// Asks the page to say when a frame has actually been drawn after it
+  /// finished loading: two animation frames (the first commits the layout, the
+  /// second is the one after it was painted), and the page's own
+  /// first-contentful-paint time. "The page finished loading" is not "the user
+  /// sees the panel": this is the second one. Reports a number and the id of
+  /// the load it belongs to, nothing else.
+  void _probePaint() {
+    final nav = _navId;
+    unawaited(
+      _controller
+          .runJavaScript('''
+(function () {
+  var done = false;
+  function report() {
+    if (done) return;
+    done = true;
+    try {
+      var p = performance.getEntriesByName('first-contentful-paint')[0];
+      var images = document.images, loaded = 0;
+      for (var i = 0; i < images.length; i++) {
+        if (images[i].complete && images[i].naturalWidth > 0) loaded++;
+      }
+      var main = document.querySelector('main') || document.body;
+      var box = main ? main.getBoundingClientRect() : { width: 0, height: 0 };
+      $_paintChannel.postMessage(JSON.stringify({
+        nav: $nav, fcp: p ? Math.round(p.startTime) : -1, at: Math.round(performance.now()),
+        ready: document.readyState, shown: document.visibilityState,
+        img: loaded + '/' + images.length,
+        sheets: document.styleSheets.length,
+        w: Math.round(box.width), h: Math.round(box.height)
+      }));
+    } catch (e) {}
+  }
+  requestAnimationFrame(function () { requestAnimationFrame(report); });
+  setTimeout(report, 1500);
+})();
+''')
+          .catchError((_) {}),
+    );
+  }
+
+  /// The page says a frame was drawn. Only a trace and a start-up mark: the
+  /// message is from a web page and changes no state.
+  void _onPaint(JavaScriptMessage message) {
+    if (!mounted || _loggingOut) return;
+    try {
+      final data = jsonDecode(message.message);
+      if (data is! Map) return;
+      if (data['nav'] != _navId) return; // a load that is no longer the current one
+      final fcp = data['fcp'];
+      final at = data['at'];
+      final mode = _online ? 'live' : 'copy';
+      // What was actually on the page when the frame was drawn. Only short
+      // words and numbers are repeated; anything else from the page is dropped.
+      String word(Object? v) => v is String && RegExp(r'^[A-Za-z]{1,12}$').hasMatch(v) ? v : 'n/a';
+      String count(Object? v) => v is String && RegExp(r'^\d{1,4}/\d{1,4}$').hasMatch(v) ? v : 'n/a';
+      String num0(Object? v) => v is num ? '${v.toInt().clamp(0, 100000)}' : 'n/a';
+      StartupTrace.mark(_online ? 'panel_painted_live' : 'panel_painted_copy');
+      _tr(
+        'PAINTED mode=$mode: a frame was drawn after the page finished; '
+        'first-contentful-paint=${fcp is num ? '${fcp.toInt().clamp(-1, 600000)} ms' : 'n/a'} '
+        'page-clock=${at is num ? '${at.toInt().clamp(0, 600000)} ms' : 'n/a'} '
+        'readyState=${word(data['ready'])} visibility=${word(data['shown'])} '
+        'images=${count(data['img'])} stylesheets=${num0(data['sheets'])} '
+        'main=${num0(data['w'])}x${num0(data['h'])}px',
+      );
+    } catch (_) {
+      // Not ours: ignore.
+    }
   }
 
   /// The page has its own scrolling; the native scroll bar drawn over the
@@ -711,6 +812,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     }
     setState(() => _state = _LoadState.ready);
     _tr('READY mode=${_online ? 'live' : 'copy'}');
+    _probePaint();
     StartupTrace.mark(_online ? 'page_ready_online' : 'page_ready_offline');
     if (!_online) {
       widget.coordinator.trace('offline-render: finished');
@@ -1261,7 +1363,7 @@ $_captureChannel.postMessage(JSON.stringify({
           _totalDeadline?.cancel();
           _totalDeadline = null;
           _startDeadline();
-          await _controller.loadRequest(plan.url);
+          await _loadRequestTraced(plan.url);
         case PageLoadOffline():
           _online = false;
           _afterHandoffPath = null;
@@ -1284,7 +1386,7 @@ $_captureChannel.postMessage(JSON.stringify({
             _offlineTotalBudget,
             () => _expireOfflineBudget(generation),
           );
-          await _controller.loadRequest(plan.url);
+          await _loadRequestTraced(plan.url);
         case PageLoadOfflineNoSnapshot():
           _online = false;
           _errorText = null;

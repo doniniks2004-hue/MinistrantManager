@@ -10,13 +10,74 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.EventChannel
+import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         NetworkSignalPlugin(applicationContext)
             .register(flutterEngine.dartExecutor.binaryMessenger)
+        SnapshotCryptoPlugin().register(flutterEngine.dartExecutor.binaryMessenger)
+    }
+}
+
+/**
+ * AES-GCM with the platform's own library, for the saved pages.
+ *
+ * The same algorithm, key and BYTES as the Dart implementation in
+ * SnapshotEncryptor: data = IV (12 bytes) + ciphertext + 16-byte tag, so what
+ * one side writes the other reads. Plain Dart does this at ~50 KB per second in
+ * a debug build; this takes milliseconds.
+ *
+ * It decides nothing: on any failure (a payload that does not authenticate, a
+ * wrong key, a bad argument) it answers with an error code, and Dart, which has
+ * the authoritative implementation, does the work and gives the real verdict.
+ * Neither the key nor any data is ever put in an error message.
+ */
+class SnapshotCryptoPlugin : MethodChannel.MethodCallHandler {
+    fun register(messenger: BinaryMessenger) {
+        MethodChannel(messenger, "eu.ministrant.manager/crypto").setMethodCallHandler(this)
+    }
+
+    override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+        try {
+            val key = call.argument<ByteArray>("key")
+            val data = call.argument<ByteArray>("data")
+            if (key == null || data == null || key.size != 32) {
+                result.error("bad_arguments", null, null)
+                return
+            }
+            val secret = SecretKeySpec(key, "AES")
+            when (call.method) {
+                "decrypt" -> {
+                    if (data.size <= 12 + 16) {
+                        result.error("bad_arguments", null, null)
+                        return
+                    }
+                    val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                    cipher.init(Cipher.DECRYPT_MODE, secret, GCMParameterSpec(128, data, 0, 12))
+                    result.success(cipher.doFinal(data, 12, data.size - 12))
+                }
+                "encrypt" -> {
+                    val iv = call.argument<ByteArray>("iv")
+                    if (iv == null || iv.size != 12) {
+                        result.error("bad_arguments", null, null)
+                        return
+                    }
+                    val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                    cipher.init(Cipher.ENCRYPT_MODE, secret, GCMParameterSpec(128, iv))
+                    result.success(iv + cipher.doFinal(data))
+                }
+                else -> result.notImplemented()
+            }
+        } catch (e: Exception) {
+            // The class of the failure only: never the key, never the data.
+            result.error("crypto_failed", e.javaClass.simpleName, null)
+        }
     }
 }
 

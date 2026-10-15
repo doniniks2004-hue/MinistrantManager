@@ -10,6 +10,7 @@ import 'core/network/api_client.dart';
 import 'core/secure/secure_storage_service.dart';
 import 'core/startup/app_services.dart';
 import 'core/startup/install_marker.dart';
+import 'core/util/loop_lag_monitor.dart';
 import 'core/util/startup_trace.dart';
 import 'features/activation/activation_screen.dart';
 import 'features/home/home_screen.dart';
@@ -19,6 +20,9 @@ import 'features/startup/startup_error_screen.dart';
 void main() {
   StartupTrace.mark('main');
   WidgetsFlutterBinding.ensureInitialized();
+  // Where the first 20 seconds went: which stretches the interface isolate was
+  // busy with one long piece of work (traces only; see LoopLagMonitor).
+  LoopLagMonitor.startIfTracing();
   runApp(const MinistrantManagerApp());
 }
 

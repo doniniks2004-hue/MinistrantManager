@@ -326,7 +326,9 @@ class LocalSnapshotServer {
     plain ??= await encryptor.decryptBytesInBackground(stored);
 
     trace?.call(
-      'offline-serve: ${p.basename(file.path)} ${stat.size}B $how read=${readMs}ms ${how == 'verified' ? 'check' : 'decrypt'}=${watch.elapsedMilliseconds - readMs}ms',
+      'offline-serve: ${p.basename(file.path)} ${stat.size}B $how read=${readMs}ms '
+      '${how == 'verified' ? 'check' : 'decrypt'}=${watch.elapsedMilliseconds - readMs}ms '
+      '(cipher so far: platform=${SnapshotEncryptor.nativeCalls} dart=${SnapshotEncryptor.dartCalls})',
     );
     if (epoch == _cacheEpoch) {
       _remember(_keyOf(file), _Plain(plain, stat.modified, stat.size));

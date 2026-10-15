@@ -66,6 +66,12 @@ class ConnectivityMonitor {
 
   Stream<ConnectivityEvent> get events => _events.stream;
 
+  /// What the system says about the connection RIGHT NOW, or null if it cannot
+  /// say (no native side, or no answer within [within]). One short question,
+  /// for the one moment it matters: the first load of a screen.
+  Future<NetworkState?> currentState({Duration within = const Duration(milliseconds: 300)}) =>
+      _signal.current().timeout(within, onTimeout: () => null).catchError((Object _) => null);
+
   /// Safe to call more than once.
   void start() {
     if (_started) return;
