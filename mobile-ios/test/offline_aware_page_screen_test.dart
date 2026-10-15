@@ -284,6 +284,11 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
     events.add('warmUp');
   }
 
+  /// For every plan the screen asked for: was it forced offline? (planReasons is
+  /// NOT that: the screen hands a reason to EVERY plan, forced or not, as the one
+  /// to use if the plan has to fall back, and its default is noNetwork.)
+  final planForced = <bool>[];
+
   /// Every line the screen wrote to the debug trace.
   final traces = <String>[];
 
@@ -349,6 +354,7 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
     OfflineReason offlineReason = OfflineReason.noNetwork,
   }) {
     planCalls++;
+    planForced.add(forceOffline);
     events.add('plan');
     planRequests.add((targetPath, handoffPath));
     planReasons.add(offlineReason);
@@ -1024,11 +1030,56 @@ void main() {
     testWidgets('a plan that never answers is reported as a PLANNING failure, not as a saved copy', (
       tester,
     ) async {
-      final coordinator = _ScriptedCoordinator((_) => _after(const Duration(seconds: 30), _onlinePlan()));
+      // A Completer nobody completes, NOT Future.delayed: a delayed future is a
+      // timer, and the test would end with it still pending.
+      final coordinator = _ScriptedCoordinator((_) => Completer<PageLoadPlan>().future);
       await tester.pumpWidget(_host(coordinator));
       await ms(tester, 6100);
       expect(find.textContaining('Nie udało się przygotować strony na czas'), findsOneWidget);
       expect(find.textContaining('Zapisana kopia'), findsNothing);
+    });
+
+    testWidgets('a plan that TIMED OUT is not "no saved copy": it is retried once, then reported as what it is', (
+      tester,
+    ) async {
+      // The real coordinator returns NoSnapshot(timedOut: true) when preparing the
+      // saved view overruns; that says nothing about whether a copy exists.
+      final coordinator = _ScriptedCoordinator((_) async => const PageLoadOfflineNoSnapshot(timedOut: true));
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 50);
+
+      expect(coordinator.planCalls, 2, reason: 'the first timed-out plan is retried once, at once');
+      expect(find.textContaining('Przygotowanie zapisanej kopii trwało zbyt długo'), findsOneWidget);
+      expect(find.text('SPRÓBUJ PONOWNIE'), findsOneWidget);
+      expect(find.textContaining('Brak zapisanej'), findsNothing, reason: 'it must not claim there is no copy');
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('a retry of a timed-out plan that succeeds shows the copy', (tester) async {
+      var calls = 0;
+      final coordinator = _ScriptedCoordinator(
+        (_) async => ++calls == 1 ? const PageLoadOfflineNoSnapshot(timedOut: true) : _offlinePlan(),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 50);
+      platform.delegates.single.onPageFinished!(_localUrl.toString());
+      await ms(tester, 10);
+
+      expect(coordinator.planCalls, 2);
+      expect(find.textContaining('OFFLINE •'), findsOneWidget);
+      expect(find.textContaining('trwało zbyt długo'), findsNothing);
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('a plan that is genuinely "no copy" (not timed out) is still reported as that, with no retry', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator((_) async => const PageLoadOfflineNoSnapshot());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 50);
+      expect(coordinator.planCalls, 1);
+      expect(find.textContaining('trwało zbyt długo'), findsNothing);
+      coordinator.connectivity.dispose();
     });
 
     testWidgets('the coordinator\'s planning budget covers its longest legitimate plan', (tester) async {
@@ -1174,10 +1225,15 @@ void main() {
       await ms(tester, 50);
 
       expect(coordinator.planCalls, 1);
+      expect(coordinator.planForced, [true], reason: 'the very first plan was already an offline one');
       expect(coordinator.planReasons.single, OfflineReason.noNetwork);
       expect(platform.controllers.single.loaded, [_localUrl], reason: 'straight to the copy: no handoff was requested');
       expect(coordinator.traces.any((t) => t.contains('skipping the online attempt')), isTrue);
       expect(coordinator.traces.any((t) => t.contains('load-start forceOffline=true reason=noNetwork')), isTrue);
+
+      // The monitor belongs to the coordinator, which outlives the screen; it was
+      // given "no network" at start and has a grace timer running. Close it.
+      coordinator.connectivity.dispose();
     });
 
     testWidgets('and it is a normal offline load: when the server answers, the live page comes back by itself', (
@@ -1192,14 +1248,20 @@ void main() {
 
       await ms(tester, 2200); // the reconnect check is due and the server answers
       expect(platform.controllers.single.loaded, [_localUrl, _ticketUrl]);
+      coordinator.connectivity.dispose();
     });
 
     testWidgets('a connected phone is NOT forced offline', (tester) async {
       final coordinator = scripted(_TestSignal()..now = wifi);
       await tester.pumpWidget(_host(coordinator));
       await ms(tester, 50);
-      expect(coordinator.planReasons, anyOf(isEmpty, everyElement(isNot(OfflineReason.noNetwork))));
+      // NOT planReasons: the screen gives every plan a fallback reason, noNetwork by
+      // default, also for a plain online load. What matters is whether the plan was
+      // FORCED offline, and what was opened.
+      expect(coordinator.planForced, [false], reason: 'a connected phone starts with the online attempt');
       expect(platform.controllers.single.loaded, [_ticketUrl]);
+      expect(coordinator.traces.any((t) => t.contains('skipping the online attempt')), isFalse);
+      coordinator.connectivity.dispose();
     });
 
     testWidgets('when the system cannot say, the online attempt is made as before', (tester) async {
@@ -1241,6 +1303,7 @@ void main() {
       expect(StartupTrace.marks.map((m) => m.$1), containsAll(['screen_init', 'load_request', 'plan_done', 'panel_painted_copy']));
       final line = coordinator.traces.singleWhere((t) => t.contains('PAINTED'));
       expect(line, allOf(contains('mode=copy'), contains('first-contentful-paint=321 ms'), contains('page-clock=412 ms')));
+      coordinator.connectivity.dispose(); // its grace timer (no network at start) must not outlive the test
     });
 
     testWidgets('the drawn-frame report says what was ON the page: state, images, stylesheets, panel size', (

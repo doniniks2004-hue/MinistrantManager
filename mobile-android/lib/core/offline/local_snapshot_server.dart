@@ -59,6 +59,20 @@ class LocalSnapshotServer {
   int _activeRequests = 0;
   DateTime? _lastRequestAt;
 
+  /// The listener's stream ended while this server still believed it was the
+  /// current one: the socket was closed from outside (the system reclaiming it).
+  /// Said by the stream itself, at once, with no connection attempt at all.
+  bool _listenerClosed = false;
+
+  /// How long ONE health probe may take, and how many are made. The repair is
+  /// part of building the saved view, which has 1.5 s in all (the offline plan
+  /// budget) and is reported as "no saved copy" when it overruns: so the whole
+  /// check must cost a fraction of that, whatever the platform does with a
+  /// connection to a dead port (Linux and Darwin refuse at once; Windows can take
+  /// a second or more to refuse). The probe is bounded here, not trusted to bound
+  /// itself.
+  static const _probeTimeout = Duration(milliseconds: 400);
+  static const _probeAttempts = 2;
   /// A listener that answered a request a moment ago, or is answering one now,
   /// is not dead, whatever one slow probe says.
   static const _recentlyServed = Duration(seconds: 10);
@@ -201,7 +215,9 @@ class LocalSnapshotServer {
     final current = _server;
     if (current == null) return start();
     final port = _boundPort;
-    if (port == null) {
+    if (port == null || _listenerClosed) {
+      // Closed from outside, and the stream says so: no probe needed, none made.
+      if (_listenerClosed) trace?.call('offline-serve: the listener was closed from outside; replacing it');
       await stop();
       return start();
     }
@@ -213,10 +229,12 @@ class LocalSnapshotServer {
     //    alive by definition and is left alone;
     //  - otherwise the probe is tried twice, the second time with more patience,
     //    and only two failures in a row count.
-    if (_servedRecently) return port;
-    if (await _healthProbe(port)) return port;
-    if (_servedRecently) return port;
-    if (await _healthProbe(port)) return port;
+    for (var attempt = 0; attempt < _probeAttempts; attempt++) {
+      if (_servedRecently) return port;
+      final alive = await _healthProbe(port).timeout(_probeTimeout, onTimeout: () => false);
+      if (alive) return port;
+    }
+    trace?.call('offline-serve: $_probeAttempts probes of ${_probeTimeout.inMilliseconds} ms failed; replacing the listener');
     await stop();
     return start();
   }
@@ -226,7 +244,7 @@ class LocalSnapshotServer {
       final socket = await Socket.connect(
         InternetAddress.loopbackIPv4,
         port,
-        timeout: const Duration(milliseconds: 1500),
+        timeout: _probeTimeout,
       );
       socket.destroy();
       return true;
@@ -239,12 +257,17 @@ class LocalSnapshotServer {
   /// operating system does to a suspended app's sockets. For tests only.
   Future<void> debugKillListenerForTest() async {
     await _server?.close(force: true);
+    // The stream reports its end a moment after close() returns.
+    for (var i = 0; i < 40 && !_listenerClosed; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
   }
 
   Future<int> _bind() async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     _server = server;
     _boundPort = server.port;
+    _listenerClosed = false;
     server.listen(
       (request) async {
         _activeRequests++;
@@ -255,6 +278,11 @@ class LocalSnapshotServer {
           _activeRequests--;
           _lastRequestAt = DateTime.now();
         }
+      },
+      onDone: () {
+        // Our own stop() clears _server BEFORE it closes the listener, so this
+        // only fires for a listener that was closed behind our back.
+        if (identical(_server, server)) _listenerClosed = true;
       },
       onError: (_) {
         // A single malformed connection must never bring the whole

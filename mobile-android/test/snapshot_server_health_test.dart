@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -77,18 +78,63 @@ void main() {
     expect(probes, 2);
   });
 
-  test('an idle server whose socket is really gone IS repaired (two failures)', () async {
+  test('a listener the system CLOSED is replaced at once, with no probe at all', () async {
+    var probes = 0;
+    final server = await started((_) async {
+      probes++;
+      return true; // even a probe that would have said "alive" is not consulted
+    });
+    await server.debugKillListenerForTest();
+
+    final port = await server.ensureHealthy();
+
+    expect(probes, 0, reason: 'the stream said it ended: nothing to ask');
+    expect(server.isRunning, isTrue);
+    final socket = await Socket.connect(InternetAddress.loopbackIPv4, port, timeout: const Duration(seconds: 1));
+    socket.destroy();
+  });
+
+  test('silent death (no signal): two failed probes in a row repair it', () async {
     var probes = 0;
     final server = await started((_) async {
       probes++;
       return false;
     });
-    await server.debugKillListenerForTest();
+    final before = server.port;
+
     final port = await server.ensureHealthy();
+
     expect(probes, 2);
+    expect(server.isRunning, isTrue);
+    expect(port, isNot(before), reason: 'a new listener');
+  });
+
+  test('REGRESSION: a probe that never answers cannot starve the caller: the whole check is bounded', () async {
+    // On Windows a connection to a dead port can take a second or more to be
+    // refused. The saved view has 1.5 s in all and reports "no saved copy" past it.
+    final server = await started((_) => Completer<bool>().future); // never completes
+    final watch = Stopwatch()..start();
+
+    final port = await server.ensureHealthy();
+
+    expect(watch.elapsedMilliseconds, lessThan(1500), reason: '2 probes x 400 ms, then the repair');
     expect(server.isRunning, isTrue);
     final socket = await Socket.connect(InternetAddress.loopbackIPv4, port, timeout: const Duration(seconds: 1));
     socket.destroy();
+  });
+
+  test('stopping the server ourselves is not mistaken for the system closing it', () async {
+    var probes = 0;
+    final server = await started((_) async {
+      probes++;
+      return true;
+    });
+    await server.stop();
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    await server.start();
+    final port = server.port;
+    expect(await server.ensureHealthy(), port, reason: 'a fresh, healthy listener is kept');
+    expect(probes, 1);
   });
 
   test('a healthy idle server is probed once and left alone', () async {

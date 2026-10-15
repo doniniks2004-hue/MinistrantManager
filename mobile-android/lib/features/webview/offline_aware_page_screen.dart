@@ -1278,7 +1278,8 @@ $_captureChannel.postMessage(JSON.stringify({
       ..reset()
       ..start();
     _tr(
-      'load-start forceOffline=$forceOffline reason=${(offlineReason ?? _offlineReason).name} '
+      'load-start forceOffline=$forceOffline '
+      'reason=${forceOffline ? (offlineReason ?? _offlineReason).name : 'n/a(online attempt first)'} '
       'prepared=${prepared != null} path=${describeUrlForLog('https://x$_currentPath')} '
       'wasOnline=$_online autoRetries=$_offlineAutoRetries',
     );
@@ -1391,6 +1392,19 @@ $_captureChannel.postMessage(JSON.stringify({
           _online = false;
           _errorText = null;
           _recoverable = !widget.forceOffline;
+          if (plan.timedOut) {
+            // Preparing the view ran out of time. A copy may well exist (a slow
+            // moment is not "there is none"): try once more, and if that fails
+            // too say what happened instead of saying there is no copy.
+            _tr('plan timed out: not "no saved copy"');
+            if (_retryOfflineOnce()) return;
+            _scheduleRecovery();
+            setState(() {
+              _state = _LoadState.error;
+              _errorText = 'Przygotowanie zapisanej kopii trwało zbyt długo. Spróbuj ponownie.';
+            });
+            return;
+          }
           _scheduleRecovery();
           setState(() => _state = _LoadState.noSnapshot);
         case PageLoadServerError():

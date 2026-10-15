@@ -304,6 +304,7 @@ class OfflinePageCoordinator {
         ticket.expired = true;
         return PageLoadOfflineNoSnapshot(
           diagnosticMessage: kDebugMode ? 'offline plan timed out' : null,
+          timedOut: true,
         );
       },
     );
@@ -675,7 +676,12 @@ class HandoffFailure {
 /// should show an explanatory empty state rather than attempting to
 /// load anything.
 class PageLoadOfflineNoSnapshot extends PageLoadPlan {
-  const PageLoadOfflineNoSnapshot({this.diagnosticMessage});
+  const PageLoadOfflineNoSnapshot({this.diagnosticMessage, this.timedOut = false});
+
+  /// Preparing the saved view ran out of its time. That says NOTHING about
+  /// whether a copy exists: it is not "no saved copy", and the screen must not
+  /// present it as that. It used to be indistinguishable.
+  final bool timedOut;
 
   /// K12 diagnostic round 3: why the online attempt (if one was even
   /// made) failed — null when this page was never actually attempted
