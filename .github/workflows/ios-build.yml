@@ -10,6 +10,10 @@ on:
         description: 'Require complete production signing (fail if missing)'
         type: boolean
         default: false
+      upload_testflight:
+        description: 'After building the signed IPA, upload it to TestFlight (needs the signing secrets AND the three APP_STORE_CONNECT_* secrets)'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,6 +27,9 @@ jobs:
       HAS_APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD != '' }}
       HAS_APPLE_PROFILE: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 != '' }}
       HAS_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID != '' }}
+      HAS_ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID != '' }}
+      HAS_ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID != '' }}
+      HAS_ASC_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 != '' }}
     defaults:
       run:
         working-directory: mobile-ios
@@ -55,6 +62,53 @@ jobs:
           fi
           if [ "${{ inputs.production }}" = "true" ] && [ "$configured" -ne 4 ]; then
             echo "Production build requires complete signing secrets."
+            exit 1
+          fi
+
+      - name: Signing and TestFlight readiness (what is missing, by name)
+        run: |
+          # Names only, never values. Missing secrets are REPORTED, not worked
+          # around: no certificate or profile is ever generated here.
+          row() { if [ "$2" = "true" ]; then echo "| \`$1\` | set |"; else echo "| \`$1\` | **missing** |"; fi; }
+          {
+            echo "## iOS release readiness"
+            echo
+            echo "| Secret | State |"
+            echo "|---|---|"
+            row APPLE_CERTIFICATE_BASE64 "$HAS_APPLE_CERT"
+            row APPLE_CERTIFICATE_PASSWORD "$HAS_APPLE_CERT_PASSWORD"
+            row APPLE_PROVISIONING_PROFILE_BASE64 "$HAS_APPLE_PROFILE"
+            row APPLE_TEAM_ID "$HAS_APPLE_TEAM_ID"
+            row APP_STORE_CONNECT_KEY_ID "$HAS_ASC_KEY_ID"
+            row APP_STORE_CONNECT_ISSUER_ID "$HAS_ASC_ISSUER_ID"
+            row APP_STORE_CONNECT_API_KEY_BASE64 "$HAS_ASC_API_KEY"
+            echo
+            if [ "$HAS_APPLE_CERT" = "true" ] && [ "$HAS_APPLE_CERT_PASSWORD" = "true" ] && [ "$HAS_APPLE_PROFILE" = "true" ] && [ "$HAS_APPLE_TEAM_ID" = "true" ]; then
+              echo "A signed IPA will be built."
+            else
+              echo "No signed IPA will be built: the four \`APPLE_*\` secrets need a paid Apple Developer Program membership (see mobile-ios/docs/IOS-RUNTIME-VERIFICATION.md, section 'What is left for TestFlight')."
+            fi
+            if [ "$HAS_ASC_KEY_ID" = "true" ] && [ "$HAS_ASC_ISSUER_ID" = "true" ] && [ "$HAS_ASC_API_KEY" = "true" ]; then
+              echo "Upload to TestFlight is possible (run this workflow manually with \`upload_testflight\`)."
+            else
+              echo "Upload to TestFlight is not possible yet: the three \`APP_STORE_CONNECT_*\` secrets are an App Store Connect API key (Users and Access, Integrations)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY" | tail -20 || true
+
+      - name: Validate the TestFlight upload request
+        if: ${{ inputs.upload_testflight == true }}
+        run: |
+          missing=""
+          [ "$HAS_APPLE_CERT" = "true" ] || missing="$missing APPLE_CERTIFICATE_BASE64"
+          [ "$HAS_APPLE_CERT_PASSWORD" = "true" ] || missing="$missing APPLE_CERTIFICATE_PASSWORD"
+          [ "$HAS_APPLE_PROFILE" = "true" ] || missing="$missing APPLE_PROVISIONING_PROFILE_BASE64"
+          [ "$HAS_APPLE_TEAM_ID" = "true" ] || missing="$missing APPLE_TEAM_ID"
+          [ "$HAS_ASC_KEY_ID" = "true" ] || missing="$missing APP_STORE_CONNECT_KEY_ID"
+          [ "$HAS_ASC_ISSUER_ID" = "true" ] || missing="$missing APP_STORE_CONNECT_ISSUER_ID"
+          [ "$HAS_ASC_API_KEY" = "true" ] || missing="$missing APP_STORE_CONNECT_API_KEY_BASE64"
+          if [ -n "$missing" ]; then
+            echo "::error::Uploading to TestFlight was requested, but these secrets are not set:$missing"
             exit 1
           fi
 
@@ -144,6 +198,13 @@ jobs:
           </plist>
           EOF
 
+      - name: Release gate (the project must be something App Store Connect accepts)
+        if: ${{ env.HAS_APPLE_CERT == 'true' && env.HAS_APPLE_CERT_PASSWORD == 'true' && env.HAS_APPLE_PROFILE == 'true' && env.HAS_APPLE_TEAM_ID == 'true' }}
+        # Fails, with the reason, on what App Store Connect would refuse AFTER the
+        # build: today that is the iPad declaration (iPad support with Portrait
+        # only). See .github/scripts/ios_static_checks.py.
+        run: python3 ../.github/scripts/ios_static_checks.py --root .. --release-gate
+
       - name: Build signed IPA
         if: ${{ env.HAS_APPLE_CERT == 'true' && env.HAS_APPLE_CERT_PASSWORD == 'true' && env.HAS_APPLE_PROFILE == 'true' && env.HAS_APPLE_TEAM_ID == 'true' }}
         # App Store Connect rejects a build number it has already seen for this
@@ -151,8 +212,56 @@ jobs:
         # The workflow's own run number only ever goes up.
         run: flutter build ipa --release --build-number=${{ github.run_number }} --export-options-plist=ios/ExportOptions.generated.plist
 
+      - name: Verify the signed IPA (what is really inside it)
+        if: ${{ env.HAS_APPLE_CERT == 'true' && env.HAS_APPLE_CERT_PASSWORD == 'true' && env.HAS_APPLE_PROFILE == 'true' && env.HAS_APPLE_TEAM_ID == 'true' }}
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          IPA="$(ls build/ios/ipa/*.ipa | head -n 1)"
+          WORK="$RUNNER_TEMP/ipa-check"
+          rm -rf "$WORK" && mkdir -p "$WORK"
+          unzip -q "$IPA" -d "$WORK"
+          APP="$WORK/Payload/Runner.app"
+
+          # The bundle: id, version, Info.plist, privacy manifest, minimum iOS.
+          python3 ../.github/scripts/ios_static_checks.py --root .. --built "$APP" --release-gate
+
+          # The signature and the entitlements the app was REALLY signed with.
+          codesign --verify --deep --strict "$APP"
+          codesign -d --entitlements :- "$APP" > "$WORK/entitlements.plist" 2>/dev/null
+          APP_ID=$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$WORK/entitlements.plist")
+          if [ "$APP_ID" != "$APPLE_TEAM_ID.eu.ministrant.manager" ]; then
+            echo "::error::signed application-identifier is '$APP_ID', expected '$APPLE_TEAM_ID.eu.ministrant.manager'"; exit 1
+          fi
+          if ! /usr/libexec/PlistBuddy -c 'Print :com.apple.developer.associated-domains' "$WORK/entitlements.plist" | grep -q 'applinks:app.ministrant.eu'; then
+            echo "::error::the signed app does not carry applinks:app.ministrant.eu (Universal Links would not work)"; exit 1
+          fi
+          GET_TASK_ALLOW=$(/usr/libexec/PlistBuddy -c 'Print :get-task-allow' "$WORK/entitlements.plist" 2>/dev/null || echo false)
+          if [ "$GET_TASK_ALLOW" = "true" ]; then
+            echo "::error::get-task-allow is true: this is a development signature, App Store Connect will refuse it"; exit 1
+          fi
+          echo "signed IPA verified: $APP_ID, associated domain present, distribution signature"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ios-build-outputs
           path: mobile-ios/build/ios/ipa/*.ipa
           if-no-files-found: warn
+
+      - name: Upload to TestFlight
+        if: ${{ inputs.upload_testflight == true }}
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          ASC_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          IPA="$(ls build/ios/ipa/*.ipa | head -n 1)"
+          mkdir -p "$HOME/.private_keys"
+          KEY_FILE="$HOME/.private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          printf '%s' "$ASC_API_KEY_BASE64" | base64 -D > "$KEY_FILE"
+          xcrun altool --upload-app --type ios --file "$IPA" --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+          echo "uploaded to App Store Connect; processing and TestFlight availability follow on Apple's side"
+
