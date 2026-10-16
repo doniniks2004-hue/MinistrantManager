@@ -65,8 +65,7 @@ All of it is on Apple's side or needs an account. Nothing is generated or bypass
    (minors are involved) and the **export compliance** answer (the app uses HTTPS and its own
    AES-GCM; whether that is exempt is the owner's declaration, then set
    `ITSAppUsesNonExemptEncryption` accordingly).
-6. The **iPad decision** (below).
-7. The real **Team ID in `backend/public/.well-known/apple-app-site-association`**, deployed to
+6. The real **Team ID in `backend/public/.well-known/apple-app-site-association`**, deployed to
    `app.ministrant.eu`.
 
 Then run the workflow `iOS build` by hand with `production` and `upload_testflight`.
@@ -76,14 +75,23 @@ working around it, checks the project against what App Store Connect refuses, bu
 `application-identifier`, the associated domain, a distribution signature) and only then uploads.
 Internal TestFlight testers need no Apple review; external testers need a beta review.
 
-### The iPad decision (found by the checks, not made here)
+### iPad: decided, the first release is iPhone only (16.10.2026)
 
-The project declares iPad support (`TARGETED_DEVICE_FAMILY = "1,2"`) but supports only
-Portrait, without `UIRequiresFullScreen`. App Store Connect refuses that upload. Today this is
-a WARNING in every run and a FAILURE at the release gate, so it cannot be forgotten.
-Two ways out, a decision for the owner:
-- **iPhone only**: `TARGETED_DEVICE_FAMILY = 1` in the three Runner configurations. Smallest change.
-- **iPad too**: all four orientations on iPad, and the layout tested on an iPad.
+The project declared iPad support (`TARGETED_DEVICE_FAMILY = "1,2"`) while supporting only
+Portrait, with no `UIRequiresFullScreen`; App Store Connect refuses such an upload. The owner
+decided that the first release supports the iPhone only, so `TARGETED_DEVICE_FAMILY = 1` is set
+in the three configurations (Debug, Release, Profile). **Nothing else changed**: the iPhone's
+supported orientations (`UISupportedInterfaceOrientations`, Portrait) are exactly as before.
+
+The decision is pinned: every CI run fails if an iPad declaration comes back in any
+configuration or in `Info.plist`, or if Portrait disappears from the iPhone's orientations
+(adding landscape later is allowed). To support the iPad later: declare it, support all four
+orientations on it, test the layout on an iPad, and change the check in
+`.github/scripts/ios_static_checks.py` together with that.
+
+Known behaviour, not a defect: an iPhone-only app can still be installed on an iPad, in the
+compatibility mode (an iPhone-sized window), because Apple makes iPhone apps available there.
+It is not designed for it and is not tested on it.
 
 ## 4. After signing: what to check on the iPhone
 
@@ -106,8 +114,8 @@ Two ways out, a decision for the owner:
    - `selftest-full.png`, `activation-screen.png`: screenshots of the simulator,
    - `full.json`, `cold_1..5.json`, `walltimes.json`, `ui_marker.json`, `static.json`: the raw results,
    - `logs/`: the log of every launch, the simulator's own log, `crashes/` if any.
-3. Accept if the verdict is PASS **and** you have read the warnings in section 4 of the report (the iPad
-   declaration, export compliance, the Team ID placeholder) and agree they are open decisions.
+3. Accept if the verdict is PASS **and** you have read the warnings in section 4 of the report (export
+   compliance, the Team ID placeholder) and agree they are open decisions.
 4. A PASS here means: the iOS app starts, its native crypto agrees with OpenSSL and with Dart, the encrypted
    page is saved and read, the loopback server and a real WebView work on iOS, and the project is
    configured as intended. It does NOT mean the app works on an iPhone.

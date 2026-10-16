@@ -201,8 +201,10 @@ jobs:
       - name: Release gate (the project must be something App Store Connect accepts)
         if: ${{ env.HAS_APPLE_CERT == 'true' && env.HAS_APPLE_CERT_PASSWORD == 'true' && env.HAS_APPLE_PROFILE == 'true' && env.HAS_APPLE_TEAM_ID == 'true' }}
         # Fails, with the reason, on what App Store Connect would refuse AFTER the
-        # build: today that is the iPad declaration (iPad support with Portrait
-        # only). See .github/scripts/ios_static_checks.py.
+        # build: an iPad declaration with Portrait only (the first release is
+        # iPhone only, decided 16.10.2026, and pinned by every run), a missing
+        # camera text, a loosened App Transport Security. See
+        # .github/scripts/ios_static_checks.py.
         run: python3 ../.github/scripts/ios_static_checks.py --root .. --release-gate
 
       - name: Build signed IPA

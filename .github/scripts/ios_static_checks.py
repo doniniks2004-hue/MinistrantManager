@@ -8,8 +8,8 @@ does not use, a bundle id or version that is not what was meant, an iPad that
 App Store Connect will refuse) are caught by CI on every change.
 
 Verdicts: PASS, FAIL (exits 1), WARN (a decision or a thing only a real signed
-build can settle; never hidden, never a pass). `--release-gate` turns the
-iPad rule from a warning into a failure, for the workflow that builds the IPA.
+build can settle; never hidden, never a pass). `--release-gate` is accepted by the
+workflow that builds the IPA; the iPhone-only decision is a failure in every run.
 
 Usage:
   ios_static_checks.py --root <repo> [--built <Runner.app>] [--release-gate] [--json out.json]
@@ -82,9 +82,7 @@ def check_info_plist(r: Report, plist: dict, where: str, built: bool):
     else:
         r.passed(f"{where}: export compliance", f"ITSAppUsesNonExemptEncryption = {plist['ITSAppUsesNonExemptEncryption']}")
 
-    families = plist.get("UIDeviceFamily")
-    portrait_only = set(plist.get("UISupportedInterfaceOrientations", [])) <= {"UIInterfaceOrientationPortrait"}
-    return portrait_only
+    return None
 
 
 def check_built_plist(r: Report, plist: dict, pubspec_version: str):
@@ -132,7 +130,7 @@ def main() -> int:
 
     # ---- the project's own files ------------------------------------------------
     source_plist = load_plist(ios / "Runner" / "Info.plist")
-    portrait_only = check_info_plist(r, source_plist, "Info.plist (source)", built=False)
+    check_info_plist(r, source_plist, "Info.plist (source)", built=False)
 
     pbx = (ios / "Runner.xcodeproj" / "project.pbxproj").read_text(encoding="utf-8")
     bundle_ids = re.findall(r"PRODUCT_BUNDLE_IDENTIFIER = ([^;]+);", pbx)
@@ -164,17 +162,26 @@ def main() -> int:
     else:
         r.fail("project: privacy manifest", "PrivacyInfo.xcprivacy is missing")
 
+    # Decision of 16.10.2026: the first release is iPhone only. It is pinned, so that
+    # an iPad declaration cannot come back by accident (a new Xcode target, a template
+    # merge): iPad support needs its layout tested on an iPad and a decision to change
+    # this check together with it.
     families = re.findall(r'TARGETED_DEVICE_FAMILY = "?([\d,]+)"?;', pbx)
-    ipad = any("2" in f.split(",") for f in families)
-    has_ipad_orientations = "UISupportedInterfaceOrientations~ipad" in source_plist
-    full_screen = source_plist.get("UIRequiresFullScreen") is True
-    if ipad and portrait_only and not has_ipad_orientations and not full_screen:
-        message = ("the app declares iPad support (TARGETED_DEVICE_FAMILY includes 2) but supports only Portrait, with no iPad orientations "
-                   "and no UIRequiresFullScreen. App Store Connect refuses such an upload. Decide: iPhone only (TARGETED_DEVICE_FAMILY = 1) "
-                   "or iPad with all orientations, which needs its layout tested on an iPad")
-        (r.fail if args.release_gate else r.warn)("project: iPad declaration", message)
+    if families and all(f.split(",") == ["1"] for f in families) and len(families) == 3:
+        r.passed("project: device family", "iPhone only (TARGETED_DEVICE_FAMILY = 1 in Debug, Release and Profile), as decided for the first release")
     else:
-        r.passed("project: iPad declaration", "consistent (iPhone only, or iPad with orientations / full screen)")
+        r.fail("project: device family", f"TARGETED_DEVICE_FAMILY is {families}: the first release is iPhone only (= 1 in all three configurations). "
+               "An iPad declaration with Portrait only would also be refused by App Store Connect")
+    if "UIDeviceFamily" in source_plist and 2 in source_plist["UIDeviceFamily"]:
+        r.fail("project: device family (Info.plist)", "UIDeviceFamily lists the iPad")
+
+    # What the iPhone supports must not shrink by accident: Portrait is the orientation the
+    # app is designed for. (The key being absent would mean "everything", which is also a change.)
+    iphone_orientations = source_plist.get("UISupportedInterfaceOrientations")
+    if isinstance(iphone_orientations, list) and "UIInterfaceOrientationPortrait" in iphone_orientations:
+        r.passed("project: iPhone orientations", f"{', '.join(o.replace('UIInterfaceOrientation', '') for o in iphone_orientations)}")
+    else:
+        r.fail("project: iPhone orientations", f"UISupportedInterfaceOrientations is {iphone_orientations!r}: Portrait must stay supported")
 
     # ---- the backend's Universal Links association file --------------------------
     aasa_path = root / "backend" / "public" / ".well-known" / "apple-app-site-association"

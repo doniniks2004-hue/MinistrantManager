@@ -70,21 +70,60 @@ class StaticChecks(unittest.TestCase):
         pbx.write_text(pbx.read_text().replace("PRODUCT_BUNDLE_IDENTIFIER = eu.ministrant.manager;", "PRODUCT_BUNDLE_IDENTIFIER = com.example.app;", 1))
         self.assertEqual(run_checks(self.tmp).returncode, 1)
 
-    def test_ipad_problem_is_a_warning_normally_and_a_failure_at_the_release_gate(self):
-        normal = run_checks(self.tmp)
-        self.assertEqual(normal.returncode, 0)
-        self.assertIn("[WARN] project: iPad declaration", normal.stdout)
-        gate = run_checks(self.tmp, "--release-gate")
-        self.assertEqual(gate.returncode, 1)
-        self.assertIn("[FAIL] project: iPad declaration", gate.stdout)
+    def pbx_path(self):
+        return self.tmp / "mobile-ios/ios/Runner.xcodeproj/project.pbxproj"
 
-    def test_iphone_only_passes_the_release_gate(self):
-        pbx = self.tmp / "mobile-ios/ios/Runner.xcodeproj/project.pbxproj"
-        pbx.write_text(pbx.read_text().replace('TARGETED_DEVICE_FAMILY = "1,2";', "TARGETED_DEVICE_FAMILY = 1;"))
-        self.assertEqual(run_checks(self.tmp, "--release-gate").returncode, 0)
+    def test_the_project_is_iphone_only_and_keeps_portrait(self):
+        r = run_checks(self.tmp)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("[PASS] project: device family: iPhone only", r.stdout)
+        self.assertIn("[PASS] project: iPhone orientations: Portrait", r.stdout)
+        self.assertNotIn("iPad declaration", r.stdout)
 
-    def test_ipad_with_full_screen_passes_the_release_gate(self):
-        self.edit_plist(lambda d: d.update({"UIRequiresFullScreen": True}))
+    def test_the_iphone_orientations_are_exactly_what_they_were(self):
+        # The iPad decision must not have touched what the iPhone supports.
+        d = plistlib.loads(self.plist_path().read_bytes())
+        self.assertEqual(d["UISupportedInterfaceOrientations"], ["UIInterfaceOrientationPortrait"])
+        self.assertNotIn("UISupportedInterfaceOrientations~ipad", d)
+        self.assertNotIn("UIDeviceFamily", d)
+
+    def test_an_ipad_declaration_coming_back_fails_in_every_run(self):
+        pbx = self.pbx_path()
+        pbx.write_text(pbx.read_text().replace("TARGETED_DEVICE_FAMILY = 1;", 'TARGETED_DEVICE_FAMILY = "1,2";'))
+        for extra in ([], ["--release-gate"]):
+            r = run_checks(self.tmp, *extra)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("[FAIL] project: device family", r.stdout)
+
+    def test_one_configuration_left_on_ipad_fails(self):
+        pbx = self.pbx_path()
+        pbx.write_text(pbx.read_text().replace("TARGETED_DEVICE_FAMILY = 1;", 'TARGETED_DEVICE_FAMILY = "1,2";', 1))
+        self.assertEqual(run_checks(self.tmp).returncode, 1)
+
+    def test_a_missing_configuration_fails(self):
+        pbx = self.pbx_path()
+        pbx.write_text(pbx.read_text().replace("TARGETED_DEVICE_FAMILY = 1;", "", 1))
+        self.assertEqual(run_checks(self.tmp).returncode, 1)
+
+    def test_ipad_in_info_plist_fails(self):
+        self.edit_plist(lambda d: d.update({"UIDeviceFamily": [1, 2]}))
+        self.assertEqual(run_checks(self.tmp).returncode, 1)
+
+    def test_losing_portrait_for_the_iphone_fails(self):
+        self.edit_plist(lambda d: d.update({"UISupportedInterfaceOrientations": ["UIInterfaceOrientationLandscapeLeft"]}))
+        r = run_checks(self.tmp)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("iPhone orientations", r.stdout)
+
+    def test_removing_the_orientation_key_fails(self):
+        self.edit_plist(lambda d: d.pop("UISupportedInterfaceOrientations"))
+        self.assertEqual(run_checks(self.tmp).returncode, 1)
+
+    def test_adding_landscape_to_the_iphone_is_allowed_if_portrait_stays(self):
+        self.edit_plist(lambda d: d.update({"UISupportedInterfaceOrientations": ["UIInterfaceOrientationPortrait", "UIInterfaceOrientationLandscapeLeft"]}))
+        self.assertEqual(run_checks(self.tmp).returncode, 0)
+
+    def test_the_release_gate_flag_is_still_accepted(self):
         self.assertEqual(run_checks(self.tmp, "--release-gate").returncode, 0)
 
     def built_app(self, **overrides):
