@@ -11,6 +11,7 @@ import '../network/network_signal.dart';
 import 'connectivity_monitor.dart';
 import 'connectivity_probe.dart';
 import 'local_snapshot_server.dart';
+import 'snapshot_encryptor.dart';
 import 'server_reachability.dart';
 import 'snapshot_capture_service.dart';
 import 'snapshot_store.dart';
@@ -54,6 +55,10 @@ class OfflinePageCoordinator {
     ConnectivityMonitor? connectivity,
   }) : connectivity = connectivity ?? ConnectivityMonitor(PlatformNetworkSignal()) {
     localServer.trace = trace;
+    // Ask the platform's AES-GCM to prove it agrees with OpenSSL, now, so that the
+    // answer is known before the first page is read (see SnapshotEncryptor).
+    SnapshotEncryptor.statusLog = trace;
+    unawaited(SnapshotEncryptor.verifyPlatform());
     // A page that has just been written is in memory the moment it is saved:
     // the server needs no decryption for it.
     snapshotStore.onWritten = (file, plaintext) {
@@ -111,8 +116,15 @@ class OfflinePageCoordinator {
   /// A line for the debug log (never in release builds): used to measure
   /// the time from a loss of connection to the saved copy being visible.
   void trace(String message) {
-    if (kDebugMode) debugPrint(message);
+    if (kDebugMode || _traceInAnyBuild) debugPrint(message);
   }
+
+  /// `--dart-define=MM_TRACE=true` turns the trace on in a release or profile
+  /// build as well, so that timings can be taken from the build that is
+  /// actually shipped (a debug build runs the Dart code several times slower).
+  /// Everything in the trace is already free of tokens, tickets, cookies and
+  /// addresses' queries.
+  static const _traceInAnyBuild = bool.fromEnvironment('MM_TRACE');
 
   final ConnectivityProbe connectivityProbe;
 
@@ -123,6 +135,19 @@ class OfflinePageCoordinator {
   /// mistaken for "no network" just because the ticket took a while).
   final Duration onlineTimeout;
   final Duration firstOnlineTimeout;
+
+  /// The longest PLANNING can legitimately take: the attempt to reach the
+  /// server (the longer of its two budgets), then building the local view, and
+  /// a margin for what happens around them (reading the manifest, waiting for
+  /// the write queue, starting the loopback server). The screen's guard on
+  /// planning follows THIS, not a number of its own: it was a fixed 3.5 s,
+  /// chosen when the handoff was allowed 1.5 s, and when the first handoff
+  /// after a sign-in was given 3 s the two left half a second for everything
+  /// else, so a slow but working first handoff was reported as a failure.
+  Duration get planningBudget =>
+      (onlineTimeout > firstOnlineTimeout ? onlineTimeout : firstOnlineTimeout) +
+      offlinePlanTimeout +
+      const Duration(milliseconds: 1500);
 
   /// Budget for building the LOCAL view (manifest, directory, starting
   /// the loopback server). Normally a few milliseconds; this exists so a
@@ -279,6 +304,7 @@ class OfflinePageCoordinator {
         ticket.expired = true;
         return PageLoadOfflineNoSnapshot(
           diagnosticMessage: kDebugMode ? 'offline plan timed out' : null,
+          timedOut: true,
         );
       },
     );
@@ -399,6 +425,7 @@ class OfflinePageCoordinator {
     // Not start(): after the app was in the background the server object can
     // exist while its socket is gone (iOS reclaims them).
     await localServer.ensureHealthy();
+    trace('offline-plan: server ready after ${planWatch.elapsedMilliseconds} ms');
     // Re-checked after the LAST await, immediately before the one
     // assignment that has a side effect outside this plan.
     if (_isStale(ticket)) {
@@ -649,7 +676,12 @@ class HandoffFailure {
 /// should show an explanatory empty state rather than attempting to
 /// load anything.
 class PageLoadOfflineNoSnapshot extends PageLoadPlan {
-  const PageLoadOfflineNoSnapshot({this.diagnosticMessage});
+  const PageLoadOfflineNoSnapshot({this.diagnosticMessage, this.timedOut = false});
+
+  /// Preparing the saved view ran out of its time. That says NOTHING about
+  /// whether a copy exists: it is not "no saved copy", and the screen must not
+  /// present it as that. It used to be indistinguishable.
+  final bool timedOut;
 
   /// K12 diagnostic round 3: why the online attempt (if one was even
   /// made) failed — null when this page was never actually attempted

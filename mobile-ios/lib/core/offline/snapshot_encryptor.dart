@@ -5,6 +5,9 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' show Hmac, sha256;
 import 'package:encrypt/encrypt.dart' as enc;
+import 'package:flutter/services.dart' show MethodChannel, MissingPluginException, PlatformException;
+
+import 'snapshot_crypto_vector.dart';
 
 /// Offline-architecture milestone, P8. Encrypts/decrypts the actual
 /// bytes stored for every offline snapshot file (snapshot.html, each
@@ -158,17 +161,159 @@ class SnapshotEncryptor {
   ///
   /// These run the same work on another isolate and give the same result
   /// (same format, same errors). Only the key and the bytes are sent.
-  Future<List<int>> encryptBytesInBackground(List<int> plaintext) {
-    if (plaintext.length < _backgroundThresholdBytes) {
-      return Future.sync(() => encryptBytes(plaintext));
+  // ---- the cipher where it is cheap: the platform's own AES-GCM ---------------
+  //
+  // On the K12 (debug build) the page, 34 KB, still took 679 ms to decrypt in
+  // plain Dart (~50 KB/s), on the critical path of the first display of a saved
+  // page, and the same cost is paid again every time a page is captured. The
+  // platform has the same algorithm in a standard, hardware-accelerated library
+  // (javax.crypto on Android, CryptoKit on iOS): the same AES-GCM, the same key,
+  // the SAME BYTES (IV, ciphertext, 16-byte tag), so what one side wrote the
+  // other reads, in both directions. Used from the isolate that owns the platform
+  // channels; where there is none (the unit tests, an unsupported platform) or
+  // the call fails, the Dart implementation does the work exactly as before, and
+  // it is the Dart implementation that decides about a payload that does not
+  // authenticate.
+  //
+  // THE PLATFORM IS NOT TRUSTED UNTIL IT HAS PROVED IT AGREES. At start (once,
+  // shared by whoever asks first) the platform is asked two questions about a
+  // known answer computed by OpenSSL (snapshot_crypto_vector.dart): "seal this
+  // text with this key and this IV" and "open this". Only if both answers are
+  // exactly the expected bytes is it used for real data; if it is missing, fails
+  // or disagrees, Dart is used, for the whole run. Dart, OpenSSL and the platform
+  // then agree on the layout, so what one writes the others read: this is the
+  // compatibility test, and it runs on every device, in every build.
+  static const MethodChannel _native = MethodChannel('eu.ministrant.manager/crypto');
+  static Future<bool>? _verification;
+
+  /// What the check found, for the log: not checked / verified / unavailable /
+  /// failed / MISMATCH.
+  static String platformStatus = 'not checked yet';
+
+  /// Where the result of the check is reported (the coordinator's trace).
+  static void Function(String message)? statusLog;
+
+  /// Runs the check (once) and returns whether the platform may be used.
+  static Future<bool> verifyPlatform() => _verification ??= _checkPlatform();
+
+  static bool _same(List<int> a, List<int> b) {
+    if (a.length != b.length) return false;
+    var difference = 0;
+    for (var i = 0; i < a.length; i++) {
+      difference |= a[i] ^ b[i];
     }
+    return difference == 0;
+  }
+
+  /// `--dart-define=MM_CRYPTO_DART_ONLY=true` switches the platform path off in
+  /// a build, for ONE purpose: a compatibility test on real saved pages. Install
+  /// the normal build, let it capture a page (the platform seals it), install this
+  /// build over it WITHOUT clearing data and open the page offline (Dart opens what
+  /// the platform sealed); then the other way round. Not a setting for users.
+  static const _dartOnly = bool.fromEnvironment('MM_CRYPTO_DART_ONLY');
+
+  static Future<bool> _checkPlatform() async {
+    var usable = false;
+    String status;
+    if (_dartOnly) {
+      status = 'disabled by this build (MM_CRYPTO_DART_ONLY): Dart is used';
+      platformStatus = status;
+      statusLog?.call('crypto-selftest: $status');
+      return false;
+    }
+    try {
+      final key = snapshotVectorBytes(snapshotVectorKeyHex);
+      final iv = snapshotVectorBytes(snapshotVectorIvHex);
+      final plain = snapshotVectorBytes(snapshotVectorPlainHex);
+      final sealed = snapshotVectorBytes(snapshotVectorSealedHex);
+      final sealedByPlatform = await _native.invokeMethod<Uint8List>('encrypt', {
+        'key': key,
+        'iv': iv,
+        'data': plain,
+      });
+      if (sealedByPlatform == null || !_same(sealedByPlatform, sealed)) {
+        status = 'MISMATCH: the platform AES-GCM seals the known text to other bytes than OpenSSL does; NOT USED, Dart is used';
+      } else {
+        final openedByPlatform = await _native.invokeMethod<Uint8List>('decrypt', {
+          'key': key,
+          'data': sealed,
+        });
+        if (openedByPlatform == null || !_same(openedByPlatform, plain)) {
+          status = 'MISMATCH: the platform AES-GCM does not open the bytes OpenSSL sealed; NOT USED, Dart is used';
+        } else {
+          usable = true;
+          status = 'verified: the platform AES-GCM reproduces the OpenSSL known answer in both directions; used for pages';
+        }
+      }
+    } on MissingPluginException {
+      status = 'unavailable: no platform side here; Dart is used';
+    } catch (e) {
+      status = 'failed (${e.runtimeType}); NOT USED, Dart is used';
+    }
+    platformStatus = status;
+    statusLog?.call('crypto-selftest: $status');
+    return usable;
+  }
+
+  /// Calls that were answered by the platform / by Dart (diagnostics: the
+  /// server's trace shows them, so a log says which implementation did the work).
+  static int nativeCalls = 0;
+  static int dartCalls = 0;
+
+  /// Below this size the call to the platform costs more than the work.
+  static const _nativeThresholdBytes = 1024;
+
+  /// Tests only: forget the result of the check, and the counters.
+  static void debugResetNative() {
+    _verification = null;
+    platformStatus = 'not checked yet';
+    statusLog = null;
+    nativeCalls = 0;
+    dartCalls = 0;
+  }
+
+  Future<List<int>?> _viaPlatform(String method, Map<String, Object> arguments) async {
+    if (!await verifyPlatform()) return null;
+    try {
+      final result = await _native.invokeMethod<Uint8List>(method, arguments);
+      if (result == null) return null;
+      nativeCalls++;
+      return result;
+    } on PlatformException {
+      // A payload that does not verify, or an input the platform refused: Dart
+      // takes over and gives the authoritative answer (including the refusal).
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<List<int>> encryptBytesInBackground(List<int> plaintext) async {
+    if (plaintext.length >= _nativeThresholdBytes) {
+      final random = Random.secure();
+      final iv = Uint8List.fromList(List<int>.generate(_ivLengthBytes, (_) => random.nextInt(256)));
+      final viaPlatform = await _viaPlatform('encrypt', {
+        'key': _keyBytes,
+        'iv': iv,
+        'data': _asUint8List(plaintext),
+      });
+      if (viaPlatform != null) return viaPlatform;
+    }
+    dartCalls++;
+    if (plaintext.length < _backgroundThresholdBytes) return encryptBytes(plaintext);
     return _encryptInBackground(_hexKey, _asUint8List(plaintext));
   }
 
-  Future<List<int>> decryptBytesInBackground(List<int> packed) {
-    if (packed.length < _backgroundThresholdBytes) {
-      return Future.sync(() => decryptBytes(packed));
+  Future<List<int>> decryptBytesInBackground(List<int> packed) async {
+    if (packed.length >= _nativeThresholdBytes) {
+      final viaPlatform = await _viaPlatform('decrypt', {
+        'key': _keyBytes,
+        'data': _asUint8List(packed),
+      });
+      if (viaPlatform != null) return viaPlatform;
     }
+    dartCalls++;
+    if (packed.length < _backgroundThresholdBytes) return decryptBytes(packed);
     return _decryptInBackground(_hexKey, _asUint8List(packed));
   }
 

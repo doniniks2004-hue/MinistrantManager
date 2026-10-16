@@ -309,6 +309,61 @@ void main() {
       socket.destroy(); // the plan's address is a live one
     });
 
+    test('a plan that finds NO copy is NOT marked as timed out', () async {
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: store,
+        localServer: localServer,
+        handoffService: _FakeHandoffService(SecureStorageService()),
+      );
+      final plan = await coordinator.plan(
+        parishId: 'p',
+        userId: 'u',
+        targetPath: '/public/never-saved.php',
+        forceOffline: true,
+      );
+      expect(plan, isA<PageLoadOfflineNoSnapshot>());
+      expect((plan as PageLoadOfflineNoSnapshot).timedOut, isFalse);
+    });
+
+    test('REGRESSION: a listener that is dead and SLOW to refuse still yields the saved view inside the plan budget', () async {
+      // Silent death: no end-of-stream, and the probe never answers (what a
+      // connection to a dead port can look like on Windows). The repair is bounded,
+      // so the plan (1.5 s in all) returns the copy and not "no saved copy".
+      final slowServer = LocalSnapshotServer(
+        encryptor: _testEncryptor,
+        healthProbe: (_) => Completer<bool>().future,
+      );
+      addTearDown(slowServer.stop);
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: store,
+        localServer: slowServer,
+        handoffService: _FakeHandoffService(SecureStorageService()),
+      );
+      await store.writeSnapshot(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/ranking.php',
+        html: '<html>Ranking</html>',
+        assets: {},
+      );
+      await slowServer.start();
+
+      final watch = Stopwatch()..start();
+      final plan = await coordinator.plan(
+        parishId: 'p',
+        userId: 'u',
+        targetPath: '/public/ranking.php',
+        forceOffline: true,
+      );
+
+      expect(plan, isA<PageLoadOffline>(), reason: 'the copy exists; a slow repair must not turn it into "no copy"');
+      expect(watch.elapsedMilliseconds, lessThan(1500));
+    });
+
     test('warmUp starts the loopback server once, however many callers and however early', () async {
       final coordinator = OfflinePageCoordinator(
         connectivityProbe: ConnectivityProbe(),
@@ -529,6 +584,7 @@ void main() {
           forceOffline: true,
         );
         expect(plan, isA<PageLoadOfflineNoSnapshot>());
+        expect((plan as PageLoadOfflineNoSnapshot).timedOut, isTrue, reason: 'it ran out of time: that is not "no copy"');
         expect(localServer.rootDirectory, isNull);
 
         gate.complete(); // the expired read now completes

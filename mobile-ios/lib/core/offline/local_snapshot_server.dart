@@ -45,7 +45,43 @@ import 'snapshot_encryptor.dart';
 /// point; this class only controls what the filesystem underneath can
 /// ever answer with.
 class LocalSnapshotServer {
-  LocalSnapshotServer({required this.encryptor, this.cacheLimitBytes = 8 * 1024 * 1024});
+  LocalSnapshotServer({
+    required this.encryptor,
+    this.cacheLimitBytes = 8 * 1024 * 1024,
+    Future<bool> Function(int port)? healthProbe,
+  }) : _healthProbe = healthProbe ?? _accepts;
+
+  /// A real loopback connection by default; replaceable so the repair logic can
+  /// be tested without making the operating system close a socket.
+  final Future<bool> Function(int port) _healthProbe;
+
+  // ---- is it SERVING right now? ----------------------------------------------
+  int _activeRequests = 0;
+  DateTime? _lastRequestAt;
+
+  /// The listener's stream ended while this server still believed it was the
+  /// current one: the socket was closed from outside (the system reclaiming it).
+  /// Said by the stream itself, at once, with no connection attempt at all.
+  bool _listenerClosed = false;
+
+  /// How long ONE health probe may take, and how many are made. The repair is
+  /// part of building the saved view, which has 1.5 s in all (the offline plan
+  /// budget) and is reported as "no saved copy" when it overruns: so the whole
+  /// check must cost a fraction of that, whatever the platform does with a
+  /// connection to a dead port (Linux and Darwin refuse at once; Windows can take
+  /// a second or more to refuse). The probe is bounded here, not trusted to bound
+  /// itself.
+  static const _probeTimeout = Duration(milliseconds: 400);
+  static const _probeAttempts = 2;
+  /// A listener that answered a request a moment ago, or is answering one now,
+  /// is not dead, whatever one slow probe says.
+  static const _recentlyServed = Duration(seconds: 10);
+
+  bool get _servedRecently {
+    if (_activeRequests > 0) return true;
+    final last = _lastRequestAt;
+    return last != null && DateTime.now().difference(last) < _recentlyServed;
+  }
 
   /// Offline-architecture milestone, P8.2: every file under
   /// [rootDirectory] is SnapshotStore-encrypted — this MUST be
@@ -178,7 +214,27 @@ class LocalSnapshotServer {
     if (starting != null) return starting;
     final current = _server;
     if (current == null) return start();
-    if (_boundPort != null && await _accepts(_boundPort!)) return _boundPort!;
+    final port = _boundPort;
+    if (port == null || _listenerClosed) {
+      // Closed from outside, and the stream says so: no probe needed, none made.
+      if (_listenerClosed) trace?.call('offline-serve: the listener was closed from outside; replacing it');
+      await stop();
+      return start();
+    }
+    // The repair is destructive: stop() closes the listener under whatever page
+    // is loading from it and forgets its address. A loopback connect that is
+    // merely SLOW (the emulator busy decrypting, rendering, saving) must not be
+    // taken for a dead socket:
+    //  - a server that is serving, or has served within the last seconds, is
+    //    alive by definition and is left alone;
+    //  - otherwise the probe is tried twice, the second time with more patience,
+    //    and only two failures in a row count.
+    for (var attempt = 0; attempt < _probeAttempts; attempt++) {
+      if (_servedRecently) return port;
+      final alive = await _healthProbe(port).timeout(_probeTimeout, onTimeout: () => false);
+      if (alive) return port;
+    }
+    trace?.call('offline-serve: $_probeAttempts probes of ${_probeTimeout.inMilliseconds} ms failed; replacing the listener');
     await stop();
     return start();
   }
@@ -188,7 +244,7 @@ class LocalSnapshotServer {
       final socket = await Socket.connect(
         InternetAddress.loopbackIPv4,
         port,
-        timeout: const Duration(milliseconds: 500),
+        timeout: _probeTimeout,
       );
       socket.destroy();
       return true;
@@ -201,14 +257,33 @@ class LocalSnapshotServer {
   /// operating system does to a suspended app's sockets. For tests only.
   Future<void> debugKillListenerForTest() async {
     await _server?.close(force: true);
+    // The stream reports its end a moment after close() returns.
+    for (var i = 0; i < 40 && !_listenerClosed; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
   }
 
   Future<int> _bind() async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     _server = server;
     _boundPort = server.port;
+    _listenerClosed = false;
     server.listen(
-      _handleRequest,
+      (request) async {
+        _activeRequests++;
+        _lastRequestAt = DateTime.now();
+        try {
+          await _handleRequest(request);
+        } finally {
+          _activeRequests--;
+          _lastRequestAt = DateTime.now();
+        }
+      },
+      onDone: () {
+        // Our own stop() clears _server BEFORE it closes the listener, so this
+        // only fires for a listener that was closed behind our back.
+        if (identical(_server, server)) _listenerClosed = true;
+      },
       onError: (_) {
         // A single malformed connection must never bring the whole
         // server down — dart:io's own listen-level error, distinct from
@@ -279,7 +354,9 @@ class LocalSnapshotServer {
     plain ??= await encryptor.decryptBytesInBackground(stored);
 
     trace?.call(
-      'offline-serve: ${p.basename(file.path)} ${stat.size}B $how read=${readMs}ms ${how == 'verified' ? 'check' : 'decrypt'}=${watch.elapsedMilliseconds - readMs}ms',
+      'offline-serve: ${p.basename(file.path)} ${stat.size}B $how read=${readMs}ms '
+      '${how == 'verified' ? 'check' : 'decrypt'}=${watch.elapsedMilliseconds - readMs}ms '
+      '(cipher so far: platform=${SnapshotEncryptor.nativeCalls} dart=${SnapshotEncryptor.dartCalls})',
     );
     if (epoch == _cacheEpoch) {
       _remember(_keyOf(file), _Plain(plain, stat.modified, stat.size));

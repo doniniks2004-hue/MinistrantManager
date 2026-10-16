@@ -1,3 +1,4 @@
+import CryptoKit
 import Flutter
 import Network
 import UIKit
@@ -11,6 +12,9 @@ import UIKit
     GeneratedPluginRegistrant.register(with: self)
     if let registrar = self.registrar(forPlugin: "NetworkSignalPlugin") {
       NetworkSignalPlugin.register(with: registrar)
+    }
+    if let registrar = self.registrar(forPlugin: "SnapshotCryptoPlugin") {
+      SnapshotCryptoPlugin.register(with: registrar)
     }
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
@@ -80,5 +84,66 @@ final class NetworkSignalPlugin: NSObject, FlutterStreamHandler {
   func onCancel(withArguments arguments: Any?) -> FlutterError? {
     sink = nil
     return nil
+  }
+}
+
+/// AES-GCM with the platform's own library (CryptoKit), for the saved pages.
+///
+/// The same algorithm, key and BYTES as the Dart implementation in
+/// SnapshotEncryptor: data = IV (12 bytes) + ciphertext + 16-byte tag, which is
+/// exactly CryptoKit's "combined" form, so what one side writes the other reads.
+/// Plain Dart does this at ~50 KB per second in a debug build; this takes
+/// milliseconds.
+///
+/// It decides nothing: on any failure (a payload that does not authenticate, a
+/// wrong key, a bad argument) it answers with an error code, and Dart, which has
+/// the authoritative implementation, does the work and gives the real verdict.
+/// Neither the key nor any data is ever put in an error message.
+final class SnapshotCryptoPlugin {
+  static func register(with registrar: FlutterPluginRegistrar) {
+    let channel = FlutterMethodChannel(
+      name: "eu.ministrant.manager/crypto",
+      binaryMessenger: registrar.messenger()
+    )
+    channel.setMethodCallHandler { call, result in
+      guard let arguments = call.arguments as? [String: Any],
+        let key = arguments["key"] as? FlutterStandardTypedData,
+        let data = arguments["data"] as? FlutterStandardTypedData,
+        key.data.count == 32
+      else {
+        result(FlutterError(code: "bad_arguments", message: nil, details: nil))
+        return
+      }
+      let symmetricKey = SymmetricKey(data: key.data)
+      do {
+        switch call.method {
+        case "decrypt":
+          if data.data.count <= 12 + 16 {
+            result(FlutterError(code: "bad_arguments", message: nil, details: nil))
+            return
+          }
+          let box = try AES.GCM.SealedBox(combined: data.data)
+          let plain = try AES.GCM.open(box, using: symmetricKey)
+          result(FlutterStandardTypedData(bytes: plain))
+        case "encrypt":
+          guard let iv = arguments["iv"] as? FlutterStandardTypedData, iv.data.count == 12 else {
+            result(FlutterError(code: "bad_arguments", message: nil, details: nil))
+            return
+          }
+          let sealed = try AES.GCM.seal(
+            data.data, using: symmetricKey, nonce: try AES.GCM.Nonce(data: iv.data))
+          guard let combined = sealed.combined else {
+            result(FlutterError(code: "crypto_failed", message: nil, details: nil))
+            return
+          }
+          result(FlutterStandardTypedData(bytes: combined))
+        default:
+          result(FlutterMethodNotImplemented)
+        }
+      } catch {
+        // No detail: never the key, never the data.
+        result(FlutterError(code: "crypto_failed", message: nil, details: nil))
+      }
+    }
   }
 }
