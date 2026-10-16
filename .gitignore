@@ -19,3 +19,6 @@
 
 # OS
 .DS_Store
+
+# Python bytecode from the CI helper scripts
+__pycache__/
