@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'support/isolated_secure_storage.dart';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -12,7 +14,6 @@ import 'package:ministrant_manager/core/offline/page_resource_downloader.dart';
 import 'package:ministrant_manager/core/offline/snapshot_capture_service.dart';
 import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
 import 'package:ministrant_manager/core/offline/snapshot_store.dart';
-import 'package:ministrant_manager/core/secure/secure_storage_service.dart';
 import 'package:ministrant_manager/core/security/access_refusals.dart' show AccessRefusals;
 import 'package:ministrant_manager/core/sync/offline_lease.dart';
 import 'package:ministrant_manager/core/sync/sync_engine.dart';
@@ -60,7 +61,7 @@ const _channel = MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
 final _encryptor = SnapshotEncryptor(hexKey: 'b' * 64);
 
 Widget _home(AppDatabase db) {
-  final secure = SecureStorageService();
+  final secure = IsolatedSecureStorage();
   final api = ApiClient(secure);
   final snapshotStore = SnapshotStore(encryptor: _encryptor);
   return MaterialApp(

@@ -69,7 +69,7 @@ jobs:
         # actually executed by this one command, not cherry-picked.
         run: |
           set -o pipefail
-          flutter test --concurrency=1 --timeout 60s --reporter expanded 2>&1 | tee flutter-test.log
+          timeout --signal=INT --kill-after=15s 6m flutter test --concurrency=4 --timeout 60s --reporter expanded 2>&1 | tee flutter-test.log
 
       - uses: actions/upload-artifact@v4
         if: always()

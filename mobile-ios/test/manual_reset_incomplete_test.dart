@@ -1,4 +1,6 @@
 import 'dart:async';
+
+import 'support/isolated_secure_storage.dart';
 import 'dart:convert';
 
 import 'package:dio/dio.dart';
@@ -51,7 +53,7 @@ class _FakeApi extends ApiClient {
   Dio centralWithAuth(String deviceToken) => Dio(BaseOptions(baseUrl: ApiClient.centralBaseUrl))..httpClientAdapter = centralAdapter;
 }
 
-class _FlakyStorage extends SecureStorageService {
+class _FlakyStorage extends IsolatedSecureStorage {
   bool failClear = false;
 
   @override
