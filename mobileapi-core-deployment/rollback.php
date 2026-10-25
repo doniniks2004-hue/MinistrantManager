@@ -29,7 +29,7 @@ function copyTree(string $src, string $dst): void {
         $rel = substr($item->getPathname(), strlen($src) + 1);
         $target = $dst . DIRECTORY_SEPARATOR . $rel;
         if ($item->isDir()) { if (!is_dir($target)) mkdir($target, 0750, true); }
-        else copy($item->getPathname(), $target);
+        elseif (!copy($item->getPathname(), $target)) throw new RuntimeException("Cannot copy " . $item->getPathname());
     }
 }
 $backup = null;
@@ -39,12 +39,40 @@ $manifest = json_decode((string)file_get_contents($backup . '/manifest.json'), t
 if (!is_array($manifest) || empty($manifest['target_root'])) fail('Invalid manifest.');
 $target = rtrim($manifest['target_root'], '/');
 
+// Validate the entire restore plan before removing any current files.
+$targetReal = realpath($target);
+if ($targetReal === false || $targetReal === DIRECTORY_SEPARATOR) fail('Invalid target root.');
+$lock = fopen($targetReal . '/.mm-installer.lock', 'c');
+if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) fail('Another installer is running.');
+foreach (array_merge($manifest['created_items'] ?? [], $manifest['backup_items'] ?? []) as $rel) {
+    if (!is_string($rel) || $rel === '' || str_starts_with($rel, '/')
+        || str_contains($rel, "\\") || str_contains($rel, "\0")
+        || in_array('..', explode('/', $rel), true) || in_array('.', explode('/', $rel), true)) {
+        fail('Invalid relative path in manifest.');
+    }
+    $cursor = $targetReal;
+    foreach (explode('/', $rel) as $segment) {
+        $cursor .= '/' . $segment;
+        if (is_link($cursor)) fail('Refusing symlink in restore target.');
+    }
+}
+foreach ($manifest['backup_items'] ?? [] as $rel) {
+    $src = $backup . '/files/' . $rel;
+    if (!file_exists($src) || is_link($src)) fail('Missing or unsafe backup item: ' . $rel);
+    if (is_dir($src)) {
+        foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($src, FilesystemIterator::SKIP_DOTS)) as $item) {
+            if ($item->isLink() || !$item->isReadable()) fail('Unreadable or linked backup item.');
+        }
+    } elseif (!is_readable($src)) fail('Unreadable backup item.');
+}
+
 foreach (array_reverse($manifest['created_items'] ?? []) as $rel) {
     removeTree($target . '/' . $rel);
 }
 foreach ($manifest['backup_items'] ?? [] as $rel) {
     $src = $backup . '/files/' . $rel;
     $dst = $target . '/' . $rel;
+    removeTree($dst);
     copyTree($src, $dst);
 }
 echo "ROLLBACK FILES OK\n";

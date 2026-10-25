@@ -88,7 +88,9 @@ final class LegacyPasswordAuthenticator
         $hash = $user['password'] ?? $dummyHash;
         $isValid = password_verify($password, $hash);
 
-        $this->recordAttempt($ip, $username, $isValid && $user !== null);
+        if (!$this->recordAttempt($ip, $username, $isValid && $user !== null)) {
+            return null;
+        }
 
         if ($user === null || !$isValid || (int) $user['is_active'] !== 1) {
             return null;
@@ -105,8 +107,9 @@ final class LegacyPasswordAuthenticator
 
     private function isRateLimited(string $ip, string $username): bool
     {
+        // A missing/broken limiter must never permit unlimited password guesses.
         if (!$this->loginAttemptsTableExists()) {
-            return false;
+            return true;
         }
 
         $timeLimit = date('Y-m-d H:i:s', strtotime('-' . self::DECAY_MINUTES . ' minutes'));
@@ -128,13 +131,13 @@ final class LegacyPasswordAuthenticator
         }
 
         if (!$stmt) {
-            return false;
+            return true;
         }
 
         $stmt->bind_param('sss', $ip, $username, $timeLimit);
         if (!$stmt->execute()) {
             $stmt->close();
-            return false;
+            return true;
         }
 
         $attempts = 0;
@@ -142,15 +145,16 @@ final class LegacyPasswordAuthenticator
         $hasRow = $stmt->fetch();
         $stmt->close();
 
-        return $hasRow && (int) $attempts >= self::MAX_FAILED_ATTEMPTS;
+        return !$hasRow || (int) $attempts >= self::MAX_FAILED_ATTEMPTS;
     }
 
-    private function recordAttempt(string $ip, string $username, bool $wasSuccessful): void
+    private function recordAttempt(string $ip, string $username, bool $wasSuccessful): bool
     {
         if (!$this->loginAttemptsTableExists()) {
-            return;
+            return false;
         }
 
+        $recorded = false;
         if ($this->loginAttemptsHasColumn('was_successful')) {
             $successFlag = $wasSuccessful ? 1 : 0;
             $stmt = @$this->conn->prepare(
@@ -158,7 +162,7 @@ final class LegacyPasswordAuthenticator
             );
             if ($stmt) {
                 $stmt->bind_param('ssi', $ip, $username, $successFlag);
-                @$stmt->execute();
+                $recorded = $stmt->execute();
                 $stmt->close();
             }
         } else {
@@ -170,10 +174,12 @@ final class LegacyPasswordAuthenticator
             );
             if ($stmt) {
                 $stmt->bind_param('ss', $ip, $username);
-                @$stmt->execute();
+                $recorded = $stmt->execute();
                 $stmt->close();
             }
         }
+
+        if (!$recorded) return false;
 
         if ($wasSuccessful) {
             // Review round addition: a successful login resets this
@@ -194,6 +200,7 @@ final class LegacyPasswordAuthenticator
 
             @$this->conn->query("DELETE FROM login_attempts WHERE attempt_time < DATE_SUB(NOW(), INTERVAL 1 DAY)");
         }
+        return true;
     }
 
     private function loginAttemptsHasColumn(string $column): bool

@@ -118,6 +118,8 @@ class SecureStorageService {
   }) {
     _sessionGeneration++;
     return _mutateCredentials(() async {
+      await _storage.delete(key: _kMobileUserToken);
+      await _storage.delete(key: _kLegacyRememberToken);
       await _storage.write(key: _kCurrentUserId, value: userId.toString());
       if (fullName != null) {
         await _storage.write(key: _kCurrentUserFullName, value: fullName);

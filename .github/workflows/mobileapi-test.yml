@@ -47,6 +47,14 @@ jobs:
         working-directory: .
         run: php mobileapi-core-deployment/tests/routing_config_test.php
 
+      - name: Test exact rollback and invalid backup rejection
+        working-directory: .
+        run: php mobileapi-core-deployment/tests/rollback_test.php
+
+      - name: Test login denial when rate-limit storage is unavailable
+        working-directory: .
+        run: php -n mobileapi-core-deployment/tests/login_limiter_test.php
+
       - name: Test handoff diagnostics (hashes stay in step with the repo; no secret can be printed)
         working-directory: .
         run: php mobileapi-core-deployment/tests/diagnose_handoff_test.php

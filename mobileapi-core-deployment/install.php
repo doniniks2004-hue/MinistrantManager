@@ -95,6 +95,13 @@ out("=== Ministrant Manager Universal Parish Installer v1 ===");
 out("Target: $targetRoot");
 out("Mode: " . ($dryRun ? 'DRY RUN' : 'INSTALL'));
 
+// Serialize installers before reading/snapshotting the target.
+$installLock = fopen($targetRoot . '/.mm-installer.lock', 'c');
+if ($installLock === false || !flock($installLock, LOCK_EX | LOCK_NB)) {
+    fail('Another installer is running for this parish.');
+}
+
+
 require $dbConfig;
 if (!isset($conn) || !($conn instanceof mysqli)) fail("config/database.php did not provide mysqli \$conn");
 
@@ -150,7 +157,7 @@ if ($secret === '' && is_file($secretPath)) {
 if ($secret === '') $secret = hiddenPrompt('MOBILE_INTERNAL_API_SECRET for this parish: ');
 if ($secret === '' || strlen($secret) < 24) fail('Secret is missing or too short.');
 
-$stamp = date('Ymd_His');
+$stamp = date('Ymd_His') . '_' . bin2hex(random_bytes(4));
 $backupRoot = $targetRoot . '/mm-installer-backups/' . $stamp;
 if (!mkdir($backupRoot, 0700, true) && !is_dir($backupRoot)) fail("Cannot create backup $backupRoot");
 
@@ -213,6 +220,22 @@ $stagedCore = $targetRoot . '/mobileapi-core.__new__';
 removeTree($stagedCore);
 copyTree($packageRoot . '/mobileapi-core', $stagedCore);
 file_put_contents($stagedCore . '/active-profile.php', "<?php\nreturn " . var_export($profile['adapter_dir'], true) . ";\n");
+// Prepare schema and metadata while the previous endpoints still use the old core.
+$secretPhp = "<?php\ndefine('MOBILE_CENTRAL_BASE_URL', 'https://app.ministrant.eu');\ndefine('MOBILE_INTERNAL_API_SECRET', " . var_export($secret, true) . ");\n";
+if (file_put_contents($secretPath, $secretPhp) === false) fail('Cannot write parish secret config.');
+chmod($secretPath, 0600);
+
+copy($packageRoot . '/scripts/preflight.php', $targetRoot . '/preflight.php');
+runPhp($targetRoot . '/preflight.php');
+
+foreach (glob($packageRoot . '/migrations/*.sql') ?: [] as $migration) {
+    out('Migration: ' . basename($migration));
+    runSqlFile($conn, $migration);
+}
+
+$metaInstaller = $stagedCore . '/' . $profile['install_meta'];
+runPhp($metaInstaller);
+
 $oldCore = $targetRoot . '/mobileapi-core.__old__';
 removeTree($oldCore);
 if (is_dir($targetRoot . '/mobileapi-core') && !rename($targetRoot . '/mobileapi-core', $oldCore)) {
@@ -226,10 +249,6 @@ if (!rename($stagedCore, $targetRoot . '/mobileapi-core')) {
 copyTree($packageRoot . '/public_html-additions/api/mobile', $publicRoot . '/api/mobile');
 copyTree($packageRoot . '/public_html-additions/public/mobile_handoff.php', $publicRoot . '/public/mobile_handoff.php');
 
-$secretPhp = "<?php\ndefine('MOBILE_CENTRAL_BASE_URL', 'https://app.ministrant.eu');\ndefine('MOBILE_INTERNAL_API_SECRET', " . var_export($secret, true) . ");\n";
-if (file_put_contents($secretPath, $secretPhp) === false) fail('Cannot write parish secret config.');
-chmod($secretPath, 0600);
-
 $htaccess = $publicRoot . '/.htaccess';
 $snippet = file_get_contents($packageRoot . '/public_html-additions/htaccess-snippet.txt');
 $currentHt = is_file($htaccess) ? (file_get_contents($htaccess) ?: '') : '';
@@ -241,17 +260,6 @@ foreach (['bootstrap', 'config', 'session-login', 'session-change-password', 'we
 if (file_put_contents($htaccess, canonicalMobileRouting($currentHt, (string)$snippet)) === false) {
     fail('Cannot write MobileAPI routing.');
 }
-
-copy($packageRoot . '/scripts/preflight.php', $targetRoot . '/preflight.php');
-runPhp($targetRoot . '/preflight.php');
-
-foreach (glob($packageRoot . '/migrations/*.sql') ?: [] as $migration) {
-    out('Migration: ' . basename($migration));
-    runSqlFile($conn, $migration);
-}
-
-$metaInstaller = $targetRoot . '/mobileapi-core/' . $profile['install_meta'];
-runPhp($metaInstaller);
 
 $manifest = [
     'installer_version' => 1,
@@ -268,7 +276,8 @@ removeTree($oldCore);
 $GLOBALS['mm_install_complete'] = true;
 
 out();
-out('INSTALL OK');
+out('MOBILEAPI INSTALL OK');
+out('Legacy application hardening was not implied by this installation.');
 out("Profile: $profileKey");
 out("Rollback: php " . $packageRoot . "/rollback.php --backup=$backupRoot");
 out('Next: run smoke/acceptance against the parish URL.');

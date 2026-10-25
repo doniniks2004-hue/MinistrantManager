@@ -43,6 +43,7 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   Future<void> _submit() async {
+    if (_submitting) return;
     final username = _usernameController.text.trim();
     final password = _passwordController.text;
     if (username.isEmpty || password.isEmpty) {
@@ -55,8 +56,8 @@ class _LoginScreenState extends State<LoginScreen> {
       _errorMessage = null;
     });
 
-    final result = await widget.userSessionService
-        .login(username: username, password: password);
+    final result = await _runSubmission(() => widget.userSessionService
+        .login(username: username, password: password));
     if (!mounted) return;
 
     switch (result) {
@@ -79,6 +80,11 @@ class _LoginScreenState extends State<LoginScreen> {
       case UserLoginDeviceNotAuthorized():
         _showDeviceError(result.deviceState);
         break;
+      case UserLoginLocalError():
+        setState(() {
+          _errorMessage = 'Nie udało się zapisać sesji na urządzeniu. Spróbuj ponownie.';
+        });
+        break;
       case UserLoginNetworkError():
         setState(() {
           _submitting = false;
@@ -89,6 +95,7 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   Future<void> _submitPasswordChange() async {
+    if (_submitting) return;
     final newPassword = _newPasswordController.text;
     final confirmPassword = _confirmPasswordController.text;
 
@@ -106,11 +113,11 @@ class _LoginScreenState extends State<LoginScreen> {
       _errorMessage = null;
     });
 
-    final result = await widget.userSessionService.changeRequiredPassword(
+    final result = await _runSubmission(() => widget.userSessionService.changeRequiredPassword(
       username: _usernameController.text.trim(),
       currentPassword: _passwordController.text,
       newPassword: newPassword,
-    );
+    ));
     if (!mounted) return;
 
     switch (result) {
@@ -135,12 +142,27 @@ class _LoginScreenState extends State<LoginScreen> {
               'Nie udało się dokończyć zmiany hasła. Zaloguj się ponownie.';
         });
         break;
+      case UserLoginLocalError():
+        setState(() {
+          _errorMessage = 'Nie udało się zapisać sesji na urządzeniu. Spróbuj ponownie.';
+        });
+        break;
       case UserLoginNetworkError():
         setState(() {
           _submitting = false;
           _errorMessage =
               'Brak połączenia z serwerem parafii. Spróbuj ponownie.';
         });
+    }
+  }
+
+  Future<UserLoginResult> _runSubmission(Future<UserLoginResult> Function() action) async {
+    try {
+      return await action();
+    } catch (_) {
+      return const UserLoginLocalError();
+    } finally {
+      if (mounted) setState(() => _submitting = false);
     }
   }
 
