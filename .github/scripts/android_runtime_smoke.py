@@ -57,11 +57,20 @@ def main():
             except (ValueError, TypeError):
                 pass
             time.sleep(0.5)
+        (out / 'timeout-last-read.txt').write_text(
+            f'path: {path}\nexit: {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}')
         raise TimeoutError('no completed result in ' + path)
 
     def launch():
-        adb('shell', 'am', 'start', '-W', '-n', PACKAGE + '/.MainActivity')
+        result = adb('shell', 'am', 'start', '-W', '-n', PACKAGE + '/.MainActivity')
+        with (out / 'launches.txt').open('a') as log:
+            log.write(result.stdout + result.stderr + '\n')
 
+    # Capture from BEFORE launch: a tail of the system log can lose the crash
+    # entirely when Google services flood logcat during a fresh emulator boot.
+    log_file = (out / 'logcat-live.txt').open('w')
+    logger = subprocess.Popen(['adb', '-s', args.serial, 'logcat', '-v', 'threadtime'],
+                              stdout=log_file, stderr=subprocess.STDOUT)
     try:
         page_size = int(adb('shell', 'getconf', 'PAGE_SIZE').stdout.strip())
         (out / 'environment.json').write_text(json.dumps({'page_size': page_size}))
@@ -90,8 +99,24 @@ def main():
         (out / 'verdict.txt').write_text('PASS: native self-test, five cold page opens, fresh activation.\n'
                                        'No live parish login or device performance acceptance.\n')
     finally:
-        logs = adb('logcat', '-d', '-t', '3000', check=False)
-        (out / 'logcat.txt').write_text(logs.stdout)
+        logger.terminate()
+        try:
+            logger.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.kill()
+            logger.wait(timeout=10)
+        log_file.close()
+        logs = adb('logcat', '-b', 'crash', '-d', check=False)
+        (out / 'crashes.txt').write_text(logs.stdout + logs.stderr)
+        state = adb('shell', 'dumpsys', 'activity', 'activities', check=False)
+        (out / 'activities.txt').write_text(state.stdout)
+        adb('shell', 'uiautomator', 'dump', '/sdcard/mm-runtime-ui.xml', check=False)
+        ui = adb('shell', 'cat', '/sdcard/mm-runtime-ui.xml', check=False)
+        (out / 'screen.xml').write_text(ui.stdout)
+        screen = subprocess.run(['adb', '-s', args.serial, 'exec-out', 'screencap', '-p'],
+                                capture_output=True, timeout=30)
+        if screen.returncode == 0:
+            (out / 'screen.png').write_bytes(screen.stdout)
 
 
 if __name__ == '__main__':
