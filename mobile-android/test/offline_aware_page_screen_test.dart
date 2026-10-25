@@ -38,6 +38,7 @@ class _FakePlatform extends WebViewPlatform {
   /// Makes the scroll-bar calls throw, like a platform without the setting.
   static bool scrollBarsThrowing = false;
 
+  Future<void>? navigationSetup;
   final controllers = <_FakeController>[];
   final delegates = <_FakeDelegate>[];
 
@@ -45,7 +46,7 @@ class _FakePlatform extends WebViewPlatform {
   PlatformWebViewController createPlatformWebViewController(
     PlatformWebViewControllerCreationParams params,
   ) {
-    final controller = _FakeController(params);
+    final controller = _FakeController(params, navigationSetup: navigationSetup);
     controllers.add(controller);
     return controller;
   }
@@ -66,8 +67,10 @@ class _FakePlatform extends WebViewPlatform {
 }
 
 class _FakeController extends PlatformWebViewController {
-  _FakeController(PlatformWebViewControllerCreationParams params)
+  _FakeController(PlatformWebViewControllerCreationParams params, {this.navigationSetup})
     : super.implementation(params);
+
+  final Future<void>? navigationSetup;
 
   /// Whether the web view widget was already part of the tree.
   bool attached = false;
@@ -92,7 +95,9 @@ class _FakeController extends PlatformWebViewController {
   @override
   Future<void> setPlatformNavigationDelegate(
     PlatformNavigationDelegate handler,
-  ) async {}
+  ) async {
+    await navigationSetup;
+  }
 
   @override
   Future<void> loadRequest(LoadRequestParams params) async {
@@ -483,6 +488,52 @@ void main() {
   });
 
   const spinner = CircularProgressIndicator;
+
+  testWidgets('first navigation waits for asynchronous WebView configuration', (tester) async {
+    final gate = Completer<void>();
+    platform.navigationSetup = gate.future;
+    final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
+    await tester.pumpWidget(_host(coordinator));
+    coordinator.connectivity.dispose();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(platform.controllers.single.loaded, isEmpty);
+    expect(coordinator.planCalls, 0);
+
+    gate.complete();
+    await tester.pump(const Duration(milliseconds: 1));
+    expect(platform.controllers.single.loaded, [_localUrl]);
+    expect(coordinator.planCalls, 1);
+  });
+
+  testWidgets('late WebView configuration cannot revive an expired load', (tester) async {
+    final gate = Completer<void>();
+    platform.navigationSetup = gate.future;
+    final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
+    await tester.pumpWidget(_host(coordinator));
+    coordinator.connectivity.dispose();
+    await tester.pump(coordinator.planningBudget + const Duration(milliseconds: 10));
+    await tester.pump(const Duration(milliseconds: 2));
+    expect(find.text('Nie udało się przygotować strony na czas. Spróbuj ponownie.'), findsOneWidget);
+
+    gate.complete();
+    await tester.pump(const Duration(milliseconds: 1));
+    expect(platform.controllers.single.loaded, isEmpty);
+    expect(coordinator.planCalls, 0);
+  });
+
+  testWidgets('late WebView configuration cannot navigate after disposal', (tester) async {
+    final gate = Completer<void>();
+    platform.navigationSetup = gate.future;
+    final coordinator = _ScriptedCoordinator((_) async => _offlinePlan());
+    await tester.pumpWidget(_host(coordinator));
+    coordinator.connectivity.dispose();
+    await tester.pumpWidget(const SizedBox.shrink());
+
+    gate.complete();
+    await tester.pump(const Duration(milliseconds: 1));
+    expect(platform.controllers.single.loaded, isEmpty);
+    expect(coordinator.planCalls, 0);
+  });
 
   testWidgets('the web view is attached BEFORE the first navigation', (
     tester,

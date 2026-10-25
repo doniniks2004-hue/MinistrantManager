@@ -169,6 +169,7 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
   }
 
   late final WebViewController _controller;
+  late final Future<void> _controllerReady;
   _LoadState _state = _LoadState.loading;
   String? _errorText;
 
@@ -321,12 +322,15 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     super.initState();
     StartupTrace.mark('screen_init');
     _currentPath = widget.targetPath;
-    _controller = WebViewController()
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..addJavaScriptChannel(_captureChannel, onMessageReceived: _onCapture)
-      ..addJavaScriptChannel(_bridgeChannel, onMessageReceived: _onBridge)
-      ..addJavaScriptChannel(_paintChannel, onMessageReceived: _onPaint)
-      ..setNavigationDelegate(
+    _controller = WebViewController();
+    // Platform setup is asynchronous. Navigation must wait until every channel
+    // and the delegate are installed, or the first finish/message can be lost.
+    _controllerReady = Future.wait<void>([
+      _controller.setJavaScriptMode(JavaScriptMode.unrestricted),
+      _controller.addJavaScriptChannel(_captureChannel, onMessageReceived: _onCapture),
+      _controller.addJavaScriptChannel(_bridgeChannel, onMessageReceived: _onBridge),
+      _controller.addJavaScriptChannel(_paintChannel, onMessageReceived: _onPaint),
+      _controller.setNavigationDelegate(
         NavigationDelegate(
           onPageStarted: _onStarted,
           onHttpError: (error) {
@@ -450,7 +454,11 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
           },
           onNavigationRequest: _navigate,
         ),
-      );
+      ),
+    ]).then<void>((_) {});
+    // Preserve the error for the bounded load below, even if setup fails before
+    // the initial saved-copy check has finished and begins awaiting it.
+    _controllerReady.ignore();
     WidgetsBinding.instance.addObserver(this);
     // Before the first plan: the loopback server must already be listening
     // when the first fallback needs it. Not awaited, never fails.
@@ -1497,6 +1505,8 @@ $_captureChannel.postMessage(JSON.stringify({
       // plan returns: otherwise an online page the screen just gave up on
       // could still finish inside that window and flip the screen back.
       _online = !forceOffline;
+      await _controllerReady;
+      if (!mounted || _loggingOut || generation != _loadGeneration) return;
       StartupTrace.mark('plan_start');
       final PageLoadPlan plan = prepared ?? await widget.coordinator.plan(
         parishId: widget.parishId,

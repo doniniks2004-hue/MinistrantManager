@@ -38,6 +38,7 @@ class SelfTestPage extends StatefulWidget {
 
 class _SelfTestPageState extends State<SelfTestPage> {
   late final WebViewController _controller;
+  late final Future<void> _controllerReady;
   final _messages = StreamController<String>.broadcast();
   final _lines = <String>[];
   String _headline = 'SELFTEST RUNNING';
@@ -47,9 +48,12 @@ class _SelfTestPageState extends State<SelfTestPage> {
   @override
   void initState() {
     super.initState();
-    _controller = WebViewController()
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..addJavaScriptChannel('SelfTest', onMessageReceived: (m) => _messages.add(m.message));
+    _controller = WebViewController();
+    _controllerReady = Future.wait<void>([
+      _controller.setJavaScriptMode(JavaScriptMode.unrestricted),
+      _controller.addJavaScriptChannel('SelfTest', onMessageReceived: (m) => _messages.add(m.message)),
+    ]).then<void>((_) {});
+    _controllerReady.ignore();
     WidgetsBinding.instance.addPostFrameCallback((_) => unawaited(_run()));
   }
 
@@ -72,24 +76,40 @@ class _SelfTestPageState extends State<SelfTestPage> {
   }
 
   /// Loads [url] and waits until the engine says it finished.
-  Future<void> _load(Uri url, {Duration within = const Duration(seconds: 20)}) {
+  Future<void> _load(Uri url, {Duration within = const Duration(seconds: 20)}) async {
     final finished = Completer<void>();
+    finished.future.ignore();
     String? failure;
-    _controller.setNavigationDelegate(
-      NavigationDelegate(
-        onPageFinished: (_) {
-          if (!finished.isCompleted) finished.complete();
-        },
-        onWebResourceError: (e) {
-          failure = '${e.errorCode} ${e.description}';
-          if (e.isForMainFrame == true && !finished.isCompleted) {
-            finished.completeError(StateError('main frame failed: $failure'));
-          }
-        },
-      ),
-    );
-    unawaited(_controller.loadRequest(url));
-    return finished.future.timeout(within, onTimeout: () => throw StateError('no onPageFinished within ${within.inSeconds}s (last error: $failure)'));
+    var active = true;
+    var stage = 'configuration';
+    try {
+      await (() async {
+        await _controllerReady;
+        if (!active) return;
+        await _controller.setNavigationDelegate(
+          NavigationDelegate(
+            onPageFinished: (_) {
+              if (active && !finished.isCompleted) finished.complete();
+            },
+            onWebResourceError: (e) {
+              failure = '${e.errorCode} ${e.description}';
+              if (active && e.isForMainFrame == true && !finished.isCompleted) {
+                finished.completeError(StateError('main frame failed: $failure'));
+              }
+            },
+          ),
+        );
+        if (!active) return;
+        stage = 'loadRequest';
+        await _controller.loadRequest(url);
+        stage = 'onPageFinished';
+        await finished.future;
+      })().timeout(within, onTimeout: () => throw StateError(
+        'navigation timed out in $stage after ${within.inSeconds}s (last error: $failure)',
+      ));
+    } finally {
+      active = false;
+    }
   }
 
   /// Two animation frames after the page finished: a frame was drawn.
