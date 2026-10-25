@@ -121,8 +121,8 @@ jobs:
       - name: Build for iPhone ARM64 (release, unsigned)
         run: |
           flutter build ios --release --no-codesign --dart-define=GIT_SHA=${{ github.sha }}
-          xcrun lipo -verify_arch arm64 build/ios/iphoneos/Runner.app/Runner
-          xcrun lipo -verify_arch arm64 build/ios/iphoneos/Runner.app/Frameworks/App.framework/App
+          xcrun lipo build/ios/iphoneos/Runner.app/Runner -verify_arch arm64
+          xcrun lipo build/ios/iphoneos/Runner.app/Frameworks/App.framework/App -verify_arch arm64
           echo "iPhone ARM64 release compilation PASS; signing and device acceptance are still required." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Import certificate and provisioning profile
