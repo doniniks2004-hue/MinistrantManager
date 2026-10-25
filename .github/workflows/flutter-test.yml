@@ -12,6 +12,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -66,4 +67,13 @@ jobs:
         # workflow. `flutter test` also runs every file under test/
         # recursively by default, so all 7 files verified above are
         # actually executed by this one command, not cherry-picked.
-        run: flutter test --concurrency=1
+        run: |
+          set -o pipefail
+          flutter test --concurrency=1 --timeout 60s --reporter expanded 2>&1 | tee flutter-test.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flutter-tests-${{ matrix.app }}
+          path: ${{ matrix.app }}/flutter-test.log
+          if-no-files-found: ignore
