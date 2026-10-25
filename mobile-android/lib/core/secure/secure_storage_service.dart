@@ -3,6 +3,8 @@ import 'dart:math';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../network/parish_server_url.dart';
+import '../../features/revocation/wipe_marker.dart' show WipeMarkerStore;
+import '../security/access_refusals.dart' show RefusalSlot, RefusalStorage, SharedRefusalStorage;
 
 /// Wraps flutter_secure_storage (Android Keystore / iOS Keychain).
 /// This is the ONLY place device_token, installation_id, and the resolved
@@ -43,6 +45,13 @@ class SecureStorageService {
   static const _kCurrentUserId = 'current_user_id';
   static const _kCurrentUserFullName = 'current_user_full_name';
   static const _kCurrentUserRoleId = 'current_user_role_id';
+  // Refusals the server has given (see AccessRefusals): records of a token's short fingerprint, a
+  // label and a time. Never a token. Cleared with the activation they belong to.
+  static const _kRefusalDevice = 'refusal_device';
+  static const _kRefusalModules = 'refusal_modules';
+  // "A wipe was started and is not confirmed complete". Deliberately NOT removed by clearActivation()
+  // or clearAfterDeletedInstall(): it is removed by the wipe itself, once every required step is done.
+  static const _kWipeInProgress = 'wipe_in_progress';
 
   Future<String?> get installationId => _storage.read(key: _kInstallationId);
   Future<void> setInstallationId(String value) =>
@@ -167,11 +176,21 @@ class SecureStorageService {
   /// a meaningfully valid signed-in user either.
   Future<void> clearActivation() async {
     await clearUserSession();
+    // The refusals belong to this activation (device) and its users (modules); a later activation
+    // starts without them. (A user's LOGOUT does not clear them: see clearUserSession.)
+    await _storage.delete(key: _kRefusalDevice);
+    await _storage.delete(key: _kRefusalModules);
     await _storage.delete(key: _kParishId);
     await _storage.delete(key: _kParishSlug);
     await _storage.delete(key: _kServerUrl);
     await _storage.delete(key: _kDeviceToken);
   }
+
+  /// The two slots AccessRefusals keeps: nothing else can be read or written through it.
+  RefusalStorage get refusalStorage => _SecureRefusalStorage(_storage);
+
+  /// The single slot of the "wipe in progress" marker.
+  WipeMarkerStore get wipeMarkerStore => _SecureWipeMarkerStore(_storage);
 
   Future<bool> get isActivated async => (await deviceToken) != null;
 
@@ -298,4 +317,43 @@ class SecureStorageService {
 
   Future<void> deleteLegacyRememberToken() =>
       _mutateCredentials(() => _storage.delete(key: _kLegacyRememberToken));
+}
+
+class _SecureRefusalStorage implements RefusalStorage, SharedRefusalStorage {
+  _SecureRefusalStorage(this._storage);
+  final FlutterSecureStorage _storage;
+
+  /// The platform keystore is ONE place: every instance, whatever service built it, queues behind
+  /// the same operations (see SharedRefusalStorage).
+  @override
+  Object get gateKey => 'platform-keystore:refusals';
+
+  static String _key(RefusalSlot slot) => switch (slot) {
+        RefusalSlot.device => SecureStorageService._kRefusalDevice,
+        RefusalSlot.modules => SecureStorageService._kRefusalModules,
+      };
+
+  @override
+  Future<String?> read(RefusalSlot slot) => _storage.read(key: _key(slot));
+
+  @override
+  Future<void> write(RefusalSlot slot, String value) => _storage.write(key: _key(slot), value: value);
+
+  @override
+  Future<void> delete(RefusalSlot slot) => _storage.delete(key: _key(slot));
+}
+
+class _SecureWipeMarkerStore implements WipeMarkerStore {
+  _SecureWipeMarkerStore(this._storage);
+  final FlutterSecureStorage _storage;
+
+  @override
+  Future<String?> read() => _storage.read(key: SecureStorageService._kWipeInProgress);
+
+  @override
+  Future<void> write(String value) =>
+      _storage.write(key: SecureStorageService._kWipeInProgress, value: value);
+
+  @override
+  Future<void> delete() => _storage.delete(key: SecureStorageService._kWipeInProgress);
 }

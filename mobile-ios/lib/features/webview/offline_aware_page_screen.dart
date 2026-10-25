@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show pid;
 
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -9,6 +10,8 @@ import '../../core/util/startup_trace.dart';
 import '../../core/offline/offline_page_coordinator.dart';
 import '../../core/offline/connectivity_monitor.dart';
 import '../../core/offline/page_identity.dart';
+import '../../core/offline/panel_probe.dart';
+import '../../core/security/access_refusals.dart' show HandoffRefusal;
 import '../../core/offline/server_reachability.dart';
 import '../../core/util/log_safe.dart';
 
@@ -24,6 +27,7 @@ class OfflineAwarePageScreen extends StatefulWidget {
     required this.coordinator,
     this.onLogout,
     this.forceOffline = false,
+    this.panelSpec,
   });
   final String title;
   final String targetPath;
@@ -33,6 +37,10 @@ class OfflineAwarePageScreen extends StatefulWidget {
   final OfflinePageCoordinator coordinator;
   final Future<void> Function()? onLogout;
   final bool forceOffline;
+
+  /// What the real panel is (see PanelSpec). Null: the one the build was made with
+  /// (`--dart-define=MM_PANEL_SPEC`), if any. Tests pass one in.
+  final PanelSpec? panelSpec;
   @override
   State<OfflineAwarePageScreen> createState() => _OfflineAwarePageScreenState();
 }
@@ -44,14 +52,32 @@ enum _LoadState { loading, ready, error, noSnapshot }
 /// for whoever is helping the user: status, the server's machine code, and
 /// the page path (no query, no ids).
 String describeServerError(PageLoadServerError e) {
-  final lead = switch (e.statusCode) {
-    401 => 'Sesja wygasła lub została odrzucona przez serwer.',
-    403 => 'Serwer odmówił dostępu do tej strony.',
-    _ => 'Połączenie z serwerem działa, ale serwer nie otworzył tej strony.',
+  final lead = e.staleParishAnswer
+      ? 'Serwer parafii odmówił autoryzacji urządzenia, ale centrala ją potwierdza.\n'
+          'Odpowiedź parafii może być nieaktualna (do 10 minut). Spróbuj ponownie za chwilę.'
+      : switch (e.refusal) {
+    HandoffRefusal.unknown =>
+        'Nie można ustalić, czy dostęp do zapisanych stron jest zablokowany '
+            '(nie udało się odczytać zapisu na urządzeniu).\n'
+            'Zapisane strony nie są otwierane. Dane nie zostały usunięte. Spróbuj ponownie.',
+    HandoffRefusal.module => e.remembered
+        ? 'Brak uprawnień do tego modułu (odmowa zapamiętana z poprzedniego połączenia).\n'
+            'Zapisana kopia jest zablokowana, dopóki serwer nie potwierdzi uprawnień.'
+        : 'Brak uprawnień do tego modułu.\nZapisana kopia jest zablokowana, dopóki serwer nie potwierdzi uprawnień.',
+    HandoffRefusal.device => e.remembered
+        ? 'Serwer odmówił autoryzacji tego urządzenia (odmowa zapamiętana z poprzedniego połączenia).\n'
+            'Zapisane strony są zablokowane, dopóki serwer nie potwierdzi urządzenia.'
+        : 'Serwer odmówił autoryzacji tego urządzenia.\nZapisane strony są zablokowane, dopóki serwer nie potwierdzi urządzenia.',
+    _ => switch (e.statusCode) {
+        401 => 'Sesja wygasła lub została odrzucona przez serwer.',
+        403 => 'Serwer odmówił dostępu do tej strony.',
+        _ => 'Połączenie z serwerem działa, ale serwer nie otworzył tej strony.',
+      },
   };
   final detail = [
     if (e.statusCode != null) 'HTTP ${e.statusCode}',
     if (e.errorCode != null) e.errorCode!,
+    if (e.deviceState != null) e.deviceState!,
     e.path,
   ].join(' · ');
   return '$lead\n$detail';
@@ -194,6 +220,10 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
   /// Why the saved copy on screen is shown (drives the banner wording).
   /// Carried across offline link taps so they do not reset it.
   OfflineReason _offlineReason = OfflineReason.noNetwork;
+
+  /// Why the last load ended with no saved copy and no live page: decides what the
+  /// screen says (no connection, a server that does not answer, a slow server).
+  OfflineReason _noSnapshotReason = OfflineReason.noNetwork;
 
   // ---- which ONLINE navigation a callback belongs to ------------------------
   //
@@ -449,70 +479,150 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     return _controller.loadRequest(url);
   }
 
+  /// What the screen says when there is no saved copy and the live page could not
+  /// be had. The three causes are different things for the user: no connection
+  /// (go somewhere with one), a server that is down or slow (nothing to do on the
+  /// phone, and it will be tried again by itself), so they are said differently.
+  String _noSnapshotText() {
+    final again = _recoverable ? ' Spróbujemy ponownie automatycznie.' : '';
+    return switch (_noSnapshotReason) {
+      OfflineReason.noNetwork => 'Brak zapisanej wersji tej strony. Otwórz ją przy połączeniu z internetem.',
+      OfflineReason.serverUnavailable =>
+        'Serwer parafii chwilowo nie odpowiada, a tej strony nie ma jeszcze w pamięci telefonu.$again',
+      OfflineReason.slowServer =>
+        'Serwer parafii odpowiada zbyt wolno, a tej strony nie ma jeszcze w pamięci telefonu.$again',
+    };
+  }
+
+  /// How long the first load may wait, BEFORE it has begun, to learn whether a saved
+  /// copy exists (see [_firstLoad]). That wait is part of what the user waits for.
+  /// A manifest that is not read within this time is "not known", which is neither
+  /// "no copy" nor "no network": the load then goes the way that does not depend on the
+  /// answer (the server is tried, within the same start budget), and the saved copy remains
+  /// the fallback if that fails.
+  static const _savedCopyCheckBudget = Duration(milliseconds: 400);
+
+  /// True if the answer to something awaited by the first load is no longer
+  /// wanted: the screen is gone or signing out, a newer load has begun, or it is
+  /// another parish or user now. A decision made from an old answer must never
+  /// start a load.
+  bool _decisionIsStale(int generation, String parishId, String userId) =>
+      !mounted ||
+      _loggingOut ||
+      generation != _loadGeneration ||
+      parishId != widget.parishId ||
+      userId != widget.userId;
+
   /// The first load of this screen. If the system ALREADY says there is no
-  /// network (the app was opened offline), the attempt to reach the server is
-  /// skipped: it cannot succeed, and until it fails (up to 1.5 s with a saved
-  /// copy) the user waits for a copy that is already there. Nothing is lost if
-  /// the system is wrong: the load is a normal "offline" one, so the
-  /// reconnect logic asks the server and brings the live page back.
+  /// network (the app was opened offline) AND a saved copy is known to exist, the
+  /// attempt to reach the server is skipped: it cannot succeed, and until it fails
+  /// the user waits for a copy that is already there.
+  ///
+  /// The system's report is not the server's answer, and a slow read of the saved-copy
+  /// manifest is not a missing network. So:
+  ///  - a copy is known to exist: straight to it (reason: no network, as reported);
+  ///  - known not to exist: the server is tried, with the time a first handoff needs;
+  ///  - NOT KNOWN (the read did not finish in [_savedCopyCheckBudget], or failed): the server
+  ///    is tried, for what is left of the same start budget (the coordinator subtracts what
+  ///    the check already took; it does not read the manifest a second time with a timeout
+  ///    of its own). If that fails, the copy is shown with the reason the failure gives.
+  ///    "No network" is never concluded from the store's slowness.
+  ///
+  /// Everything awaited here happens BEFORE the load and is therefore part of the
+  /// user's wait: it is bounded, timed (the trace line "start: decided in N ms" and the
+  /// start-up mark `start_decided`), and its answer is discarded if it arrives after the
+  /// screen, the user, or the attempt it was asked for has changed ([_decisionIsStale]).
   Future<void> _firstLoad() async {
+    final generation = _loadGeneration;
+    final parishId = widget.parishId;
+    final userId = widget.userId;
+    final watch = Stopwatch()..start();
     var forceOffline = widget.forceOffline;
     OfflineReason? reason;
+    var copyFact = SavedCopyFact.unchecked;
+    var how = 'online attempt';
     if (!forceOffline) {
       final state = await widget.coordinator.connectivity.currentState();
-      if (!mounted || _loggingOut) return;
+      if (_decisionIsStale(generation, parishId, userId)) return;
       if (state != null && !state.hasInterface) {
-        forceOffline = true;
-        reason = OfflineReason.noNetwork;
-        widget.coordinator.trace('start: the system reports no network; skipping the online attempt');
+        // Skipping the attempt only buys something when a saved copy is waiting to be
+        // shown instead. With no copy (the first run, right after an activation and a
+        // sign-in) there is nothing to show, and the system's report may be a moment's
+        // flicker: the attempt is made, and if it fails the reason it gives is the
+        // true one. Asking the system "is there a network" instead of the server was
+        // what showed "no internet" to a user whose connection was fine.
+        var fact = SavedCopyFact.unknown;
+        try {
+          fact = await widget.coordinator
+              .savedCopyFact(parishId: parishId, userId: userId, pagePath: widget.targetPath)
+              .timeout(_savedCopyCheckBudget);
+        } on TimeoutException {
+          fact = SavedCopyFact.unknown;
+        } catch (_) {
+          fact = SavedCopyFact.unknown;
+        }
+        if (_decisionIsStale(generation, parishId, userId)) {
+          widget.coordinator.trace('start: the saved-copy answer arrived after the screen, the user or the attempt had changed; ignored (${watch.elapsedMilliseconds} ms)');
+          return;
+        }
+        copyFact = fact;
+        if (fact == SavedCopyFact.exists) {
+          forceOffline = true;
+          reason = OfflineReason.noNetwork;
+          how = 'saved copy exists';
+          widget.coordinator.trace('start: the system reports no network and a saved copy exists; skipping the online attempt');
+        } else if (fact == SavedCopyFact.absent) {
+          how = 'no saved copy yet';
+          widget.coordinator.trace('start: the system reports no network but there is no saved copy yet; trying the server anyway');
+        } else {
+          how = 'saved copy not established within ${_savedCopyCheckBudget.inMilliseconds} ms';
+          widget.coordinator.trace('start: the system reports no network and whether a saved copy exists is NOT known (${watch.elapsedMilliseconds} ms); '
+              'trying the server within the same start budget, the copy stays the fallback');
+        }
       }
     }
-    await _loadPage(forceOffline: forceOffline, offlineReason: reason);
+    StartupTrace.mark('start_decided');
+    widget.coordinator.trace(
+      'start: decided in ${watch.elapsedMilliseconds} ms before the load began (${forceOffline ? 'offline' : 'online'}: $how)',
+    );
+    await _loadPage(
+      forceOffline: forceOffline,
+      offlineReason: reason,
+      copyFact: copyFact,
+      spentBeforeLoad: watch.elapsed,
+    );
   }
+
+  /// The owner's definition of the real panel (see PanelSpec); null if the build
+  /// was made without one, in which case the report says verdict=none.
+  static final PanelSpec? _envPanelSpec = PanelSpec.fromEnvironment();
+  PanelSpec? get _panelSpec => widget.panelSpec ?? _envPanelSpec;
+
+  /// Names this run of the process in the trace, next to the operating system's
+  /// process id: a log line is evidence for THIS process only if both match what
+  /// the acceptance script saw start.
+  static final String _processSession = DateTime.now().microsecondsSinceEpoch.toRadixString(36);
 
   /// Asks the page to say when a frame has actually been drawn after it
   /// finished loading: two animation frames (the first commits the layout, the
-  /// second is the one after it was painted), and the page's own
-  /// first-contentful-paint time. "The page finished loading" is not "the user
-  /// sees the panel": this is the second one. Reports a number and the id of
-  /// the load it belongs to, nothing else.
+  /// second is the one after it was painted), whether the page is visible, and
+  /// whether the real panel (PanelSpec) is on it, with the required styles
+  /// applied. "The page finished loading" is not "the user sees the panel":
+  /// this is the second one. The 1.5 s timer in the probe only keeps the screen
+  /// from waiting for ever; its report is labelled via=timer and is not a drawn
+  /// frame. Reports short words and numbers and the id of the load, nothing else.
   void _probePaint() {
     final nav = _navId;
     unawaited(
       _controller
-          .runJavaScript('''
-(function () {
-  var done = false;
-  function report() {
-    if (done) return;
-    done = true;
-    try {
-      var p = performance.getEntriesByName('first-contentful-paint')[0];
-      var images = document.images, loaded = 0;
-      for (var i = 0; i < images.length; i++) {
-        if (images[i].complete && images[i].naturalWidth > 0) loaded++;
-      }
-      var main = document.querySelector('main') || document.body;
-      var box = main ? main.getBoundingClientRect() : { width: 0, height: 0 };
-      $_paintChannel.postMessage(JSON.stringify({
-        nav: $nav, fcp: p ? Math.round(p.startTime) : -1, at: Math.round(performance.now()),
-        ready: document.readyState, shown: document.visibilityState,
-        img: loaded + '/' + images.length,
-        sheets: document.styleSheets.length,
-        w: Math.round(box.width), h: Math.round(box.height)
-      }));
-    } catch (e) {}
-  }
-  requestAnimationFrame(function () { requestAnimationFrame(report); });
-  setTimeout(report, 1500);
-})();
-''')
+          .runJavaScript(buildPanelProbe(nav: nav, channel: _paintChannel, spec: _panelSpec))
           .catchError((_) {}),
     );
   }
 
-  /// The page says a frame was drawn. Only a trace and a start-up mark: the
-  /// message is from a web page and changes no state.
+  /// The page says what was on it. A trace line (PAINTED_FACTS) and, only when a
+  /// real frame was drawn of a visible page that is the real panel, a start-up
+  /// mark. The message is from a web page and changes no state.
   void _onPaint(JavaScriptMessage message) {
     if (!mounted || _loggingOut) return;
     try {
@@ -527,14 +637,36 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
       String word(Object? v) => v is String && RegExp(r'^[A-Za-z]{1,12}$').hasMatch(v) ? v : 'n/a';
       String count(Object? v) => v is String && RegExp(r'^\d{1,4}/\d{1,4}$').hasMatch(v) ? v : 'n/a';
       String num0(Object? v) => v is num ? '${v.toInt().clamp(0, 100000)}' : 'n/a';
-      StartupTrace.mark(_online ? 'panel_painted_live' : 'panel_painted_copy');
+      String codes(Object? v) =>
+          v is String && RegExp(r'^(-|[rfs]\d{1,2}|t)(,([rfs]\d{1,2}|t)){0,60}$').hasMatch(v) ? v : 'n/a';
+      String specId(Object? v) => v is String && RegExp(r'^([0-9a-f]{12}|-)$').hasMatch(v) ? v : 'n/a';
+
+      final via = word(data['via']);
+      final shown = word(data['shown']);
+      final hidden = data['hidden'] == 0 || data['hidden'] == 1 ? '${data['hidden']}' : 'n/a';
+      final visible = shown == 'visible' && hidden == '0';
+      // A drawn frame is one the engine called back for, on a page that is visible.
+      // The fallback timer is neither.
+      final drawn = via == 'raf' && visible;
+
+      final expectedId = _panelSpec?.id ?? '-';
+      final reportedId = specId(data['spec']);
+      final verdict = reportedId == expectedId ? word(data['verdict']) : 'n/a';
+      final specPath = _panelSpec?.path;
+      final pathOk = specPath == null || Uri.tryParse(_currentPath)?.path == specPath;
+      // With a spec, "the panel" means the checks passed on the right page. Without
+      // one nothing says what the panel is, so no mark claims it.
+      final isPanel = drawn && _panelSpec != null && verdict == 'ok' && pathOk;
+      if (isPanel) StartupTrace.mark(_online ? 'panel_painted_live' : 'panel_painted_copy');
+
       _tr(
-        'PAINTED mode=$mode: a frame was drawn after the page finished; '
+        'PAINTED_FACTS pid=$pid session=$_processSession mode=$mode via=$via drawn=${drawn ? 1 : 0} '
         'first-contentful-paint=${fcp is num ? '${fcp.toInt().clamp(-1, 600000)} ms' : 'n/a'} '
         'page-clock=${at is num ? '${at.toInt().clamp(0, 600000)} ms' : 'n/a'} '
-        'readyState=${word(data['ready'])} visibility=${word(data['shown'])} '
+        'readyState=${word(data['ready'])} visibility=$shown hidden=$hidden '
         'images=${count(data['img'])} stylesheets=${num0(data['sheets'])} '
-        'main=${num0(data['w'])}x${num0(data['h'])}px',
+        'main=${num0(data['w'])}x${num0(data['h'])}px '
+        'spec=$reportedId verdict=$verdict failed=${codes(data['failed'])} path_ok=${pathOk ? 1 : 0} panel=${isPanel ? 1 : 0}',
       );
     } catch (_) {
       // Not ours: ignore.
@@ -1144,6 +1276,12 @@ $_captureChannel.postMessage(JSON.stringify({
         // The server is there and refuses: asking again cannot fix it.
         _recoverable = false;
         final e = result.error;
+        if (e.refusal != null) {
+          // An unambiguous refusal (the device is not authorized, or the role has no access to this
+          // module): the copy that is on screen must not stay on screen as though nothing had been said.
+          _applyServerError(e);
+          return;
+        }
         setState(() {
           _recoveryRejection =
               'Serwer odrzucił otwarcie strony • ${[
@@ -1264,6 +1402,34 @@ $_captureChannel.postMessage(JSON.stringify({
     setState(() => _state = _LoadState.error);
   }
 
+  /// The server answered and refused (or a refusal received earlier still stands): stop every pending
+  /// wait and say what the server said (sanitized), with the ways out. After an unambiguous refusal
+  /// ([PageLoadServerError.refusal]) the loopback server stops serving the copy as well, so that
+  /// nothing already on its way to the screen can still show it.
+  void _applyServerError(PageLoadServerError plan) {
+    // The server answered, so this is neither "offline" nor a load
+    // still in progress.
+    _online = false;
+    _afterHandoffPath = null;
+    _banner = null;
+    _offlineLoadUrl = null;
+    _navigationDeadline?.cancel();
+    _navigationDeadline = null;
+    _totalDeadline?.cancel();
+    _totalDeadline = null;
+    if (plan.refusal != null) {
+      _recoveryTimer?.cancel();
+      _heartbeat?.cancel();
+      _recoverable = false;
+      _captureTimer?.cancel();
+      widget.coordinator.localServer.rootDirectory = null;
+      _loadGeneration++; // whatever was still loading belongs to a screen that is no longer shown
+    }
+    _serverError = plan;
+    _errorText = describeServerError(plan);
+    if (mounted) setState(() => _state = _LoadState.error);
+  }
+
   /// [prepared] is a handoff ticket already obtained by the background
   /// check; the load then skips planning and uses it, instead of asking the
   /// server for a second ticket right after it just issued one.
@@ -1271,6 +1437,8 @@ $_captureChannel.postMessage(JSON.stringify({
     bool forceOffline = false,
     PageLoadOnline? prepared,
     OfflineReason? offlineReason,
+    SavedCopyFact copyFact = SavedCopyFact.unchecked,
+    Duration spentBeforeLoad = Duration.zero,
   }) async {
     final generation = ++_loadGeneration;
     _navId++;
@@ -1333,6 +1501,8 @@ $_captureChannel.postMessage(JSON.stringify({
         handoffPath: widget.targetPath,
         forceOffline: forceOffline,
         offlineReason: offlineReason ?? _offlineReason,
+        copyFact: copyFact,
+        alreadySpent: spentBeforeLoad,
       );
       if (!mounted || _loggingOut || generation != _loadGeneration) {
         _tr('plan-result DISCARDED (a newer load exists or the screen is gone): ${plan.runtimeType}');
@@ -1392,6 +1562,7 @@ $_captureChannel.postMessage(JSON.stringify({
           _online = false;
           _errorText = null;
           _recoverable = !widget.forceOffline;
+          _noSnapshotReason = plan.reason;
           if (plan.timedOut) {
             // Preparing the view ran out of time. A copy may well exist (a slow
             // moment is not "there is none"): try once more, and if that fails
@@ -1408,20 +1579,7 @@ $_captureChannel.postMessage(JSON.stringify({
           _scheduleRecovery();
           setState(() => _state = _LoadState.noSnapshot);
         case PageLoadServerError():
-          // The server answered, so this is neither "offline" nor a load
-          // still in progress: stop every pending wait and say what the
-          // server said (sanitized), with the ways out.
-          _online = false;
-          _afterHandoffPath = null;
-          _banner = null;
-          _offlineLoadUrl = null;
-          _navigationDeadline?.cancel();
-          _navigationDeadline = null;
-          _totalDeadline?.cancel();
-          _totalDeadline = null;
-          _serverError = plan;
-          _errorText = describeServerError(plan);
-          setState(() => _state = _LoadState.error);
+          _applyServerError(plan);
       }
     } catch (_) {
       if (mounted && generation == _loadGeneration)
@@ -1543,13 +1701,16 @@ $_captureChannel.postMessage(JSON.stringify({
                                       Icon(
                                         _serverError != null
                                             ? Icons.error_outline
-                                            : Icons.wifi_off,
+                                            : (_state == _LoadState.noSnapshot &&
+                                                      _noSnapshotReason != OfflineReason.noNetwork
+                                                  ? Icons.cloud_off
+                                                  : Icons.wifi_off),
                                         size: 48,
                                       ),
                                       const SizedBox(height: 16),
                                       Text(
                                         _state == _LoadState.noSnapshot
-                                            ? 'Brak zapisanej wersji tej strony. Otwórz ją przy połączeniu z internetem.'
+                                            ? _noSnapshotText()
                                             : (_errorText ??
                                                   'Nie udało się otworzyć strony.'),
                                         textAlign: TextAlign.center,

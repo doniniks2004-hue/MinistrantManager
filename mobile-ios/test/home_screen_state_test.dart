@@ -13,6 +13,7 @@ import 'package:ministrant_manager/core/offline/snapshot_capture_service.dart';
 import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
 import 'package:ministrant_manager/core/offline/snapshot_store.dart';
 import 'package:ministrant_manager/core/secure/secure_storage_service.dart';
+import 'package:ministrant_manager/core/security/access_refusals.dart' show AccessRefusals;
 import 'package:ministrant_manager/core/sync/offline_lease.dart';
 import 'package:ministrant_manager/core/sync/sync_engine.dart';
 import 'package:ministrant_manager/features/auth/user_session_service.dart';
@@ -111,6 +112,9 @@ void main() {
   final store = <String, String>{};
   var failReads = false;
   var hangReads = false;
+  // Only the refusal records ("refusal_*"): the rest of the keystore keeps answering.
+  var failRefusalReads = false;
+  var hangRefusalReads = false;
 
   setUpAll(() {
     TestWidgetsFlutterBinding.ensureInitialized();
@@ -125,12 +129,18 @@ void main() {
     store.clear();
     failReads = false;
     hangReads = false;
+    failRefusalReads = false;
+    hangRefusalReads = false;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(_channel, (call) async {
       final args = call.arguments as Map?;
       final key = args?['key'] as String?;
       switch (call.method) {
         case 'read':
+          if (key != null && key.startsWith('refusal_')) {
+            if (failRefusalReads) throw PlatformException(code: 'keystore-unavailable');
+            if (hangRefusalReads) return Completer<Object?>().future;
+          }
           if (failReads) throw PlatformException(code: 'keystore-unavailable');
           if (hangReads) return Completer<Object?>().future; // never answers
           return key == null ? null : store[key];
@@ -167,6 +177,10 @@ void main() {
       DeviceAuthState.parishDisabled: true,
       DeviceAuthState.updateRequired: true,
       DeviceAuthState.authError: true,
+      // A refusal the server gave and the app remembers: never the live page, and no copy either.
+      DeviceAuthState.tokenRejected: true,
+      // Whether a refusal stands could not be found out: nothing saved is opened either.
+      DeviceAuthState.refusalUnknown: true,
     };
 
     test('every state is classified', () {
@@ -277,5 +291,65 @@ void main() {
 
     expect(find.textContaining('Nie udało się odczytać danych aplikacji'), findsNothing);
     expect(find.textContaining(missingData), findsOneWidget, reason: 'the retry really re-read');
+  });
+
+  group('a refusal record that cannot be read is NOT "no refusal"', () {
+    void signedInDevice() {
+      store['device_token'] = 'device-token-A';
+      store['mobile_user_token'] = 'token';
+      store['current_user_id'] = '7';
+      store['parish_id'] = 'szarlej';
+      store['server_url'] = 'https://szarlej.ministrant.eu';
+    }
+
+    const unknownText = 'Nie można ustalić, czy to urządzenie ma zablokowany dostęp';
+
+    testWidgets('a failing read stops the start: nothing is shown, nothing is erased, and there is a retry', (tester) async {
+      signedInDevice();
+      failRefusalReads = true;
+      await tester.pumpWidget(_home(sharedDb));
+      await _settle(tester);
+
+      expect(find.textContaining(unknownText), findsOneWidget);
+      expect(find.text('SPRÓBUJ PONOWNIE'), findsOneWidget);
+      expect(find.byType(spinner), findsNothing);
+      expect(store['device_token'], 'device-token-A', reason: 'nothing was erased');
+      expect(store['parish_id'], 'szarlej');
+    });
+
+    testWidgets('a read that never answers is cut off, and ends in the same screen (not in "no refusal")', (tester) async {
+      signedInDevice();
+      hangRefusalReads = true;
+      await tester.pumpWidget(_home(sharedDb));
+      await tester.pump(const Duration(seconds: 6)); // past the keystore limit of the refusal records
+      await _settle(tester);
+
+      expect(find.textContaining(unknownText), findsOneWidget);
+      expect(find.text('SPRÓBUJ PONOWNIE'), findsOneWidget);
+    });
+
+    testWidgets('when the keystore recovers, the retry asks again and the screen is left', (tester) async {
+      signedInDevice();
+      failRefusalReads = true;
+      await tester.pumpWidget(_home(sharedDb));
+      await _settle(tester);
+      expect(find.textContaining(unknownText), findsOneWidget);
+
+      failRefusalReads = false;
+      await tester.tap(find.text('SPRÓBUJ PONOWNIE'));
+      await _settle(tester);
+      expect(find.textContaining(unknownText), findsNothing);
+    });
+
+    testWidgets('a readable refusal that stands still shows the refusal screen, not this one', (tester) async {
+      signedInDevice();
+      final fp = AccessRefusals.fingerprint('device-token-A');
+      store['refusal_device'] = '{"tf":"$fp","src":"central_401","at":"2026-10-22T09:00:00.000Z"}';
+      await tester.pumpWidget(_home(sharedDb));
+      await _settle(tester);
+
+      expect(find.textContaining('Serwer odrzucił autoryzację tego urządzenia'), findsOneWidget);
+      expect(find.textContaining(unknownText), findsNothing);
+    });
   });
 }

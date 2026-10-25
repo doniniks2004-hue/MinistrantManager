@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:ministrant_manager/core/offline/snapshot_crypto_vector.dart';
 import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
 import 'package:ministrant_manager/selftest/platform_selftest.dart';
 import 'package:ministrant_manager/selftest/selftest_report.dart';
@@ -65,6 +66,7 @@ void main() {
 
       for (final name in [
         'crypto.openssl_vector_dart_opens',
+        'crypto.openssl_vector_refused_under_another_key',
         'crypto.tampered_payload_refused',
         'store.encrypted_roundtrip',
         'server.loopback_http',
@@ -95,6 +97,17 @@ void main() {
         pagePath: PlatformSelfTest.pagePath,
       );
       expect(found, isNotNull);
+    });
+
+    test('REGRESSION: the OpenSSL vector opens under ITS key and is refused under the harness key', () {
+      // The harness once opened the vector with the key the saved page uses and got
+      // InvalidCipherTextException; that was correct, the vector was sealed with
+      // another key. The two keys are different, on purpose.
+      expect(PlatformSelfTest.hexKey, isNot(snapshotVectorKeyHex));
+      final sealed = snapshotVectorBytes(snapshotVectorSealedHex);
+      final plain = snapshotVectorBytes(snapshotVectorPlainHex);
+      expect(SnapshotEncryptor(hexKey: snapshotVectorKeyHex).decryptBytes(sealed), plain);
+      expect(() => SnapshotEncryptor(hexKey: PlatformSelfTest.hexKey).decryptBytes(sealed), throwsA(anything));
     });
 
     test('the stand-in page has the sizes of a real dashboard', () {

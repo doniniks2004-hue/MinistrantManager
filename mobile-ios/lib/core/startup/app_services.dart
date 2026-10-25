@@ -10,6 +10,8 @@ import '../offline/snapshot_capture_service.dart';
 import '../offline/snapshot_encryptor.dart';
 import '../offline/snapshot_store.dart';
 import '../secure/secure_storage_service.dart';
+import '../security/access_refusals.dart';
+import '../security/wipe_lock.dart';
 import '../sync/sync_engine.dart';
 import '../../features/activation/activation_service.dart';
 import '../../features/auth/user_session_service.dart';
@@ -95,12 +97,18 @@ Future<AppServices> buildAppServices(
     // the exact same instance.
     final snapshotEncryptor = SnapshotEncryptor(hexKey: snapshotKey);
     final snapshotStore = SnapshotStore(encryptor: snapshotEncryptor);
-    final syncEngine =
-        SyncEngine(db: db, api: api, secureStorage: secureStorage);
+    // ONE record of what the server has refused, shared by the device check and the page loading:
+    // a refusal received by either is known to both.
+    final refusals = AccessRefusals(secureStorage.refusalStorage);
+    final syncEngine = SyncEngine(
+        db: db, api: api, secureStorage: secureStorage, refusals: refusals);
     final activationService =
         ActivationService(api: api, secureStorage: secureStorage);
+    // ONE lock for "this device's data is being erased / not yet erased": held by the handler,
+    // obeyed by the coordinator that hands out saved copies, and by the screen that shows the panel.
+    final wipeLock = WipeLock();
     final revocationHandler = RevocationHandler(
-        db: db, secureStorage: secureStorage, snapshotStore: snapshotStore);
+        db: db, secureStorage: secureStorage, snapshotStore: snapshotStore, wipeLock: wipeLock);
     final configService = ConfigService(db: db, api: api);
     final userSessionService = UserSessionService(
         api: api,
@@ -120,6 +128,9 @@ Future<AppServices> buildAppServices(
       snapshotStore: snapshotStore,
       localServer: LocalSnapshotServer(encryptor: snapshotEncryptor),
       handoffService: handoffService,
+      refusals: refusals,
+      reverifyDevice: syncEngine.reverifyDevice,
+      wipeLock: wipeLock,
     );
 
     return AppServices(

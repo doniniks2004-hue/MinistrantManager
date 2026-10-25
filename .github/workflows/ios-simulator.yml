@@ -30,7 +30,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Test the helper scripts
-        run: python3 .github/scripts/test_ios_scripts.py
+        run: |
+          python3 .github/scripts/test_ios_scripts.py
+          python3 .github/scripts/test_android_offline_acceptance.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test the page-side panel probe (jsdom)
+        run: |
+          npm install --no-save --no-package-lock jsdom@24.1.0
+          node --test .github/scripts/panel_probe_test.mjs
       - name: Check the iOS project files
         run: python3 .github/scripts/ios_static_checks.py --root . --json static-source.json
       - uses: actions/upload-artifact@v4
@@ -67,16 +76,42 @@ jobs:
       - name: Build the self-test app (simulator, debug)
         run: |
           set -euo pipefail
-          flutter build ios --simulator --debug --no-codesign -t lib/selftest/main_selftest.dart
+          mkdir -p "$GITHUB_WORKSPACE/results/logs"
+          # Ad hoc SIGNED (a simulator needs no account for it) rather than --no-codesign.
+          # The reason is a HYPOTHESIS, not an established fact: that an app with no signature
+          # has no entitlements and the Keychain refuses it with -34018 ("a required
+          # entitlement is not present"), and that the app, which reads the Keychain before it
+          # draws its first screen, therefore stops at its startup error screen. The signed
+          # build is an ATTEMPT to see whether that is so; the unsigned build is the fallback.
+          # Which one was used is recorded, and the report (section 1b) calls the signing
+          # confirmed only if this run shows the activation screen reached and no -34018.
+          if flutter build ios --simulator --debug -t lib/selftest/main_selftest.dart; then
+            echo "selftest: built with the default (ad hoc) signing" >> "$GITHUB_WORKSPACE/results/logs/build-signing.txt"
+          else
+            echo "::warning::the signed simulator build of the self-test failed; falling back to --no-codesign (the Keychain will not work in it)"
+            flutter build ios --simulator --debug --no-codesign -t lib/selftest/main_selftest.dart
+            echo "selftest: built with --no-codesign (FALLBACK: no entitlements)" >> "$GITHUB_WORKSPACE/results/logs/build-signing.txt"
+          fi
           mkdir -p "$RUNNER_TEMP/apps/selftest"
           cp -R build/ios/iphonesimulator/Runner.app "$RUNNER_TEMP/apps/selftest/Runner.app"
+          codesign -dvvv --entitlements :- "$RUNNER_TEMP/apps/selftest/Runner.app" > "$GITHUB_WORKSPACE/results/logs/codesign-selftest.txt" 2>&1 || true
 
       - name: Build the production app (simulator, debug)
         run: |
           set -euo pipefail
-          flutter build ios --simulator --debug --no-codesign
+          mkdir -p "$GITHUB_WORKSPACE/results/logs"
+          if flutter build ios --simulator --debug; then
+            echo "production: built with the default (ad hoc) signing" >> "$GITHUB_WORKSPACE/results/logs/build-signing.txt"
+          else
+            echo "::warning::the signed simulator build of the app failed; falling back to --no-codesign (the Keychain will not work in it)"
+            flutter build ios --simulator --debug --no-codesign
+            echo "production: built with --no-codesign (FALLBACK: no entitlements)" >> "$GITHUB_WORKSPACE/results/logs/build-signing.txt"
+          fi
           mkdir -p "$RUNNER_TEMP/apps/prod"
           cp -R build/ios/iphonesimulator/Runner.app "$RUNNER_TEMP/apps/prod/Runner.app"
+          codesign -dvvv --entitlements :- "$RUNNER_TEMP/apps/prod/Runner.app" > "$GITHUB_WORKSPACE/results/logs/codesign-production.txt" 2>&1 || true
+          echo "--- what the built app is signed with ---"
+          cat "$GITHUB_WORKSPACE/results/logs/codesign-production.txt" | head -40 || true
 
       - name: Prepare the results folder
         run: mkdir -p "$GITHUB_WORKSPACE/results" "$GITHUB_WORKSPACE/results/logs"
@@ -214,17 +249,28 @@ jobs:
           xcrun simctl launch --console "$UDID" "$BUNDLE_ID" > results/logs/production-app.log 2>&1 &
           LAUNCH_PID=$!
 
+          # Wait for a TERMINAL screen: the activation screen, or the startup error screen
+          # (which says why). "first_frame" only means the app drew something and has not
+          # finished starting; if that is all there is after the time is up, that is what
+          # the report says.
+          terminal() {
+            MARKER="$1" python3 -c "import json,os,sys; d=json.load(open(os.environ['MARKER'])); sys.exit(0 if d.get('screen') in ('activation_screen','startup_error') else 1)" 2>/dev/null
+          }
           deadline=$(( $(date +%s) + 120 ))
           while [ "$(date +%s)" -lt "$deadline" ]; do
             DIR="$(data_dir)"
-            if [ -n "$DIR" ] && [ -f "$DIR/Documents/mm_ui_marker.json" ]; then
-              cp "$DIR/Documents/mm_ui_marker.json" results/ui_marker.json
-              echo "the app reported its first screen:"; cat results/ui_marker.json; echo
+            if [ -n "$DIR" ] && [ -f "$DIR/Documents/mm_ui_marker.json" ] && terminal "$DIR/Documents/mm_ui_marker.json"; then
               break
             fi
             sleep 0.5
           done
-          [ -f results/ui_marker.json ] || echo "::error::the production app did not reach a screen that reports itself within 120 s"
+          DIR="$(data_dir)"
+          if [ -n "$DIR" ] && [ -f "$DIR/Documents/mm_ui_marker.json" ]; then
+            cp "$DIR/Documents/mm_ui_marker.json" results/ui_marker.json
+            echo "what the app reported:"; cat results/ui_marker.json; echo
+          else
+            echo "::error::the production app wrote no marker at all in 120 s (no frame was drawn, or the reporting failed)"
+          fi
 
           sleep 2
           xcrun simctl io "$UDID" screenshot results/activation-screen.png || true

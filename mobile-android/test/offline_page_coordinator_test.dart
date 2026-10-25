@@ -16,6 +16,8 @@ import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
 import 'package:ministrant_manager/core/offline/snapshot_manifest.dart';
 import 'package:ministrant_manager/core/offline/snapshot_store.dart';
 import 'package:ministrant_manager/core/secure/secure_storage_service.dart';
+import 'package:ministrant_manager/core/security/access_refusals.dart';
+import 'package:ministrant_manager/core/sync/sync_engine.dart' show DeviceAuthState;
 import 'package:ministrant_manager/features/webview/webview_handoff_service.dart';
 
 /// P10 fix: a test double for WebviewHandoffService, which
@@ -85,6 +87,18 @@ class _FakeHandoffService extends WebviewHandoffService {
   }
 }
 
+/// A handoff service whose keystore cannot give the device token (a failing read, not "not activated").
+class _TokenFailsHandoff extends _FakeHandoffService {
+  _TokenFailsHandoff() : super(_TokenFailsStorage()) {
+    handoffUrlToReturn = Uri.parse('https://szarlej.ministrant.eu/public/mobile_handoff.php?ticket=t');
+  }
+}
+
+class _TokenFailsStorage extends SecureStorageService {
+  @override
+  Future<String?> get deviceToken async => throw PlatformException(code: 'keystore-unavailable');
+}
+
 DioException _httpError(int status, [Object? data]) {
   final request = RequestOptions(path: '/mobile/webview/handoff');
   return DioException(
@@ -124,6 +138,27 @@ class _GatedStore extends SnapshotStore {
       userId: userId,
       pagePath: pagePath,
     );
+  }
+}
+
+/// A store whose manifest reads can be slow or fail, and which counts them.
+class _ReadingStore extends SnapshotStore {
+  _ReadingStore(Directory root) : super(encryptor: _testEncryptor, rootOverride: root);
+
+  Duration readDelay = Duration.zero;
+  Object? readFailure;
+  int reads = 0;
+
+  @override
+  Future<SnapshotManifest?> readManifestFor({
+    required String parishId,
+    required String userId,
+    required String pagePath,
+  }) async {
+    reads++;
+    if (readDelay > Duration.zero) await Future<void>.delayed(readDelay);
+    if (readFailure != null) throw readFailure!;
+    return super.readManifestFor(parishId: parishId, userId: userId, pagePath: pagePath);
   }
 }
 
@@ -215,14 +250,28 @@ void main() {
       'plugins.it_nomads.com/flutter_secure_storage',
     );
     final fakeStore = <String, String>{};
+    // Failures of the keystore for the refusal records only ("refusal_*").
+    var failRefusalReads = false;
+    var failRefusalWrites = false;
+    var failRefusalDeletes = false;
 
     setUp(() {
       TestWidgetsFlutterBinding.ensureInitialized();
       fakeStore.clear();
+      failRefusalReads = failRefusalWrites = failRefusalDeletes = false;
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(secureStorageChannel, (call) async {
             final args = call.arguments as Map?;
             final key = args?['key'] as String?;
+            if (key != null && key.startsWith('refusal_')) {
+              final broken = switch (call.method) {
+                'read' => failRefusalReads,
+                'write' => failRefusalWrites,
+                'delete' => failRefusalDeletes,
+                _ => false,
+              };
+              if (broken) throw PlatformException(code: 'keystore-unavailable');
+            }
             switch (call.method) {
               case 'read':
                 return key != null ? fakeStore[key] : null;
@@ -274,6 +323,75 @@ void main() {
       }
     });
 
+    group('a saved copy that this install cannot read (another key, damaged, an older format)', () {
+      OfflinePageCoordinator coordinatorOver(SnapshotStore withStore) => OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: SnapshotCaptureService(downloader: PageResourceDownloader(), store: withStore),
+        snapshotStore: withStore,
+        localServer: localServer,
+        handoffService: _FakeHandoffService(SecureStorageService()),
+      );
+
+      Future<void> saveWith(SnapshotStore target, String html) => target.writeSnapshot(
+        parishId: 'p',
+        userId: 'u',
+        pagePath: '/public/ranking.php',
+        html: html,
+        assets: {'public/css/style.css': utf8.encode('body{}')},
+      );
+
+      test('is read as "no copy": no exception, no loop, and the answer is the same every time', () async {
+        // Saved by an install whose key is lost (a restored backup, a rotated key).
+        await saveWith(SnapshotStore(encryptor: SnapshotEncryptor(hexKey: 'a' * 64), rootOverride: tempRoot), '<html>old</html>');
+        final coordinator = coordinatorOver(store); // this install: _testEncryptor, another key
+
+        for (var attempt = 0; attempt < 3; attempt++) {
+          final plan = await coordinator.plan(parishId: 'p', userId: 'u', targetPath: '/public/ranking.php', forceOffline: true);
+          expect(plan, isA<PageLoadOfflineNoSnapshot>(), reason: 'attempt $attempt');
+          expect((plan as PageLoadOfflineNoSnapshot).timedOut, isFalse, reason: 'it is not a timeout: nothing to open');
+        }
+        expect(await coordinator.hasSavedCopy(parishId: 'p', userId: 'u', pagePath: '/public/ranking.php'), isFalse);
+        expect(localServer.rootDirectory, isNull, reason: 'nothing unreadable was handed to the server');
+      });
+
+      test('the next capture REPLACES it, and the new copy opens', () async {
+        await saveWith(SnapshotStore(encryptor: SnapshotEncryptor(hexKey: 'a' * 64), rootOverride: tempRoot), '<html>old</html>');
+        final coordinator = coordinatorOver(store);
+        expect(await coordinator.plan(parishId: 'p', userId: 'u', targetPath: '/public/ranking.php', forceOffline: true), isA<PageLoadOfflineNoSnapshot>());
+
+        await saveWith(store, '<html>new</html>');
+
+        final plan = await coordinator.plan(parishId: 'p', userId: 'u', targetPath: '/public/ranking.php', forceOffline: true);
+        expect(plan, isA<PageLoadOffline>());
+        final client = HttpClient();
+        addTearDown(() => client.close(force: true));
+        final response = await (await client.getUrl((plan as PageLoadOffline).url)).close();
+        final body = await response.transform(utf8.decoder).join();
+        expect(response.statusCode, 200);
+        expect(body, contains('new'));
+      });
+
+      test('a copy whose manifest opens but whose PAGE does not is refused by the server (500), not served and not hung', () async {
+        await saveWith(store, '<html>fine</html>');
+        final dir = (await store.getPageDirectoryIfReady(parishId: 'p', userId: 'u', pagePath: '/public/ranking.php'))!;
+        final page = File('${dir.path}/snapshot.html');
+        final bytes = page.readAsBytesSync();
+        bytes[bytes.length - 1] ^= 0xff; // a changed byte in the authentication tag
+        page.writeAsBytesSync(bytes);
+
+        final coordinator = coordinatorOver(store);
+        final plan = await coordinator.plan(parishId: 'p', userId: 'u', targetPath: '/public/ranking.php', forceOffline: true);
+        expect(plan, isA<PageLoadOffline>(), reason: 'the manifest is fine: it is the page that fails, when asked');
+
+        final client = HttpClient();
+        addTearDown(() => client.close(force: true));
+        final response = await (await client.getUrl((plan as PageLoadOffline).url)).close().timeout(const Duration(seconds: 5));
+        await response.drain<void>();
+        expect(response.statusCode, 500, reason: 'integrity failure: refused, never served');
+        expect(localServer.isRunning, isTrue, reason: 'one bad file does not take the server down');
+      });
+    });
+
     test('an offline plan after the app was away: the dead listener is replaced, the URL answers', () async {
       final coordinator = OfflinePageCoordinator(
         connectivityProbe: ConnectivityProbe(),
@@ -307,6 +425,588 @@ void main() {
         timeout: const Duration(seconds: 1),
       );
       socket.destroy(); // the plan's address is a live one
+    });
+
+    test('a plan with no copy carries WHY the live page could not be had (not always "no network")', () async {
+      final coordinator = OfflinePageCoordinator(
+        connectivityProbe: ConnectivityProbe(),
+        captureService: captureService,
+        snapshotStore: store,
+        localServer: localServer,
+        handoffService: _FakeHandoffService(SecureStorageService()),
+      );
+      for (final reason in OfflineReason.values) {
+        final plan = await coordinator.plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/never-saved.php',
+          forceOffline: true,
+          offlineReason: reason,
+        );
+        expect((plan as PageLoadOfflineNoSnapshot).reason, reason);
+      }
+    });
+
+    group('what is known about the saved copy, and the start budget shared with the handoff', () {
+      OfflinePageCoordinator make(SnapshotStore st, _FakeHandoffService handoff, {Duration plan = const Duration(milliseconds: 100)}) =>
+          OfflinePageCoordinator(
+            connectivityProbe: ConnectivityProbe(),
+            captureService: SnapshotCaptureService(downloader: PageResourceDownloader(), store: st),
+            snapshotStore: st,
+            localServer: localServer,
+            handoffService: handoff,
+            offlinePlanTimeout: plan,
+          );
+
+      test('the handoff gets: little time with a copy, a first handoff\'s time with none, what is left when unknown', () {
+        final c = make(store, _FakeHandoffService(SecureStorageService()));
+        expect(c.handoffBudgetFor(SavedCopyFact.exists), c.onlineTimeout);
+        expect(c.handoffBudgetFor(SavedCopyFact.exists, spent: const Duration(seconds: 2)), c.onlineTimeout);
+        expect(c.handoffBudgetFor(SavedCopyFact.absent), c.firstOnlineTimeout);
+        expect(c.handoffBudgetFor(SavedCopyFact.unknown, spent: const Duration(milliseconds: 400)),
+            c.firstOnlineTimeout - const Duration(milliseconds: 400));
+        expect(c.handoffBudgetFor(SavedCopyFact.unchecked, spent: const Duration(milliseconds: 400)),
+            c.firstOnlineTimeout - const Duration(milliseconds: 400));
+        expect(c.handoffBudgetFor(SavedCopyFact.unknown, spent: const Duration(seconds: 10)), c.onlineTimeout,
+            reason: 'never less than the ordinary handoff time');
+        expect(c.handoffBudgetFor(SavedCopyFact.unknown), c.firstOnlineTimeout);
+      });
+
+      test('savedCopyFact: a manifest is "exists", none is "absent", a slow or failing read is "unknown" and never "absent"', () async {
+        final reading = _ReadingStore(tempRoot);
+        final c = make(reading, _FakeHandoffService(SecureStorageService()));
+        await reading.writeSnapshot(parishId: 'p', userId: 'u', pagePath: '/public/ranking.php', html: '<html>R</html>', assets: {});
+        expect(await c.savedCopyFact(parishId: 'p', userId: 'u', pagePath: '/public/ranking.php'), SavedCopyFact.exists);
+        expect(await c.savedCopyFact(parishId: 'p', userId: 'u', pagePath: '/public/never.php'), SavedCopyFact.absent);
+        reading.readDelay = const Duration(milliseconds: 400); // over the 100 ms plan limit
+        expect(await c.savedCopyFact(parishId: 'p', userId: 'u', pagePath: '/public/ranking.php'), SavedCopyFact.unknown);
+        reading.readDelay = Duration.zero;
+        reading.readFailure = StateError('manifest unreadable');
+        expect(await c.savedCopyFact(parishId: 'p', userId: 'u', pagePath: '/public/ranking.php'), SavedCopyFact.unknown);
+        // and hasSavedCopy keeps its meaning for the screens that use it (a failed read is not a copy)
+        expect(await c.hasSavedCopy(parishId: 'p', userId: 'u', pagePath: '/public/ranking.php'), isFalse);
+      });
+
+      test('REGRESSION: the system said "no network", the copy read was slow, the server IS reachable: the live page is the result', () async {
+        final reading = _ReadingStore(tempRoot)..readDelay = const Duration(milliseconds: 400);
+        final handoff = _FakeHandoffService(SecureStorageService())
+          ..handoffUrlToReturn = Uri.parse('https://szarlej.ministrant.eu/public/mobile_handoff.php?ticket=t');
+        final c = make(reading, handoff);
+        final plan = await c.plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/dashboard.php',
+          copyFact: SavedCopyFact.unknown,
+          alreadySpent: const Duration(milliseconds: 400),
+        );
+        expect(plan, isA<PageLoadOnline>());
+        expect(handoff.calls, 1);
+        expect(reading.reads, 0, reason: 'the manifest the caller could not read in time is NOT read again, with a timeout of its own');
+        expect(handoff.lastTimeout, c.firstOnlineTimeout - const Duration(milliseconds: 400));
+      });
+
+      test('a plan asked to find out itself spends that time out of the handoff\'s, not on top of it', () async {
+        final reading = _ReadingStore(tempRoot)..readDelay = const Duration(milliseconds: 400);
+        final handoff = _FakeHandoffService(SecureStorageService())
+          ..handoffUrlToReturn = Uri.parse('https://szarlej.ministrant.eu/public/mobile_handoff.php?ticket=t');
+        final c = make(reading, handoff);
+        await c.plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php');
+        expect(reading.reads, 1);
+        expect(handoff.lastTimeout!, lessThan(c.firstOnlineTimeout), reason: 'the 100 ms the unfinished read used came off the budget');
+        expect(handoff.lastTimeout!, greaterThanOrEqualTo(c.onlineTimeout));
+      });
+
+      test('a copy the caller already knows to exist is not looked for again before the handoff', () async {
+        final reading = _ReadingStore(tempRoot);
+        await reading.writeSnapshot(parishId: 'p', userId: 'u', pagePath: '/public/dashboard.php', html: '<html>D</html>', assets: {});
+        Future<int> readsFor(SavedCopyFact fact) async {
+          reading.reads = 0;
+          final handoff = _FakeHandoffService(SecureStorageService())..errorToThrow = DioException(
+            requestOptions: RequestOptions(path: '/x'),
+            type: DioExceptionType.connectionError,
+          );
+          final c = make(reading, handoff, plan: const Duration(seconds: 2));
+          final plan = await c.plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php', copyFact: fact);
+          expect(plan, isA<PageLoadOffline>(), reason: 'the handoff failed, the copy is shown');
+          return reading.reads;
+        }
+        final known = await readsFor(SavedCopyFact.exists);
+        final asked = await readsFor(SavedCopyFact.unchecked);
+        expect(asked, known + 1, reason: 'exactly the one read the caller had already done');
+      });
+
+      test('when the server is NOT reachable the copy is still shown, with the failure\'s own reason, not a store timeout', () async {
+        final reading = _ReadingStore(tempRoot);
+        await reading.writeSnapshot(parishId: 'p', userId: 'u', pagePath: '/public/dashboard.php', html: '<html>D</html>', assets: {});
+        final handoff = _FakeHandoffService(SecureStorageService())..errorToThrow = _httpError(503);
+        final c = make(reading, handoff, plan: const Duration(seconds: 2));
+        final plan = await c.plan(
+          parishId: 'p',
+          userId: 'u',
+          targetPath: '/public/dashboard.php',
+          copyFact: SavedCopyFact.unknown,
+          alreadySpent: const Duration(milliseconds: 400),
+        );
+        expect(plan, isA<PageLoadOffline>());
+        expect((plan as PageLoadOffline).reason, OfflineReason.serverUnavailable);
+      });
+    });
+
+    group('a refusal the server gave is not bypassed by the saved copy', () {
+      late _ReadingStore reading;
+      late _FakeHandoffService handoff;
+      late OfflinePageCoordinator c;
+
+      Future<void> save(String page, {String user = 'u'}) =>
+          reading.writeSnapshot(parishId: 'p', userId: user, pagePath: page, html: '<html>$page</html>', assets: {});
+
+      setUp(() async {
+        fakeStore['device_token'] = 'device-token-A';
+        reading = _ReadingStore(tempRoot);
+        handoff = _FakeHandoffService(SecureStorageService())
+          ..handoffUrlToReturn = Uri.parse('https://szarlej.ministrant.eu/public/mobile_handoff.php?ticket=t');
+        c = OfflinePageCoordinator(
+          connectivityProbe: ConnectivityProbe(),
+          captureService: SnapshotCaptureService(downloader: PageResourceDownloader(), store: reading),
+          snapshotStore: reading,
+          localServer: localServer,
+          handoffService: handoff,
+        );
+        await save('/public/dashboard.php');
+        await save('/public/ranking.php');
+      });
+
+      Future<PageLoadPlan> online(String page, {String user = 'u'}) =>
+          c.plan(parishId: 'p', userId: user, targetPath: page);
+      Future<PageLoadPlan> offlineOnly(String page, {String user = 'u'}) =>
+          c.plan(parishId: 'p', userId: user, targetPath: page, forceOffline: true);
+
+      // ---- 403 forbidden: the user's role has no access to the module
+
+      test('403 forbidden blocks THAT module: the reply says so and offers no copy, even though one exists', () async {
+        handoff.errorToThrow = _httpError(403, {'error': 'forbidden', 'message': 'Brak uprawnień do tego modułu.'});
+        final plan = await online('/public/ranking.php');
+        expect(plan, isA<PageLoadServerError>());
+        final e = plan as PageLoadServerError;
+        expect(e.refusal, HandoffRefusal.module);
+        expect(e.hasSnapshot, isFalse);
+        expect(e.remembered, isFalse);
+      });
+
+      test('a LATER start with no connection does not open that module\'s copy (direct entry, not only a hidden button)', () async {
+        handoff.errorToThrow = _httpError(403, {'error': 'forbidden'});
+        await online('/public/ranking.php');
+        final offlinePlan = await offlineOnly('/public/ranking.php');
+        expect(offlinePlan, isA<PageLoadServerError>(), reason: 'was PageLoadOffline before the refusal');
+        expect((offlinePlan as PageLoadServerError).remembered, isTrue);
+        expect(offlinePlan.refusal, HandoffRefusal.module);
+        expect(localServer.rootDirectory, isNull, reason: 'nothing is being served');
+        expect(await c.hasSavedCopy(parishId: 'p', userId: 'u', pagePath: '/public/ranking.php'), isFalse);
+        expect(await c.savedCopyFact(parishId: 'p', userId: 'u', pagePath: '/public/ranking.php'), SavedCopyFact.absent);
+      });
+
+      test('the refusal survives a restart: a coordinator built afterwards on the same storage still refuses', () async {
+        handoff.errorToThrow = _httpError(403, {'error': 'forbidden'});
+        await online('/public/ranking.php');
+        final restarted = OfflinePageCoordinator(
+          connectivityProbe: ConnectivityProbe(),
+          captureService: SnapshotCaptureService(downloader: PageResourceDownloader(), store: reading),
+          snapshotStore: reading,
+          localServer: localServer,
+          handoffService: _FakeHandoffService(SecureStorageService()),
+        );
+        final plan = await restarted.plan(parishId: 'p', userId: 'u', targetPath: '/public/ranking.php', forceOffline: true);
+        expect(plan, isA<PageLoadServerError>());
+      });
+
+      test('other modules of the same user keep working offline', () async {
+        handoff.errorToThrow = _httpError(403, {'error': 'forbidden'});
+        await online('/public/ranking.php');
+        expect(await offlineOnly('/public/dashboard.php'), isA<PageLoadOffline>());
+      });
+
+      test('another user of the same parish is not affected', () async {
+        await save('/public/ranking.php', user: 'other');
+        handoff.errorToThrow = _httpError(403, {'error': 'forbidden'});
+        await online('/public/ranking.php');
+        expect(await offlineOnly('/public/ranking.php', user: 'other'), isA<PageLoadOffline>());
+      });
+
+      test('a page opened THROUGH the blocked module (another page, entry = the module) is refused too', () async {
+        await save('/public/ranking_detail.php');
+        handoff.errorToThrow = _httpError(403, {'error': 'forbidden'});
+        await c.plan(parishId: 'p', userId: 'u', targetPath: '/public/ranking_detail.php', handoffPath: '/public/ranking.php');
+        final viaEntry = await c.plan(
+          parishId: 'p', userId: 'u', targetPath: '/public/ranking_detail.php', handoffPath: '/public/ranking.php', forceOffline: true,
+        );
+        expect(viaEntry, isA<PageLoadServerError>());
+      });
+
+      test('it is lifted ONLY by the server accepting a handoff for that module', () async {
+        handoff.errorToThrow = _httpError(403, {'error': 'forbidden'});
+        await online('/public/ranking.php');
+        expect(await offlineOnly('/public/ranking.php'), isA<PageLoadServerError>());
+
+        handoff.errorToThrow = null; // the role was granted: the handoff is accepted
+        expect(await online('/public/ranking.php'), isA<PageLoadOnline>());
+        await Future<void>.delayed(Duration.zero);
+        expect(await offlineOnly('/public/ranking.php'), isA<PageLoadOffline>());
+      });
+
+      test('a confirmed device (central ACTIVE) is not a lifted module: the refusal stands without any handoff', () async {
+        handoff.errorToThrow = _httpError(403, {'error': 'forbidden'});
+        await online('/public/ranking.php');
+        // (SyncEngine.liftDevice touches only the device record: see access_refusals_test)
+        expect(await offlineOnly('/public/ranking.php'), isA<PageLoadServerError>());
+      });
+
+      test('a 403 WITHOUT the module code (a firewall page, an unknown reason) blocks nothing and the copy is offered as before', () async {
+        handoff.errorToThrow = _httpError(403, '<html>blocked by firewall</html>');
+        final plan = await online('/public/ranking.php') as PageLoadServerError;
+        expect(plan.refusal, isNull);
+        expect(plan.hasSnapshot, isTrue);
+        expect(await offlineOnly('/public/ranking.php'), isA<PageLoadOffline>());
+      });
+
+      test('400 invalid_path (a module the server does not know) blocks nothing', () async {
+        handoff.errorToThrow = _httpError(400, {'error': 'invalid_path'});
+        final plan = await online('/public/ranking.php') as PageLoadServerError;
+        expect(plan.refusal, isNull);
+        expect(await offlineOnly('/public/ranking.php'), isA<PageLoadOffline>());
+      });
+
+      // ---- device_not_authorized
+
+      test('device_not_authorized + revoked: the DEVICE is refused, no copy is offered, and nothing is erased', () async {
+        handoff.errorToThrow = _httpError(403, {'error': 'device_not_authorized', 'device_state': 'revoked'});
+        final plan = await online('/public/dashboard.php') as PageLoadServerError;
+        expect(plan.refusal, HandoffRefusal.device);
+        expect(plan.hasSnapshot, isFalse);
+        expect(plan.deviceState, 'revoked');
+        expect(await reading.getPageDirectoryIfReady(parishId: 'p', userId: 'u', pagePath: '/public/dashboard.php'), isNotNull,
+            reason: 'refusing is not erasing: erasing is the central server\'s own DEVICE_REVOKED');
+      });
+
+      test('every state that says "no" refuses every page of the device afterwards, offline too', () async {
+        for (final state in ['revoked', 'parish_disabled', 'not_found', 'parish_mismatch']) {
+          fakeStore.remove('refusal_device');
+          handoff.errorToThrow = _httpError(403, {'error': 'device_not_authorized', 'device_state': state});
+          await online('/public/dashboard.php');
+          for (final page in ['/public/dashboard.php', '/public/ranking.php']) {
+            final plan = await offlineOnly(page);
+            expect(plan, isA<PageLoadServerError>(), reason: '$state / $page');
+            expect((plan as PageLoadServerError).refusal, HandoffRefusal.device);
+          }
+        }
+      });
+
+      test('the record holds no token', () async {
+        handoff.errorToThrow = _httpError(403, {'error': 'device_not_authorized', 'device_state': 'revoked'});
+        await online('/public/dashboard.php');
+        expect(fakeStore['refusal_device'], isNotNull);
+        expect(fakeStore['refusal_device'], isNot(contains('device-token-A')));
+      });
+
+      test('an UNKNOWN device_state is not a revocation: nothing is remembered, no copy is offered this time', () async {
+        handoff.errorToThrow = _httpError(403, {'error': 'device_not_authorized', 'device_state': 'something_new'});
+        final plan = await online('/public/dashboard.php') as PageLoadServerError;
+        expect(plan.refusal, isNull);
+        expect(plan.hasSnapshot, isFalse, reason: 'the server said "not authorized": a copy is not offered on top of that');
+        expect(fakeStore.containsKey('refusal_device'), isFalse);
+        expect(await offlineOnly('/public/dashboard.php'), isA<PageLoadOffline>(), reason: 'and nothing stands in the way of the next start');
+      });
+
+      test('a missing device_state likewise', () async {
+        handoff.errorToThrow = _httpError(403, {'error': 'device_not_authorized'});
+        final plan = await online('/public/dashboard.php') as PageLoadServerError;
+        expect(plan.refusal, isNull);
+        expect(fakeStore.containsKey('refusal_device'), isFalse);
+      });
+
+      test('central_unavailable (503) is "could not check": the copy is shown, nothing is remembered', () async {
+        handoff.errorToThrow = _httpError(503, {'error': 'device_not_authorized', 'device_state': 'central_unavailable'});
+        final plan = await online('/public/dashboard.php');
+        expect(plan, isA<PageLoadOffline>());
+        expect((plan as PageLoadOffline).reason, OfflineReason.serverUnavailable);
+        expect(fakeStore.containsKey('refusal_device'), isFalse);
+      });
+
+      test('a 401 of the handoff (the user\'s session) is not a refusal of the device or the module', () async {
+        handoff.errorToThrow = _httpError(401, {'error': 'invalid_token'});
+        final plan = await online('/public/dashboard.php') as PageLoadServerError;
+        expect(plan.refusal, isNull);
+        expect(fakeStore.keys.where((k) => k.startsWith('refusal_')), isEmpty);
+      });
+
+      // ---- the background probe (a copy is on screen)
+
+      test('the probe that meets 403 forbidden reports an unambiguous refusal and blocks the module; an accepted probe lifts it', () async {
+        handoff.errorToThrow = _httpError(403, {'error': 'forbidden'});
+        final rejected = await c.probeOnline(parishId: 'p', userId: 'u', targetPath: '/public/ranking.php');
+        expect(rejected, isA<OnlineProbeRejected>());
+        expect((rejected as OnlineProbeRejected).error.refusal, HandoffRefusal.module);
+        expect(await offlineOnly('/public/ranking.php'), isA<PageLoadServerError>());
+
+        handoff.errorToThrow = null;
+        expect(await c.probeOnline(parishId: 'p', userId: 'u', targetPath: '/public/ranking.php'), isA<OnlineProbeRecovered>());
+        await Future<void>.delayed(Duration.zero);
+        expect(await offlineOnly('/public/ranking.php'), isA<PageLoadOffline>());
+      });
+
+
+      // ---- a record that cannot be read is NOT "no refusal"
+
+      group('a refusal that cannot be READ keeps the saved copy shut', () {
+        // A coordinator with nothing in memory (a new process), over the same keystore.
+        OfflinePageCoordinator restarted() => OfflinePageCoordinator(
+              connectivityProbe: ConnectivityProbe(),
+              captureService: SnapshotCaptureService(downloader: PageResourceDownloader(), store: reading),
+              snapshotStore: reading,
+              localServer: localServer,
+              handoffService: handoff,
+            );
+
+        test('an unreadable device record: the copy is not opened, the plan says "cannot tell", nothing is erased', () async {
+          failRefusalReads = true;
+          final plan = await restarted().plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php', forceOffline: true);
+          expect(plan, isA<PageLoadServerError>(), reason: 'was PageLoadOffline: the bug');
+          final e = plan as PageLoadServerError;
+          expect(e.refusal, HandoffRefusal.unknown);
+          expect(e.hasSnapshot, isFalse);
+          expect(e.statusCode, isNull, reason: 'it is not a reply of the server');
+          expect(localServer.rootDirectory, isNull);
+          expect(await reading.getPageDirectoryIfReady(parishId: 'p', userId: 'u', pagePath: '/public/dashboard.php'), isNotNull,
+              reason: 'nothing is erased');
+        });
+
+        test('damaged text in the device record, or in the module record, is the same', () async {
+          fakeStore['refusal_device'] = '{not json';
+          var plan = await restarted().plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php', forceOffline: true);
+          expect((plan as PageLoadServerError).refusal, HandoffRefusal.unknown);
+          fakeStore.remove('refusal_device');
+          fakeStore['refusal_modules'] = 'garbage';
+          plan = await restarted().plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php', forceOffline: true);
+          expect((plan as PageLoadServerError).refusal, HandoffRefusal.unknown);
+        });
+
+        test('a device token that cannot be read is "cannot tell" too (not "not activated")', () async {
+          final broken = _TokenFailsHandoff();
+          final plan = await OfflinePageCoordinator(
+            connectivityProbe: ConnectivityProbe(),
+            captureService: SnapshotCaptureService(downloader: PageResourceDownloader(), store: reading),
+            snapshotStore: reading,
+            localServer: localServer,
+            handoffService: broken,
+          ).plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php', forceOffline: true);
+          expect((plan as PageLoadServerError).refusal, HandoffRefusal.unknown);
+        });
+
+        test('hasSavedCopy is false and savedCopyFact is unknown (the server decides), never "exists"', () async {
+          failRefusalReads = true;
+          final r = restarted();
+          expect(await r.hasSavedCopy(parishId: 'p', userId: 'u', pagePath: '/public/dashboard.php'), isFalse);
+          expect(await r.savedCopyFact(parishId: 'p', userId: 'u', pagePath: '/public/dashboard.php'), SavedCopyFact.unknown);
+        });
+
+        test('with a server that answers and accepts, the page opens online: the server is the authority', () async {
+          failRefusalReads = true;
+          final plan = await restarted().plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php');
+          expect(plan, isA<PageLoadOnline>());
+        });
+
+        test('with no answer from the server the copy still stays shut (a failed handoff falls back to "cannot tell")', () async {
+          failRefusalReads = true;
+          handoff.errorToThrow = DioException(requestOptions: RequestOptions(path: '/x'), type: DioExceptionType.connectionError);
+          final plan = await restarted().plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php');
+          expect((plan as PageLoadServerError).refusal, HandoffRefusal.unknown);
+        });
+
+        test('it is a retry, not a verdict: once the keystore reads again the copy opens', () async {
+          failRefusalReads = true;
+          final r = restarted();
+          expect(await r.plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php', forceOffline: true), isA<PageLoadServerError>());
+          failRefusalReads = false;
+          expect(await r.plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php', forceOffline: true), isA<PageLoadOffline>());
+        });
+
+        test('a standing refusal is reported as the refusal, not as "cannot tell", when both are possible', () async {
+          handoff.errorToThrow = _httpError(403, {'error': 'forbidden'});
+          await online('/public/ranking.php');
+          fakeStore['refusal_device'] = 'garbage'; // the other record is damaged
+          final plan = await offlineOnly('/public/ranking.php');
+          expect((plan as PageLoadServerError).refusal, HandoffRefusal.module);
+        });
+      });
+
+      // ---- a refusal that cannot be WRITTEN, or REMOVED
+
+      group('a refusal that cannot be written still blocks in this process; one that cannot be removed is not lifted', () {
+        test('device: the write fails, the block stands for the next attempts, offline, even with the keystore unreadable', () async {
+          failRefusalWrites = true;
+          handoff.errorToThrow = _httpError(403, {'error': 'device_not_authorized', 'device_state': 'revoked'});
+          final first = await online('/public/dashboard.php') as PageLoadServerError;
+          expect(first.refusal, HandoffRefusal.device);
+          expect(fakeStore.containsKey('refusal_device'), isFalse, reason: 'nothing was stored');
+          expect((await offlineOnly('/public/ranking.php') as PageLoadServerError).refusal, HandoffRefusal.device);
+          failRefusalReads = true;
+          expect((await offlineOnly('/public/ranking.php') as PageLoadServerError).refusal, HandoffRefusal.device);
+        });
+
+        test('device: no readable token at the time: the refusal still stands for this process', () async {
+          final broken = _TokenFailsHandoff()
+            ..errorToThrow = _httpError(403, {'error': 'device_not_authorized', 'device_state': 'revoked'});
+          final cc = OfflinePageCoordinator(
+            connectivityProbe: ConnectivityProbe(),
+            captureService: SnapshotCaptureService(downloader: PageResourceDownloader(), store: reading),
+            snapshotStore: reading,
+            localServer: localServer,
+            handoffService: broken,
+          );
+          final first = await cc.plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php') as PageLoadServerError;
+          expect(first.refusal, HandoffRefusal.device);
+          broken.errorToThrow = null;
+          final later = await cc.plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php', forceOffline: true);
+          expect((later as PageLoadServerError).refusal, HandoffRefusal.device);
+        });
+
+        test('module: the write fails, the block stands for the later attempts', () async {
+          failRefusalWrites = true;
+          handoff.errorToThrow = _httpError(403, {'error': 'forbidden'});
+          expect((await online('/public/ranking.php') as PageLoadServerError).refusal, HandoffRefusal.module);
+          expect((await offlineOnly('/public/ranking.php') as PageLoadServerError).refusal, HandoffRefusal.module);
+          expect(await offlineOnly('/public/dashboard.php'), isA<PageLoadOffline>(), reason: 'other modules are not affected');
+        });
+
+        test('module: an accepted handoff whose lift FAILS leaves the block standing; the next accepted one lifts it', () async {
+          handoff.errorToThrow = _httpError(403, {'error': 'forbidden'});
+          await online('/public/ranking.php');
+          handoff.errorToThrow = null; // accepted now
+          failRefusalDeletes = true;
+          expect(await online('/public/ranking.php'), isA<PageLoadOnline>());
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+          expect(await offlineOnly('/public/ranking.php'), isA<PageLoadServerError>(), reason: 'not lifted, and not reported as lifted');
+
+          failRefusalDeletes = false;
+          expect(await online('/public/ranking.php'), isA<PageLoadOnline>());
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+          expect(await offlineOnly('/public/ranking.php'), isA<PageLoadOffline>());
+        });
+      });
+
+      // ---- the parish says no, the central server says ACTIVE (an old answer from the relay's cache)
+
+      group('the parish refusal is checked against the central server before it becomes a block', () {
+        OfflinePageCoordinator withVerifier(Future<DeviceAuthState?> Function() verify, {Duration timeout = const Duration(seconds: 3)}) =>
+            OfflinePageCoordinator(
+              connectivityProbe: ConnectivityProbe(),
+              captureService: SnapshotCaptureService(downloader: PageResourceDownloader(), store: reading),
+              snapshotStore: reading,
+              localServer: localServer,
+              handoffService: handoff,
+              reverifyDevice: verify,
+              reverifyTimeout: timeout,
+            );
+
+        void parishSaysRevoked() =>
+            handoff.errorToThrow = _httpError(403, {'error': 'device_not_authorized', 'device_state': 'revoked'});
+
+        test('central ACTIVE after the parish said "revoked": not blocked, no copy offered on that reply, and it says why', () async {
+          final cc = withVerifier(() async => DeviceAuthState.active);
+          parishSaysRevoked();
+          final plan = await cc.plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php') as PageLoadServerError;
+          expect(plan.refusal, isNull);
+          expect(plan.staleParishAnswer, isTrue);
+          expect(plan.hasSnapshot, isFalse, reason: 'the parish said "not authorized": a copy is not offered on top of that');
+          expect(fakeStore.containsKey('refusal_device'), isFalse, reason: 'nothing was stored');
+        });
+
+        test('and it does not block the NEXT start either: the copy opens offline', () async {
+          final cc = withVerifier(() async => DeviceAuthState.active);
+          parishSaysRevoked();
+          await cc.plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php');
+          expect(await cc.plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php', forceOffline: true), isA<PageLoadOffline>());
+        });
+
+        test('every answer that is not ACTIVE leaves the refusal standing (a real, new refusal is never set aside)', () async {
+          for (final answer in [DeviceAuthState.revoked, DeviceAuthState.parishDisabled, DeviceAuthState.tokenRejected,
+              DeviceAuthState.refusalUnknown, DeviceAuthState.authError, DeviceAuthState.updateRequired,
+              DeviceAuthState.offlineWithinLease, DeviceAuthState.offlineLeaseExpired, null]) {
+            fakeStore.remove('refusal_device');
+            final cc = withVerifier(() async => answer);
+            parishSaysRevoked();
+            final plan = await cc.plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php') as PageLoadServerError;
+            expect(plan.refusal, HandoffRefusal.device, reason: '$answer');
+            expect(plan.staleParishAnswer, isFalse, reason: '$answer');
+            expect(fakeStore['refusal_device'], isNotNull, reason: '$answer');
+          }
+        });
+
+        test('a verification that fails or does not answer in time leaves the refusal standing', () async {
+          for (final verify in <Future<DeviceAuthState?> Function()>[
+            () async => throw StateError('no network'),
+            () => Completer<DeviceAuthState?>().future,
+          ]) {
+            fakeStore.remove('refusal_device');
+            final cc = withVerifier(verify, timeout: const Duration(milliseconds: 50));
+            parishSaysRevoked();
+            final plan = await cc.plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php') as PageLoadServerError;
+            expect(plan.refusal, HandoffRefusal.device);
+          }
+        });
+
+        test('no way to verify (no verifier): the refusal stands, as before', () async {
+          parishSaysRevoked();
+          expect((await online('/public/dashboard.php') as PageLoadServerError).refusal, HandoffRefusal.device);
+        });
+
+        test('ORDER: refused, then lifted by a central ACTIVE, then the relay repeats its old answer: not blocked again; a real refusal after that blocks', () async {
+          var central = DeviceAuthState.revoked;
+          final cc = withVerifier(() async => central);
+          parishSaysRevoked();
+          expect((await cc.plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php') as PageLoadServerError).refusal,
+              HandoffRefusal.device);
+          // The central server now says ACTIVE (SyncEngine lifts the record).
+          expect(await cc.refusals.liftDevice(deviceToken: 'device-token-A'), LiftResult.done);
+          central = DeviceAuthState.active;
+          // The relay still serves its cached "revoked".
+          final again = await cc.plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php') as PageLoadServerError;
+          expect(again.refusal, isNull);
+          expect(again.staleParishAnswer, isTrue);
+          expect(await cc.plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php', forceOffline: true), isA<PageLoadOffline>());
+          // Then the central server really does refuse: the next parish refusal blocks.
+          central = DeviceAuthState.tokenRejected;
+          expect((await cc.plan(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php') as PageLoadServerError).refusal,
+              HandoffRefusal.device);
+        });
+
+        test('a MODULE refusal is not put to the central server: ACTIVE says nothing about the user\'s role', () async {
+          var asked = 0;
+          final cc = withVerifier(() async {
+            asked++;
+            return DeviceAuthState.active;
+          });
+          handoff.errorToThrow = _httpError(403, {'error': 'forbidden'});
+          expect((await cc.plan(parishId: 'p', userId: 'u', targetPath: '/public/ranking.php') as PageLoadServerError).refusal,
+              HandoffRefusal.module);
+          expect(asked, 0);
+        });
+
+        test('the probe goes through the same check', () async {
+          final cc = withVerifier(() async => DeviceAuthState.active);
+          parishSaysRevoked();
+          final rejected = await cc.probeOnline(parishId: 'p', userId: 'u', targetPath: '/public/dashboard.php');
+          expect((rejected as OnlineProbeRejected).error.staleParishAnswer, isTrue);
+          expect(rejected.error.refusal, isNull);
+        });
+      });
+
+      test('HandoffFailure keeps the device_state only when it is a short machine code', () {
+        DioException withBody(Object body) => _httpError(403, body);
+        expect(HandoffFailure.of(withBody({'error': 'device_not_authorized', 'device_state': 'revoked'})).deviceState, 'revoked');
+        expect(HandoffFailure.of(withBody({'error': 'device_not_authorized', 'device_state': 'Revoked <b>'})).deviceState, isNull);
+        expect(HandoffFailure.of(withBody({'error': 'x', 'device_state': 42})).deviceState, isNull);
+        expect(HandoffFailure.of(withBody('plain')).deviceState, isNull);
+      });
     });
 
     test('a plan that finds NO copy is NOT marked as timed out', () async {

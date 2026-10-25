@@ -11,10 +11,13 @@ import 'core/secure/secure_storage_service.dart';
 import 'core/startup/app_services.dart';
 import 'core/startup/install_marker.dart';
 import 'core/util/loop_lag_monitor.dart';
+import 'core/util/startup_error_detail.dart';
+import 'core/util/ui_marker.dart';
 import 'core/util/startup_trace.dart';
 import 'features/activation/activation_screen.dart';
 import 'features/home/home_screen.dart';
 import 'features/preflight/preflight_gate.dart';
+import 'features/revocation/revocation_handler.dart' show resumeInterruptedWipe;
 import 'features/startup/startup_error_screen.dart';
 
 void main() {
@@ -24,12 +27,17 @@ void main() {
   // busy with one long piece of work (traces only; see LoopLagMonitor).
   LoopLagMonitor.startIfTracing();
   runApp(const MinistrantManagerApp());
+  // The first frame the app draws. With the screen the app ends on, it tells a CI
+  // job that watches the app from outside whether the app stopped or the reporting
+  // failed (see UiMarker).
+  WidgetsBinding.instance.addPostFrameCallback((_) => unawaited(UiMarker.record('first_frame')));
 }
 
 class MinistrantManagerApp extends StatefulWidget {
   const MinistrantManagerApp({
     super.key,
     this.buildServices = buildAppServices,
+    this.resumeWipe = resumeInterruptedWipe,
     this.deepLinkService,
     this.startupTimeout = const Duration(seconds: 20),
   });
@@ -37,6 +45,10 @@ class MinistrantManagerApp extends StatefulWidget {
   /// Opens the encrypted database and wires every service that depends on
   /// it. Injectable so the startup failure paths can be tested.
   final AppServicesBuilder buildServices;
+
+  /// Finishes a wipe that was interrupted (marker "wipe in progress"). Runs before anything else can
+  /// show data; throws if it cannot be finished. Injectable for the startup tests.
+  final Future<bool> Function(SecureStorageService storage) resumeWipe;
   final DeepLinkService? deepLinkService;
 
   /// Upper bound for the whole startup sequence (secure storage, database
@@ -159,14 +171,29 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
         _startupError = 'Uruchamianie aplikacji trwa zbyt długo.';
         _startupErrorDetail = null;
       });
+      _reportErrorScreen('TimeoutException');
     } catch (e) {
       if (!mounted || generation != _startupGeneration) return;
+      // The type, and for an error from the platform its code and numeric status
+      // (the Keychain's -34018): never the message, which can carry paths or URLs.
+      final detail = startupErrorDetail(e);
       setState(() {
         _startupError = 'Nie udało się uruchomić aplikacji.';
-        // The type only — an exception's message can carry paths or URLs.
-        _startupErrorDetail = e.runtimeType.toString();
+        _startupErrorDetail = detail;
       });
+      _reportErrorScreen(detail);
     }
+  }
+
+  /// The error screen counts as reached once it has been DRAWN, not when
+  /// setState() was called: the report goes out after the next frame, and only if
+  /// the screen is still the one on show (a retry that already succeeded must not
+  /// leave "startup_error" behind).
+  void _reportErrorScreen(String detail) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _startupError == null) return;
+      unawaited(UiMarker.record('startup_error', detail: detail));
+    });
   }
 
   Future<_StartupData> _bootstrap() async {
@@ -193,6 +220,12 @@ class _MinistrantManagerAppState extends State<MinistrantManagerApp> {
     // Cautious and never throws (see InstallMarker).
     if (Platform.isIOS) {
       await InstallMarker().clearCredentialsOfDeletedInstall(_secureStorage);
+    }
+    // A wipe that was started and not confirmed complete is finished BEFORE the activation is read
+    // and before any database or saved page is opened. If it cannot be finished this throws, and
+    // startup ends on the retryable error screen: a half-erased app does not show its data.
+    if (await widget.resumeWipe(_secureStorage)) {
+      StartupTrace.mark('wipe_resumed');
     }
     final activated = await _secureStorage.isActivated;
     StartupTrace.mark('activation_read');

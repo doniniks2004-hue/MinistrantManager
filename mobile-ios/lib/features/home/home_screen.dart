@@ -12,6 +12,7 @@ import '../device_settings/device_settings_screen.dart';
 import '../../core/offline/offline_page_coordinator.dart';
 import '../../core/util/startup_trace.dart';
 import '../revocation/revocation_handler.dart';
+import '../revocation/wipe_marker.dart' show WipeIncompleteException;
 import '../webview/offline_aware_page_screen.dart';
 
 /// How long the LOCAL start-up reads (keystore, database open) may take. They
@@ -114,6 +115,73 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _syncInProgress = false;
   int _sessionGeneration = 0;
   Timer? _leaseTimer;
+  StreamSubscription<DeviceAuthState>? _centralRevocationSub;
+
+  /// A revocation was received and its wipe is not complete. The app does NOT go on (no services
+  /// are rebuilt, nothing can be activated): this screen blocks, with a retry.
+  /// The shared [WipeLock] is the one truth: held from the start of a wipe (manual reset or
+  /// revocation) until it is complete, whichever screen started it. While it is held this screen
+  /// shows nothing of the device's data, and coming back from another screen cannot change that.
+  bool get _wipeIncomplete => widget.revocationHandler.wipeLock.isHeld || _wipeSeen;
+
+  /// Once a wipe has been seen, this screen never goes back to showing the panel: every way a wipe
+  /// ends well (revocation, retry, manual reset) calls onRevoked, which rebuilds the app, so a
+  /// moment between "lock released" and that rebuild must not show the old data.
+  bool _wipeSeen = false;
+  void _onWipeLockChanged() {
+    if (widget.revocationHandler.wipeLock.isHeld) _wipeSeen = true;
+    if (mounted) setState(() {});
+  }
+
+  bool _wipeRetrying = false;
+
+  /// The app is rebuilt ONCE per wipe, however many callers (a revocation, a manual reset, a retry)
+  /// were waiting for the same wipe operation.
+  bool _rebuildRequested = false;
+  void _requestRebuild() {
+    if (_rebuildRequested) return;
+    _rebuildRequested = true;
+    widget.onRevoked();
+  }
+  bool _revoking = false;
+
+  /// The central server's explicit DEVICE_REVOKED / PARISH_DISABLED, from a status check or from a
+  /// parish refusal that was checked against it: erase (RevocationHandler) and rebuild. If the erasing
+  /// is not complete, stop here instead.
+  Future<void> _revokeAndRebuild(DeviceAuthState state) async {
+    if (_revoking) return;
+    _revoking = true;
+    widget.offlinePageCoordinator.localServer.rootDirectory = null;
+    try {
+      if (mounted) setState(() => _authState = state);
+      try {
+        await widget.revocationHandler.handle(state);
+      } on WipeIncompleteException {
+        if (mounted) setState(() {});
+        return;
+      }
+      _requestRebuild();
+    } finally {
+      _revoking = false;
+    }
+  }
+
+  Future<void> _retryWipe() async {
+    if (_wipeRetrying) return;
+    setState(() => _wipeRetrying = true);
+    var done = false;
+    try {
+      done = await widget.revocationHandler.retryIncompleteWipe();
+    } catch (_) {
+      done = false;
+    }
+    if (!mounted) return;
+    setState(() => _wipeRetrying = false);
+    if (done) {
+      // The handler has released the lock: only now does the flow go on.
+      _requestRebuild();
+    }
+  }
 
   Future<void> _openDeviceSettings() async {
     final slug = await widget.userSessionService.secureStorage.parishSlug;
@@ -123,10 +191,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           builder: (_) => DeviceSettingsScreen(
                 revocationHandler: widget.revocationHandler,
                 parishSlug: slug,
+                onWipeIncomplete: () {
+                  // Back to this screen, which is blocked by the shared lock (not by anything
+                  // remembered here), so neither the button nor the system Back can show the panel.
+                  if (mounted) Navigator.of(context).popUntil((route) => route.isFirst);
+                },
                 onParishReset: () {
                   _sessionGeneration++;
                   Navigator.of(context).popUntil((route) => route.isFirst);
-                  widget.onRevoked();
+                  _requestRebuild();
                 },
               )),
     );
@@ -182,7 +255,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    widget.revocationHandler.wipeLock.addListener(_onWipeLockChanged);
+    _wipeSeen = widget.revocationHandler.wipeLock.isHeld;
     WidgetsBinding.instance.addObserver(this);
+    _centralRevocationSub = widget.offlinePageCoordinator.centralRevocations.listen(
+      (state) => unawaited(_revokeAndRebuild(state)),
+    );
     _bootstrapThenSync();
     _leaseTimer = Timer.periodic(
       const Duration(seconds: 30),
@@ -214,8 +292,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    widget.revocationHandler.wipeLock.removeListener(_onWipeLockChanged);
     _sessionGeneration++;
     _leaseTimer?.cancel();
+    unawaited(_centralRevocationSub?.cancel());
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -291,7 +371,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _bootstrapThenSync() async {
-    if (_syncInProgress) return;
+    if (_syncInProgress || _wipeIncomplete) return;
     _syncInProgress = true;
     final generation = _sessionGeneration;
     if (_stateLoadFailed && mounted) {
@@ -330,6 +410,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         widget.db.ensureSyncMetadata().timeout(_localReadLimit)..ignore();
     final localIdentity = await identityRead;
     final localMeta = await metaRead;
+    // A refusal received on an EARLIER run is read here, from local storage, before anything is
+    // shown: a start with no connection must not open the saved copy for a device the server has
+    // refused, and waiting for the central check (which takes as long as a connect timeout when
+    // there is no network) would have shown it in the meantime.
+    DeviceStatusResult? rememberedRefusal;
+    try {
+      rememberedRefusal = await widget.syncEngine.persistedRefusal().timeout(_localReadLimit);
+    } catch (_) {
+      // A read that fails or does not answer in time is neither "no refusal" nor "a refusal": it is
+      // not known. Nothing saved is opened until it is (the central check below still runs, and an
+      // ACTIVE from it removes whatever record was there).
+      rememberedRefusal = DeviceStatusResult(DeviceAuthState.refusalUnknown);
+    }
     final localHasUserSession = localIdentity.hasUserSession;
     final localUserId = localIdentity.userId;
     final localParishId = localIdentity.parishId;
@@ -340,10 +433,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
 
     if (!mounted || generation != _sessionGeneration) return;
+    if (rememberedRefusal != null) {
+      widget.offlinePageCoordinator.localServer.rootDirectory = null;
+    }
     setState(() {
-      _authState = localWithinLease
-          ? DeviceAuthState.offlineWithinLease
-          : DeviceAuthState.offlineLeaseExpired;
+      _authState = rememberedRefusal != null
+          ? rememberedRefusal.state
+          : localWithinLease
+              ? DeviceAuthState.offlineWithinLease
+              : DeviceAuthState.offlineLeaseExpired;
       _applyIdentity(
         hasUserSession: localHasUserSession,
         userId: localUserId,
@@ -380,8 +478,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
     if (status.state == DeviceAuthState.revoked ||
         status.state == DeviceAuthState.parishDisabled) {
-      await widget.revocationHandler.handle(status.state);
-      widget.onRevoked();
+      await _revokeAndRebuild(status.state);
       return;
     }
 
@@ -392,8 +489,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
 
+    if (status.state == DeviceAuthState.refusalUnknown) {
+      // Whether a refusal stands could not be found out. Fail closed: nothing saved is shown, nothing
+      // is erased, and the retry button asks again.
+      return;
+    }
+
+    if (status.state == DeviceAuthState.tokenRejected) {
+      // The server refused this device's token (now, or on an earlier run and still in force).
+      // Nothing is erased and no saved copy is opened; a verified ACTIVE, or a new activation, lifts it.
+      return;
+    }
+
     if (status.state == DeviceAuthState.authError) {
-      // Review round: explicit 401/403/unrecognized-status — fail closed.
+      // Review round: an answer that cannot be read as ACTIVE or as a refusal — fail closed.
       // Deliberately NOT the same handling as revoked/parishDisabled: this
       // is not a confirmed revocation signal (could be a transient server
       // bug, a genuinely unknown token, or a forward-compat gap), so local
@@ -507,6 +616,41 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    if (_wipeIncomplete) {
+      return PopScope(
+        canPop: false,
+        child: Scaffold(
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.delete_forever_outlined, size: 48, color: Colors.red),
+                const SizedBox(height: 16),
+                Text(
+                  widget.revocationHandler.hasIncompleteWipe
+                      ? 'Nie udało się dokończyć usuwania danych tego urządzenia.\n'
+                          'Dane są zablokowane i nie można aktywować urządzenia, dopóki usuwanie się nie powiedzie.'
+                      : 'Trwa usuwanie danych tego urządzenia…',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 20),
+                if (widget.revocationHandler.hasIncompleteWipe)
+                  FilledButton(
+                    onPressed: _wipeRetrying ? null : _retryWipe,
+                    child: Text(_wipeRetrying ? 'TRWA USUWANIE…' : 'SPRÓBUJ PONOWNIE'),
+                  )
+                else
+                  const CircularProgressIndicator(),
+              ],
+            ),
+          ),
+        ),
+        ),
+      );
+    }
+
     if (_clientConfig?['maintenance_mode'] == true) {
       return Scaffold(
         body: Center(
@@ -575,6 +719,63 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         ? 'AKTUALIZUJ'
                         : 'Aktualizacja wkrótce dostępna',
                   ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    if (_authState == DeviceAuthState.refusalUnknown) {
+      return Scaffold(
+        appBar: _deviceSettingsBar(),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.lock_outline, size: 48, color: Colors.orange),
+                const SizedBox(height: 16),
+                const Text(
+                  'Nie można ustalić, czy to urządzenie ma zablokowany dostęp.\n'
+                  'Zapisane strony nie są otwierane. Dane nie zostały usunięte.',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 20),
+                FilledButton(
+                  onPressed: _bootstrapThenSync,
+                  child: const Text('SPRÓBUJ PONOWNIE'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    if (_authState == DeviceAuthState.tokenRejected) {
+      return Scaffold(
+        appBar: _deviceSettingsBar(),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.lock_outline, size: 48, color: Colors.red),
+                const SizedBox(height: 16),
+                const Text(
+                  'Serwer odrzucił autoryzację tego urządzenia.\n'
+                  'Zapisane strony są zablokowane. Połącz się z internetem, aby ją potwierdzić, '
+                  'albo aktywuj urządzenie ponownie w ustawieniach.',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 20),
+                FilledButton(
+                  onPressed: _bootstrapThenSync,
+                  child: const Text('SPRÓBUJ PONOWNIE'),
                 ),
               ],
             ),

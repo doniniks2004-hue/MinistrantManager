@@ -168,9 +168,9 @@ class SimulatorReport(unittest.TestCase):
         return {"name": name, "status": status, "ms": ms, "detail": detail}
 
     def good(self):
-        self.write("ui_marker.json", {"screen": "activation_screen", "marks": {"main": 0}})
+        self.write("ui_marker.json", {"screen": "activation_screen", "screens": ["first_frame", "activation_screen"], "marks": {"main": 0}})
         self.write("full.json", {"done": True, "ok": True, "platform": "ios", "passed": 2, "failed": 0, "info": 1,
-                                  "checks": [self.check("crypto.platform_verified"), self.check("webview.loads_loopback_http"), self.check("keychain", "info")]})
+                                  "checks": [self.check("crypto.platform_verified"), self.check("webview.loads_loopback_http"), self.check("keychain.secure_storage", "pass", "write, read and delete work")]})
         for n, ms in enumerate([700, 650, 900, 800, 750], 1):
             self.write(f"cold_{n}.json", {"done": True, "ok": True, "marks": {"painted_ms": ms}, "checks": []})
         self.write("walltimes.json", {f"cold_{n}": 2500 for n in range(1, 6)})
@@ -196,10 +196,130 @@ class SimulatorReport(unittest.TestCase):
         self.assertIn("0 of 5 within 2000 ms", text)
         self.assertIn("not a verdict", text)
 
+    def test_ad_hoc_signing_is_an_attempt_until_the_run_confirms_it(self):
+        self.good()
+        (self.tmp / "logs").mkdir()
+        (self.tmp / "logs" / "build-signing.txt").write_text("production: built with the default (ad hoc) signing\n")
+        text, problems = self.build()
+        self.assertIn("CONFIRMED by this run", text)
+        self.assertNotIn("NOT CONFIRMED", text)
+
+    def test_the_unsigned_fallback_is_never_called_confirmed(self):
+        self.good()
+        (self.tmp / "logs").mkdir()
+        (self.tmp / "logs" / "build-signing.txt").write_text("production: built with --no-codesign (FALLBACK: no entitlements)\n")
+        text, _ = self.build()
+        self.assertIn("NOT CONFIRMED", text)
+
+    def test_signing_is_not_confirmed_when_the_app_stopped_at_the_keychain_error(self):
+        self.good()
+        (self.tmp / "logs").mkdir()
+        (self.tmp / "logs" / "build-signing.txt").write_text("production: built with the default (ad hoc) signing\n")
+        self.write("ui_marker.json", {"screen": "startup_error", "screens": ["first_frame", "startup_error"], "detail": "PlatformException(-34018)", "marks": {}})
+        text, problems = self.build()
+        self.assertIn("NOT CONFIRMED", text)
+        self.assertTrue(problems, "and the stop itself is still a failure")
+
+    def test_signing_without_a_recorded_build_log_is_not_confirmed(self):
+        self.good()
+        text, _ = self.build()
+        self.assertIn("NOT CONFIRMED", text)
+        self.assertIn("not recorded", text)
+
+    def test_a_keychain_check_that_reports_34018_blocks_the_confirmation(self):
+        self.good()
+        (self.tmp / "logs").mkdir()
+        (self.tmp / "logs" / "build-signing.txt").write_text("production: built with the default (ad hoc) signing\n")
+        self.write("full.json", {"done": True, "ok": True, "platform": "ios", "passed": 2, "failed": 0, "info": 1,
+                                  "checks": [self.check("crypto.platform_verified"), self.check("keychain.secure_storage", "info", "PlatformException(-34018)")]})
+        text, _ = self.build()
+        self.assertIn("NOT CONFIRMED", text)
+
+    def _signed_run_with_keychain(self, status, detail, name="keychain.secure_storage", present=True):
+        self.good()
+        (self.tmp / "logs").mkdir(exist_ok=True)
+        (self.tmp / "logs" / "build-signing.txt").write_text("production: built with the default (ad hoc) signing\n")
+        checks = [self.check("crypto.platform_verified")]
+        if present:
+            checks.append(self.check(name, status, detail))
+        self.write("full.json", {"done": True, "ok": True, "platform": "ios", "passed": 2, "failed": 0, "info": 1, "checks": checks})
+        return self.build()
+
+    def test_another_keychain_error_does_not_confirm_signing(self):
+        text, _ = self._signed_run_with_keychain("info", "PlatformException(OtherKeychainError -99999)")
+        self.assertIn("NOT CONFIRMED", text)
+        self.assertNotIn("CONFIRMED by this run", text.replace("NOT CONFIRMED", ""))
+        self.assertIn("NOT passed", text)
+
+    def test_a_failed_keychain_check_does_not_confirm_signing(self):
+        text, _ = self._signed_run_with_keychain("fail", "StateError: read back \"null\"")
+        self.assertIn("NOT CONFIRMED", text)
+
+    def test_an_informational_keychain_result_does_not_confirm_signing(self):
+        # even one that carries a reassuring detail: only a PASSED write/read/delete counts
+        text, _ = self._signed_run_with_keychain("info", "write, read and delete work")
+        self.assertIn("NOT CONFIRMED", text)
+
+    def test_a_missing_keychain_check_does_not_confirm_signing(self):
+        text, _ = self._signed_run_with_keychain("pass", "", present=False)
+        self.assertIn("NOT CONFIRMED", text)
+        self.assertIn("not present", text)
+
+    def test_a_pass_under_another_check_name_does_not_confirm_signing(self):
+        text, _ = self._signed_run_with_keychain("pass", "ok", name="keychain_something_else")
+        self.assertIn("NOT CONFIRMED", text)
+
+    def test_a_passed_keychain_write_read_delete_confirms_signing(self):
+        text, problems = self._signed_run_with_keychain("pass", "write, read and delete work")
+        self.assertIn("CONFIRMED by this run", text)
+        self.assertNotIn("NOT CONFIRMED", text)
+        self.assertEqual(problems, [])
+
     def test_the_app_never_reaching_its_first_screen_fails(self):
         self.good()
         (self.tmp / "ui_marker.json").unlink()
-        self.assertTrue(any("activation screen" in p for p in self.build()[1]))
+        self.assertTrue(any("no marker at all" in p for p in self.build()[1]))
+
+    def test_an_app_that_stopped_at_its_startup_error_is_named_with_the_keychain_hint(self):
+        self.good()
+        self.write("ui_marker.json", {"screen": "startup_error", "screens": ["first_frame", "startup_error"],
+                                      "detail": "PlatformException(Unexpected security result code -34018)", "marks": {}})
+        text, problems = self.build()
+        self.assertTrue(any("startup error screen" in p and "-34018" in p for p in problems))
+        self.assertIn("Keychain refusing for want of an entitlement", text)
+        self.assertIn("first_frame -> startup_error", text)
+
+    def test_a_startup_error_without_a_keychain_status_has_no_keychain_hint(self):
+        self.good()
+        self.write("ui_marker.json", {"screen": "startup_error", "screens": ["first_frame", "startup_error"], "detail": "TimeoutException", "marks": {}})
+        text, problems = self.build()
+        self.assertTrue(problems)
+        self.assertIn("TimeoutException", text)
+        # (the signing section names the Keychain on every run; what must not appear is the HINT that blames it)
+        self.assertNotIn("Keychain refusing", text)
+        self.assertNotIn("for want of an entitlement**", text)
+
+    def test_a_bare_first_frame_fails_but_does_not_claim_the_app_hung(self):
+        self.good()
+        self.write("ui_marker.json", {"screen": "first_frame", "screens": ["first_frame"], "marks": {}})
+        text, problems = self.build()
+        self.assertTrue(any("first_frame" in p and "not established" in p for p in problems))
+        self.assertNotIn("stuck", text.lower())
+        self.assertNotIn("hung:", " ".join(problems).lower())
+        self.assertIn("does **not** show", text)
+        self.assertIn("screenshot", text)
+
+    def test_no_marker_at_all_says_no_frame_or_reporting_failed(self):
+        self.good()
+        (self.tmp / "ui_marker.json").unlink()
+        text, problems = self.build()
+        self.assertTrue(any("no marker at all" in p for p in problems))
+        self.assertIn("crashes/", text)
+
+    def test_an_old_marker_without_the_history_still_reads(self):
+        self.good()
+        self.write("ui_marker.json", {"screen": "activation_screen", "marks": {"main": 0}})
+        self.assertEqual(self.build()[1], [])
 
     def test_another_first_screen_fails(self):
         self.good()

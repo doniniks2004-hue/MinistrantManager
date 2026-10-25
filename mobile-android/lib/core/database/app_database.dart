@@ -374,15 +374,32 @@ class AppDatabase extends _$AppDatabase {
   /// `_rebuildDatabaseAfterRevocation`.
   Future<void> closeAndDeleteFiles() async {
     await close();
+    await deleteDatabaseFiles();
+  }
 
+  /// Deletes the database file and its `-wal`/`-shm`/`-journal` siblings. Static and safe to run
+  /// again: a wipe that was interrupted is finished at the next start, when no database is open.
+  static Future<void> deleteDatabaseFiles() async {
     final file = await _databaseFile();
-    for (final suffix in ['', '-wal', '-shm', '-journal']) {
+    for (final suffix in _fileSuffixes) {
       final sibling = File('${file.path}$suffix');
       if (await sibling.exists()) {
         await sibling.delete();
       }
     }
   }
+
+  /// Whether any of those files is still there. A deletion is reported complete only when this
+  /// says no.
+  static Future<bool> databaseFilesRemain() async {
+    final file = await _databaseFile();
+    for (final suffix in _fileSuffixes) {
+      if (await File('${file.path}$suffix').exists()) return true;
+    }
+    return false;
+  }
+
+  static const _fileSuffixes = ['', '-wal', '-shm', '-journal'];
 }
 
 Future<File> _databaseFile() async {

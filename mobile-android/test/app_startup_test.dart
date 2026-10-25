@@ -4,7 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ministrant_manager/core/deeplink/deep_link_service.dart';
+import 'package:ministrant_manager/core/secure/secure_storage_service.dart';
 import 'package:ministrant_manager/core/startup/app_services.dart';
+import 'package:ministrant_manager/features/revocation/wipe_marker.dart';
 import 'package:ministrant_manager/main.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
@@ -18,6 +20,10 @@ class _NoDeepLinks extends DeepLinkService {
   @override
   void listen(void Function(String token) onToken) {}
 }
+
+/// "No interrupted wipe": the real check also reads a file in the app's own storage, which needs a
+/// platform these tests do not have. What it does is covered by wipe_resume_test.dart.
+Future<bool> _noWipe(SecureStorageService _) async => false;
 
 const _secureStorage = MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
 
@@ -65,6 +71,7 @@ void main() {
     await tester.pumpWidget(
       MinistrantManagerApp(
         deepLinkService: _NoDeepLinks(),
+        resumeWipe: _noWipe,
         buildServices: (_, __) async {
           builds++;
           throw StateError('cannot open database');
@@ -91,6 +98,7 @@ void main() {
     await tester.pumpWidget(
       MinistrantManagerApp(
         deepLinkService: _NoDeepLinks(),
+        resumeWipe: _noWipe,
         buildServices: (_, __) async {
           builds++;
           throw StateError('unreachable');
@@ -105,6 +113,51 @@ void main() {
     expect(builds, 0);
   });
 
+  testWidgets('an interrupted wipe is finished BEFORE the activation is read or any service is built', (
+    tester,
+  ) async {
+    final order = <String>[];
+    var builds = 0;
+    await tester.pumpWidget(
+      MinistrantManagerApp(
+        deepLinkService: _NoDeepLinks(),
+        resumeWipe: (_) async {
+          order.add('resume');
+          return true;
+        },
+        buildServices: (_, __) async {
+          order.add('build');
+          builds++;
+          throw StateError('stop here');
+        },
+      ),
+    );
+    await _pumpStartup(tester);
+    expect(order, ['resume', 'build']);
+    expect(builds, 1);
+  });
+
+  testWidgets('a wipe that cannot be finished stops startup on the error screen: no services, no data', (
+    tester,
+  ) async {
+    var builds = 0;
+    await tester.pumpWidget(
+      MinistrantManagerApp(
+        deepLinkService: _NoDeepLinks(),
+        resumeWipe: (_) async => throw const WipeIncompleteException(),
+        buildServices: (_, __) async {
+          builds++;
+          throw StateError('unreachable');
+        },
+      ),
+    );
+    await _pumpStartup(tester);
+    expect(find.text('Nie udało się uruchomić aplikacji.'), findsOneWidget);
+    expect(find.text('WipeIncompleteException'), findsOneWidget);
+    expect(find.text('SPRÓBUJ PONOWNIE'), findsOneWidget);
+    expect(builds, 0);
+  });
+
   testWidgets('retry runs the startup again; a transient failure can recover into the next stage', (
     tester,
   ) async {
@@ -113,6 +166,7 @@ void main() {
     await tester.pumpWidget(
       MinistrantManagerApp(
         deepLinkService: _NoDeepLinks(),
+        resumeWipe: _noWipe,
         startupTimeout: const Duration(milliseconds: 100),
         // Never completes: lets the test observe that the retry really
         // got past the storage read and into the service build.
@@ -145,6 +199,7 @@ void main() {
     await tester.pumpWidget(
       MinistrantManagerApp(
         deepLinkService: _NoDeepLinks(),
+        resumeWipe: _noWipe,
         startupTimeout: const Duration(milliseconds: 100),
         buildServices: (_, __) {
           builds++;

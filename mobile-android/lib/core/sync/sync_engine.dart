@@ -9,6 +9,7 @@ import 'package:uuid/uuid.dart';
 import '../database/app_database.dart';
 import '../network/api_client.dart';
 import '../secure/secure_storage_service.dart';
+import '../security/access_refusals.dart';
 import 'offline_lease.dart';
 
 enum DeviceAuthState {
@@ -24,6 +25,17 @@ enum DeviceAuthState {
   // access is blocked, cached data is not shown, without necessarily
   // being as destructive as a confirmed revoked/parishDisabled signal.
   authError,
+  // The central server answered, unambiguously, that it does not accept this device's token
+  // (HTTP 401 on /device/status), or the parish server refused the device with a state that says
+  // so (device_not_authorized + revoked / parish_disabled / not_found / parish_mismatch). Unlike
+  // [authError] it is REMEMBERED (AccessRefusals): a later start with no connection does not get
+  // the offline lease back, and no saved copy is opened. Unlike [revoked] it erases nothing; it is
+  // lifted by a verified ACTIVE from the central server, or by a new activation.
+  tokenRejected,
+  // The app cannot find out whether a refusal stands (the local record cannot be read or is damaged,
+  // or a refusal could not be lifted after a verified ACTIVE). NOT "no refusal": saved data is not
+  // opened, nothing is erased, and the user can try again.
+  refusalUnknown,
   offlineWithinLease,
   offlineLeaseExpired,
 }
@@ -84,26 +96,94 @@ class SyncEngine {
     required this.api,
     required this.secureStorage,
     this.offlineLease = const OfflineLease(),
-  });
+    AccessRefusals? refusals,
+  }) : refusals = refusals ?? AccessRefusals(secureStorage.refusalStorage);
 
   final AppDatabase db;
   final ApiClient api;
   final SecureStorageService secureStorage;
   final OfflineLease offlineLease;
+
+  /// What the server has refused, remembered across restarts.
+  final AccessRefusals refusals;
   final _uuid = const Uuid();
 
   bool _isSyncing = false;
 
+  /// A refusal that was received earlier and has not been lifted, read from LOCAL storage only
+  /// (no network): what a start must know BEFORE it shows anything. Three answers:
+  ///  - null: the device is not activated, or no refusal stands;
+  ///  - [DeviceAuthState.tokenRejected]: a refusal stands;
+  ///  - [DeviceAuthState.refusalUnknown]: it could not be found out (the token or the record cannot
+  ///    be read, or the record is damaged). That is NOT "no refusal".
+  Future<DeviceStatusResult?> persistedRefusal() async {
+    String? token;
+    var tokenReadFailed = false;
+    try {
+      token = await secureStorage.deviceToken;
+    } catch (_) {
+      tokenReadFailed = true;
+    }
+    if (token == null && !tokenReadFailed) return null;
+    final check = await refusals.checkDevice(deviceToken: token, tokenReadFailed: tokenReadFailed);
+    return switch (check.check) {
+      RefusalCheck.clear => null,
+      RefusalCheck.blocked => DeviceStatusResult(DeviceAuthState.tokenRejected),
+      RefusalCheck.unknown => DeviceStatusResult(DeviceAuthState.refusalUnknown),
+    };
+  }
+
+  String? _lastAppVersion;
+  String? _lastOsVersion;
+
+  /// Asks the central server again, with the versions of the last check: used by a caller that
+  /// has just been told "no" by the PARISH server, whose answer can be a stale copy (it caches the
+  /// central one for 10 minutes). Null when there has been no check to take the versions from, or
+  /// the device is not activated. The same rules as [checkDeviceStatus]: an ACTIVE lifts a
+  /// remembered refusal, a 401 adds one.
+  Future<DeviceAuthState?> reverifyDevice() async {
+    final app = _lastAppVersion;
+    final os = _lastOsVersion;
+    if (app == null || os == null) return null;
+    return (await checkDeviceStatus(appVersion: app, osVersion: os))?.state;
+  }
+
   /// Returns null if the app isn't activated yet — caller should route to
-  /// the activation screen.
+  /// the activation screen — and also when the activation CHANGED while the request was on its way
+  /// (the answer was for another token: it is dropped, nothing of it is applied).
+  ///
+  /// What each answer of the CENTRAL server means (`POST /device/status`, DeviceController):
+  ///  - 200 ACTIVE: confirmed. Lifts a remembered refusal for this token, renews the lease.
+  ///  - 200 DEVICE_REVOKED / PARISH_DISABLED: revoked (the caller erases, RevocationHandler).
+  ///  - 200 UPDATE_REQUIRED: unchanged. It does NOT lift a remembered refusal: only ACTIVE does.
+  ///  - 401: the central server does not accept this token. REMEMBERED ([DeviceAuthState.tokenRejected]).
+  ///  - 200 with an unknown status, a body that is not an object, 403 (this endpoint does not
+  ///    produce it: a firewall or proxy does), 4xx and 3xx others: an answer this app cannot
+  ///    interpret. NOT ACTIVE, the lease is NOT renewed, nothing is erased, nothing new is
+  ///    remembered, and a refusal remembered earlier STAYS (it is not removed by noise).
+  ///  - 5xx, no answer: the offline lease, as before; with a remembered refusal, the refusal.
   Future<DeviceStatusResult?> checkDeviceStatus({
     required String appVersion,
     required String osVersion,
   }) async {
     final token = await secureStorage.deviceToken;
     if (token == null) return null;
+    _lastAppVersion = appVersion;
+    _lastOsVersion = osVersion;
 
     final meta = await db.ensureSyncMetadata();
+    final remembered = (await refusals.checkDevice(deviceToken: token)).check;
+
+    // Whether this answer still belongs to the CURRENT activation. The device can be re-activated
+    // (another token) while a request is on its way; an answer for the old token must neither
+    // lift, add, renew nor wipe anything of the new one.
+    Future<bool> stillCurrent() async {
+      try {
+        return (await secureStorage.deviceToken) == token;
+      } catch (_) {
+        return false;
+      }
+    }
 
     try {
       final dio = api.centralWithAuth(token);
@@ -115,17 +195,46 @@ class SyncEngine {
         '/device/status',
         data: {'app_version': appVersion, 'os_version': osVersion},
       );
-      if (resp.data is! Map<String, dynamic>)
-        return DeviceStatusResult(DeviceAuthState.authError);
+      if (!await stillCurrent()) return null;
+      if (resp.data is! Map<String, dynamic>) {
+        return _cannotInterpret(remembered);
+      }
       final data = resp.data as Map<String, dynamic>;
       final result = _interpretStatus(data);
-      if (result.state == DeviceAuthState.active)
+      if (result.state == DeviceAuthState.authError) return _cannotInterpret(remembered);
+      if (result.state == DeviceAuthState.active) {
+        // The refusal is lifted BEFORE the device is called active, and the app learns whether it
+        // really was: a block that could not be removed from storage is not lifted, and "active"
+        // would then be a statement the next start contradicts.
+        final lift = await refusals.liftDevice(deviceToken: token, stillCurrent: stillCurrent);
+        if (lift == LiftResult.superseded) return null; // the activation changed: nothing here applies
+        if (lift == LiftResult.failed) return DeviceStatusResult(DeviceAuthState.refusalUnknown);
+        if (!await stillCurrent()) return null;
         await _persistServerControlledConfig(data);
+      }
       return result;
     } on DioException catch (e) {
-      return _interpretDioFailure(e, meta);
+      if (!await stillCurrent()) return null;
+      return _interpretDioFailure(e, meta, token: token, remembered: remembered);
     }
   }
+
+  /// An answer that cannot be read as ACTIVE or as a refusal. Fails closed (authError) and leaves
+  /// everything else as it was; a refusal remembered earlier keeps being reported, and a record that
+  /// cannot be read keeps the app at "cannot tell".
+  DeviceStatusResult _cannotInterpret(RefusalCheck remembered) => DeviceStatusResult(switch (remembered) {
+        RefusalCheck.blocked => DeviceAuthState.tokenRejected,
+        RefusalCheck.unknown => DeviceAuthState.refusalUnknown,
+        RefusalCheck.clear => DeviceAuthState.authError,
+      });
+
+  /// What a transient failure (no answer, 5xx) comes to: the offline lease, unless a refusal stands
+  /// (it is not undone by the connection being gone) or could not be ruled out.
+  DeviceStatusResult _transient(RefusalCheck remembered, SyncMetadataData meta) => switch (remembered) {
+        RefusalCheck.blocked => DeviceStatusResult(DeviceAuthState.tokenRejected),
+        RefusalCheck.unknown => DeviceStatusResult(DeviceAuthState.refusalUnknown),
+        RefusalCheck.clear => _offlineLeaseResult(meta),
+      };
 
   /// Review round fix: the previous code treated EVERY DioException as
   /// "no internet" and fell back to the offline lease — but a DioException
@@ -134,39 +243,43 @@ class SyncEngine {
   /// opinion; silently reading that as "offline, use cached lease" would
   /// let a device with an invalidated token keep using local data for up
   /// to the whole lease window.
-  DeviceStatusResult _interpretDioFailure(
+  ///
+  /// Now also: that 401 is remembered, and 403/other statuses are told apart from it (see
+  /// [checkDeviceStatus]).
+  Future<DeviceStatusResult> _interpretDioFailure(
     DioException e,
-    SyncMetadataData meta,
-  ) {
+    SyncMetadataData meta, {
+    required String token,
+    required RefusalCheck remembered,
+  }) async {
     final statusCode = e.response?.statusCode;
 
     if (statusCode != null) {
       // The server responded — this is never a connectivity problem.
       if (statusCode == 401) {
-        // Invalid/unknown device token — fail closed, do not serve cached data.
-        return DeviceStatusResult(DeviceAuthState.authError);
-      }
-      if (statusCode == 403) {
-        // Explicit security rejection — same treatment as 401.
-        return DeviceStatusResult(DeviceAuthState.authError);
+        // The central server does not accept this device token: remembered, so that the next start
+        // (which may have no connection) does not take the lease back and open a saved copy.
+        await refusals.blockDevice(deviceToken: token, source: 'central_401');
+        return DeviceStatusResult(DeviceAuthState.tokenRejected);
       }
       if (statusCode >= 500) {
         // Server-side failure, not a device-auth decision by the server —
         // treated as a temporary outage, same as a genuine transport
         // failure below (an explicit, deliberate choice per review, not
         // an oversight: a device shouldn't be locked out by a backend
-        // deploy blip).
-        return _offlineLeaseResult(meta);
+        // deploy blip). A refusal received EARLIER is still in force.
+        return _transient(remembered, meta);
       }
-      // Any other unexpected HTTP status from a server that DID respond:
-      // fail closed rather than silently trusting cached data.
-      return DeviceStatusResult(DeviceAuthState.authError);
+      // 403 and every other status: an answer this endpoint does not give for a refused token, so
+      // it is not read as one (and not as ACTIVE either).
+      return _cannotInterpret(remembered);
     }
 
     // No response at all — genuine transport failure (timeout, DNS,
     // connection refused, no network reachability). This is the ONLY
-    // case the offline lease is meant to cover.
-    return _offlineLeaseResult(meta);
+    // case the offline lease is meant to cover, and a refusal that was
+    // already received is not undone by the connection being gone.
+    return _transient(remembered, meta);
   }
 
   DeviceStatusResult _offlineLeaseResult(SyncMetadataData meta) {

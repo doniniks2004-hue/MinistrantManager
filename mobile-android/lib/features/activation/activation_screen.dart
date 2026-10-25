@@ -35,8 +35,12 @@ class _ActivationScreenState extends State<ActivationScreen> {
   void initState() {
     super.initState();
     // For a CI job that launches the app on a simulator and has to know this
-    // screen was reached (debug builds only; see UiMarker).
-    unawaited(UiMarker.record('activation_screen'));
+    // screen was reached (debug builds only; see UiMarker). Reported after the
+    // frame that draws it, not from initState: initState runs before anything is
+    // on the screen.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(UiMarker.record('activation_screen'));
+    });
     if (widget.initialToken != null) {
       // Deferred to right after the first frame so context/Navigator are
       // fully ready — matches how _handleScanned is invoked from a real

@@ -1,12 +1,15 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ministrant_manager/core/network/api_client.dart';
 import 'package:ministrant_manager/core/network/network_signal.dart';
+import 'package:ministrant_manager/core/offline/panel_probe.dart';
 import 'package:ministrant_manager/core/offline/connectivity_monitor.dart';
 import 'package:ministrant_manager/core/offline/connectivity_probe.dart';
 import 'package:ministrant_manager/core/offline/local_snapshot_server.dart';
+import 'package:ministrant_manager/core/security/access_refusals.dart' show HandoffRefusal;
 import 'package:ministrant_manager/core/offline/offline_page_coordinator.dart';
 import 'package:ministrant_manager/core/offline/page_resource_downloader.dart';
 import 'package:ministrant_manager/core/offline/server_reachability.dart';
@@ -337,12 +340,38 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
   /// What hasSavedCopy answers (a page the server refused: is there a copy?).
   bool savedCopy = false;
 
+  /// If set, hasSavedCopy answers through this instead (a slow manifest read).
+  Future<bool> Function()? savedCopyAnswer;
+  int savedCopyCalls = 0;
+
   @override
   Future<bool> hasSavedCopy({
     required String parishId,
     required String userId,
     required String pagePath,
-  }) async => savedCopy;
+  }) async {
+    savedCopyCalls++;
+    final answer = savedCopyAnswer;
+    return answer != null ? answer() : savedCopy;
+  }
+
+  /// The three-way answer the first load asks for. Follows [savedCopyAnswer] / [savedCopy]; a
+  /// failing answer is propagated, as a read that throws would be (the screen treats it as unknown).
+  @override
+  Future<SavedCopyFact> savedCopyFact({
+    required String parishId,
+    required String userId,
+    required String pagePath,
+  }) async {
+    savedCopyCalls++;
+    final answer = savedCopyAnswer;
+    final exists = answer != null ? await answer() : savedCopy;
+    return exists ? SavedCopyFact.exists : SavedCopyFact.absent;
+  }
+
+  /// What each plan() was told about the saved copy and the time already spent.
+  final planFacts = <SavedCopyFact>[];
+  final planSpent = <Duration>[];
 
   @override
   Future<PageLoadPlan> plan({
@@ -352,8 +381,12 @@ class _ScriptedCoordinator extends OfflinePageCoordinator {
     String? handoffPath,
     bool forceOffline = false,
     OfflineReason offlineReason = OfflineReason.noNetwork,
+    SavedCopyFact copyFact = SavedCopyFact.unchecked,
+    Duration alreadySpent = Duration.zero,
   }) {
     planCalls++;
+    planFacts.add(copyFact);
+    planSpent.add(alreadySpent);
     planForced.add(forceOffline);
     events.add('plan');
     planRequests.add((targetPath, handoffPath));
@@ -395,6 +428,7 @@ Widget _host(
   bool forceOffline = false,
   String parishId = 'p',
   String userId = 'u',
+  PanelSpec? panelSpec,
 }) => MaterialApp(
   home: OfflineAwarePageScreen(
     title: 'Panel',
@@ -405,6 +439,7 @@ Widget _host(
     coordinator: coordinator,
     onLogout: onLogout,
     forceOffline: forceOffline,
+    panelSpec: panelSpec,
   ),
 );
 
@@ -800,6 +835,104 @@ void main() {
 
     expect(find.textContaining('odmówił dostępu'), findsOneWidget);
     expect(find.text('ZALOGUJ PONOWNIE'), findsNothing);
+  });
+
+  testWidgets('a REMEMBERED refusal of the module says so, offers no saved copy, and loads nothing', (tester) async {
+    final coordinator = _ScriptedCoordinator(
+      (_) async => const PageLoadServerError(
+        statusCode: 403,
+        errorCode: 'forbidden',
+        path: '/public/dashboard.php',
+        hasSnapshot: false,
+        refusal: HandoffRefusal.module,
+        remembered: true,
+      ),
+    );
+    await tester.pumpWidget(_host(coordinator, forceOffline: true));
+    await tester.pump(const Duration(milliseconds: 1));
+
+    expect(find.textContaining('Brak uprawnień do tego modułu'), findsOneWidget);
+    expect(find.textContaining('zapamiętana z poprzedniego połączenia'), findsOneWidget);
+    expect(find.textContaining('HTTP 403 · forbidden'), findsOneWidget);
+    expect(find.text('OTWÓRZ ZAPISANĄ KOPIĘ'), findsNothing);
+    expect(find.textContaining('OFFLINE'), findsNothing);
+    expect(platform.controllers.single.loaded, isEmpty, reason: 'neither a page nor a copy was requested');
+    coordinator.connectivity.dispose();
+  });
+
+  testWidgets('a refusal of the DEVICE says so, names the state, and offers no saved copy', (tester) async {
+    final coordinator = _ScriptedCoordinator(
+      (_) async => const PageLoadServerError(
+        statusCode: 403,
+        errorCode: 'device_not_authorized',
+        path: '/public/dashboard.php',
+        hasSnapshot: false,
+        deviceState: 'revoked',
+        refusal: HandoffRefusal.device,
+      ),
+    );
+    await tester.pumpWidget(_host(coordinator));
+    await tester.pump(const Duration(milliseconds: 1));
+
+    expect(find.textContaining('odmówił autoryzacji tego urządzenia'), findsOneWidget);
+    expect(find.textContaining('device_not_authorized · revoked'), findsOneWidget);
+    expect(find.text('OTWÓRZ ZAPISANĄ KOPIĘ'), findsNothing);
+    expect(platform.controllers.single.loaded, isEmpty);
+    coordinator.connectivity.dispose();
+  });
+
+  testWidgets('"cannot tell whether a refusal stands" says so, offers a retry and NO saved copy, and loads nothing', (tester) async {
+    final coordinator = _ScriptedCoordinator(
+      (_) async => const PageLoadServerError(
+        statusCode: null,
+        errorCode: 'refusal_unreadable',
+        path: '/public/dashboard.php',
+        hasSnapshot: false,
+        refusal: HandoffRefusal.unknown,
+      ),
+    );
+    await tester.pumpWidget(_host(coordinator, forceOffline: true));
+    await tester.pump(const Duration(milliseconds: 1));
+
+    expect(find.textContaining('Nie można ustalić, czy dostęp do zapisanych stron jest zablokowany'), findsOneWidget);
+    expect(find.textContaining('Dane nie zostały usunięte'), findsOneWidget);
+    expect(find.text('SPRÓBUJ PONOWNIE'), findsOneWidget);
+    expect(find.text('OTWÓRZ ZAPISANĄ KOPIĘ'), findsNothing);
+    expect(find.textContaining('OFFLINE'), findsNothing);
+    expect(platform.controllers.single.loaded, isEmpty);
+    coordinator.connectivity.dispose();
+  });
+
+  testWidgets('a parish refusal contradicted by the central server says the answer may be old, and blocks nothing', (tester) async {
+    final coordinator = _ScriptedCoordinator(
+      (_) async => const PageLoadServerError(
+        statusCode: 403,
+        errorCode: 'device_not_authorized',
+        path: '/public/dashboard.php',
+        hasSnapshot: false,
+        deviceState: 'revoked',
+        staleParishAnswer: true,
+      ),
+    );
+    await tester.pumpWidget(_host(coordinator));
+    await tester.pump(const Duration(milliseconds: 1));
+
+    expect(find.textContaining('centrala ją potwierdza'), findsOneWidget);
+    expect(find.textContaining('nieaktualna'), findsOneWidget);
+    expect(find.text('SPRÓBUJ PONOWNIE'), findsOneWidget);
+    coordinator.connectivity.dispose();
+  });
+
+  testWidgets('an error that is NOT an unambiguous refusal is described as before (and a copy is still offered)', (tester) async {
+    final coordinator = _ScriptedCoordinator(
+      (forceOffline) async => forceOffline ? _offlinePlan() : _serverError(403, code: 'access_denied', hasSnapshot: true),
+    );
+    await tester.pumpWidget(_host(coordinator));
+    await tester.pump(const Duration(milliseconds: 1));
+    expect(find.textContaining('Serwer odmówił dostępu do tej strony'), findsOneWidget);
+    expect(find.textContaining('Brak uprawnień do tego modułu'), findsNothing);
+    expect(find.text('OTWÓRZ ZAPISANĄ KOPIĘ'), findsOneWidget);
+    coordinator.connectivity.dispose();
   });
 
   testWidgets('a saved copy shown because the SERVER was unavailable is labelled as such', (
@@ -1208,14 +1341,17 @@ void main() {
     const wifi = NetworkState(hasInterface: true, validated: true, transport: NetworkTransport.wifi);
     Future<void> ms(WidgetTester tester, int millis) => tester.pump(Duration(milliseconds: millis));
 
+    /// [copy]: is there a saved copy of the page? Skipping the online attempt on a
+    /// "no network" report is only right when there is one to show instead.
     _ScriptedCoordinator scripted(
       _TestSignal signal, {
       Future<OnlineProbeResult> Function(int call)? probe,
+      bool copy = true,
     }) => _ScriptedCoordinator(
       (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
       signal: signal,
       probe: probe,
-    );
+    )..savedCopy = copy;
 
     testWidgets('REGRESSION: opened with no network, the app does not first try to reach the server', (tester) async {
       // With a saved copy the attempt to reach the server is allowed 1.5 s before
@@ -1251,6 +1387,121 @@ void main() {
       coordinator.connectivity.dispose();
     });
 
+    testWidgets(
+      'REGRESSION: "no network" reported at start but NO saved copy yet (the first run): the server is tried anyway',
+      (tester) async {
+        // Skipping the attempt buys nothing without a copy to show instead, and the
+        // system's report may be a moment's flicker: it used to put "no internet"
+        // on the screen of a user whose connection was fine, until the reconnect
+        // check, two seconds later, found the server.
+        final coordinator = scripted(_TestSignal()..now = none, copy: false);
+        await tester.pumpWidget(_host(coordinator));
+        await ms(tester, 50);
+
+        expect(coordinator.planForced, [false], reason: 'the online attempt was made');
+        expect(platform.controllers.single.loaded, [_ticketUrl]);
+        expect(find.textContaining('Brak zapisanej'), findsNothing);
+        expect(find.byIcon(Icons.wifi_off), findsNothing);
+        expect(coordinator.traces.any((t) => t.contains('no saved copy yet; trying the server anyway')), isTrue);
+        coordinator.connectivity.dispose();
+      },
+    );
+
+    testWidgets('while it connects the screen shows loading, not a message', (tester) async {
+      final coordinator = _ScriptedCoordinator((_) => Completer<PageLoadPlan>().future);
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 500);
+      expect(find.byType(spinner), findsOneWidget);
+      expect(find.textContaining('Brak zapisanej'), findsNothing);
+      expect(find.textContaining('Serwer parafii'), findsNothing);
+      expect(find.byIcon(Icons.wifi_off), findsNothing);
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('no copy, and the SERVER does not answer: it says so, it does not say there is no internet', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator(
+        (_) async => const PageLoadOfflineNoSnapshot(reason: OfflineReason.serverUnavailable),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 50);
+
+      expect(find.textContaining('Serwer parafii chwilowo nie odpowiada'), findsOneWidget);
+      expect(find.textContaining('automatycznie'), findsOneWidget, reason: 'a reconnect check is scheduled');
+      expect(find.textContaining('internetem'), findsNothing, reason: 'the connection is not what is wrong');
+      expect(find.byIcon(Icons.cloud_off), findsOneWidget);
+      expect(find.byIcon(Icons.wifi_off), findsNothing);
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('no copy, and the server is SLOW: says that', (tester) async {
+      final coordinator = _ScriptedCoordinator(
+        (_) async => const PageLoadOfflineNoSnapshot(reason: OfflineReason.slowServer),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 50);
+      expect(find.textContaining('odpowiada zbyt wolno'), findsOneWidget);
+      expect(find.byIcon(Icons.cloud_off), findsOneWidget);
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('no copy and genuinely no connection: still the message about the connection', (tester) async {
+      final coordinator = _ScriptedCoordinator((_) async => const PageLoadOfflineNoSnapshot());
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 50);
+      expect(find.textContaining('Brak zapisanej wersji tej strony'), findsOneWidget);
+      expect(find.textContaining('połączeniu z internetem'), findsOneWidget);
+      expect(find.byIcon(Icons.wifi_off), findsOneWidget);
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('where no reconnect check runs (the app is told to stay offline) it does not promise one', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator(
+        (_) async => const PageLoadOfflineNoSnapshot(reason: OfflineReason.serverUnavailable),
+      );
+      await tester.pumpWidget(_host(coordinator, forceOffline: true));
+      await ms(tester, 50);
+      expect(find.textContaining('Serwer parafii chwilowo nie odpowiada'), findsOneWidget);
+      expect(find.textContaining('automatycznie'), findsNothing);
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('REGRESSION: a message from an earlier attempt does not stay once the connection is made', (tester) async {
+      // The first attempt finds the server not answering; the reconnect check finds it a
+      // moment later. Nothing of the first attempt may be left on the screen.
+      var first = true;
+      final coordinator = _ScriptedCoordinator(
+        (forceOffline) async {
+          if (first) {
+            first = false;
+            return const PageLoadOfflineNoSnapshot(reason: OfflineReason.serverUnavailable);
+          }
+          return _onlinePlan();
+        },
+        probe: (_) async => OnlineProbeRecovered(_onlinePlan()),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 50);
+      expect(find.textContaining('Serwer parafii chwilowo nie odpowiada'), findsOneWidget);
+
+      await ms(tester, 2200); // the reconnect check is due, and it succeeds
+      expect(find.byType(spinner), findsOneWidget, reason: 'while it connects: loading, not the old message');
+      expect(find.textContaining('Serwer parafii'), findsNothing);
+      expect(platform.controllers.single.loaded.last, _ticketUrl);
+
+      platform.delegates.single.onPageFinished!('https://szarlej.ministrant.eu/public/dashboard.php');
+      await ms(tester, 10);
+      expect(find.byType(spinner), findsNothing);
+      expect(find.textContaining('Serwer parafii'), findsNothing);
+      expect(find.textContaining('Brak zapisanej'), findsNothing);
+      expect(find.byIcon(Icons.cloud_off), findsNothing);
+      expect(find.byIcon(Icons.wifi_off), findsNothing);
+      coordinator.connectivity.dispose();
+    });
+
     testWidgets('a connected phone is NOT forced offline', (tester) async {
       final coordinator = scripted(_TestSignal()..now = wifi);
       await tester.pumpWidget(_host(coordinator));
@@ -1271,9 +1522,53 @@ void main() {
       expect(platform.controllers.single.loaded, [_ticketUrl]);
     });
 
+    // The owner's spec, as the acceptance script is given it (see panel_probe_test.dart).
+    final spec = PanelSpec.fromBase64(
+      'eyJwYXRoIjoiL3B1YmxpYy9kYXNoYm9hcmQucGhwIiwicmVxdWlyZWQiOlsiI3BhbmVsIl0sImZvcmJpZGRlbiI6WyJpbnB1dFt0eXBlPXBhc3N3b3JkXSJdLCJzdHlsZXMiOlt7InNlbGVjdG9yIjoiYm9keSIsInByb3BlcnR5IjoiYmFja2dyb3VuZC1jb2xvciIsIm5vdCI6InJnYmEoMCwgMCwgMCwgMCkifV19',
+    )!;
+    const specId = '08e9cf523dae';
+
+    /// What the page's probe would post; every field can be changed per test.
+    String report({
+      int nav = 1,
+      String via = 'raf',
+      String shown = 'visible',
+      int hidden = 0,
+      String ready = 'complete',
+      String img = '3/3',
+      Object sheets = 1,
+      int w = 1180,
+      int h = 2300,
+      String specField = specId,
+      String verdict = 'ok',
+      String failed = '-',
+    }) => jsonEncode({
+      'nav': nav, 'via': via, 'fcp': 210, 'at': 480, 'ready': ready, 'shown': shown, 'hidden': hidden,
+      'img': img, 'sheets': sheets, 'w': w, 'h': h, 'spec': specField, 'verdict': verdict, 'failed': failed,
+    });
+
+    /// Opens the saved copy (no network at start), finishes the load, returns what traced.
+    Future<_ScriptedCoordinator> openedCopy(WidgetTester tester, {PanelSpec? withSpec}) async {
+      StartupTrace.reset();
+      final coordinator = scripted(_TestSignal()..now = none);
+      await tester.pumpWidget(_host(coordinator, panelSpec: withSpec));
+      await ms(tester, 50);
+      platform.delegates.single.onPageFinished!(_localUrl.toString());
+      await ms(tester, 10);
+      return coordinator;
+    }
+
+    Future<void> send(WidgetTester tester, String message) async {
+      platform.controllers.single.channels['MM_Paint']!(JavaScriptMessage(message: message));
+      await ms(tester, 1);
+    }
+
+    List<String> marks() => StartupTrace.marks.map((m) => m.$1).toList();
+    String facts(_ScriptedCoordinator c) => c.traces.singleWhere((t) => t.contains('PAINTED_FACTS'));
+
     testWidgets('the screen asks the page for a drawn frame after it finished, and says which load', (tester) async {
       final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
-      await tester.pumpWidget(_host(coordinator));
+      await tester.pumpWidget(_host(coordinator, panelSpec: spec));
       await ms(tester, 10);
       platform.delegates.single.onPageFinished!('$host/public/dashboard.php');
       await ms(tester, 10);
@@ -1282,57 +1577,105 @@ void main() {
       expect(probe, contains('nav: 1'));
       expect(probe, contains('requestAnimationFrame'));
       expect(probe, contains('first-contentful-paint'));
+      expect(probe, contains("spec: '$specId'"));
     });
 
-    testWidgets('REGRESSION: "visible" is measured, not assumed: the drawn frame is a mark and a trace line', (
+    testWidgets('REGRESSION: "visible" is measured, not assumed: a real frame of the real panel is a mark and a trace line', (
       tester,
     ) async {
-      StartupTrace.reset();
-      final coordinator = scripted(_TestSignal()..now = none);
-      await tester.pumpWidget(_host(coordinator));
-      await ms(tester, 50);
-      platform.delegates.single.onPageFinished!(_localUrl.toString());
-      await ms(tester, 10);
-      expect(StartupTrace.marks.map((m) => m.$1), isNot(contains('panel_painted_copy')), reason: 'finished is not visible');
+      final coordinator = await openedCopy(tester, withSpec: spec);
+      expect(marks(), isNot(contains('panel_painted_copy')), reason: 'finished is not visible');
 
-      platform.controllers.single.channels['MM_Paint']!(
-        JavaScriptMessage(message: '{"nav":1,"fcp":321,"at":412}'),
+      await send(tester, report());
+
+      expect(marks(), containsAll(['screen_init', 'load_request', 'plan_done', 'panel_painted_copy']));
+      expect(
+        facts(coordinator),
+        allOf(
+          contains('mode=copy'),
+          contains('via=raf'),
+          contains('drawn=1'),
+          contains('verdict=ok'),
+          contains('panel=1'),
+          contains('first-contentful-paint=210 ms'),
+          contains('page-clock=480 ms'),
+          matches(RegExp(r'pid=\d+ session=[0-9a-z]+ ')),
+        ),
       );
-      await ms(tester, 1);
-
-      expect(StartupTrace.marks.map((m) => m.$1), containsAll(['screen_init', 'load_request', 'plan_done', 'panel_painted_copy']));
-      final line = coordinator.traces.singleWhere((t) => t.contains('PAINTED'));
-      expect(line, allOf(contains('mode=copy'), contains('first-contentful-paint=321 ms'), contains('page-clock=412 ms')));
       coordinator.connectivity.dispose(); // its grace timer (no network at start) must not outlive the test
+    });
+
+    testWidgets('REGRESSION: the fallback timer is NOT a drawn frame: no mark, drawn=0', (tester) async {
+      final coordinator = await openedCopy(tester, withSpec: spec);
+      await send(tester, report(via: 'timer'));
+      expect(marks(), isNot(contains('panel_painted_copy')));
+      expect(facts(coordinator), allOf(contains('via=timer'), contains('drawn=0'), contains('panel=0')));
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('REGRESSION: a hidden page is not a drawn panel, even if its frames were counted', (tester) async {
+      final coordinator = await openedCopy(tester, withSpec: spec);
+      await send(tester, report(shown: 'hidden', hidden: 1));
+      expect(marks(), isNot(contains('panel_painted_copy')));
+      expect(facts(coordinator), allOf(contains('visibility=hidden'), contains('hidden=1'), contains('drawn=0'), contains('panel=0')));
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('REGRESSION: a sign-in or error screen that was drawn is not the panel (a forbidden element is showing)', (tester) async {
+      final coordinator = await openedCopy(tester, withSpec: spec);
+      await send(tester, report(verdict: 'fail', failed: 'r0,f0'));
+      expect(marks(), isNot(contains('panel_painted_copy')));
+      expect(facts(coordinator), allOf(contains('drawn=1'), contains('verdict=fail'), contains('failed=r0,f0'), contains('panel=0')));
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('REGRESSION: a page whose required style was not applied is not the panel, however many stylesheets it has', (tester) async {
+      final coordinator = await openedCopy(tester, withSpec: spec);
+      await send(tester, report(verdict: 'fail', failed: 's0', sheets: 4));
+      expect(marks(), isNot(contains('panel_painted_copy')));
+      expect(facts(coordinator), allOf(contains('stylesheets=4'), contains('failed=s0'), contains('panel=0')));
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('a good report from a build made with ANOTHER spec is not accepted', (tester) async {
+      final coordinator = await openedCopy(tester, withSpec: spec);
+      await send(tester, report(specField: 'ffffffffffff'));
+      expect(marks(), isNot(contains('panel_painted_copy')));
+      expect(facts(coordinator), allOf(contains('spec=ffffffffffff'), contains('verdict=n/a'), contains('panel=0')));
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('a build with NO spec never claims a panel: nothing says what the panel is', (tester) async {
+      final coordinator = await openedCopy(tester);
+      await send(tester, report(specField: '-', verdict: 'none'));
+      expect(marks(), isNot(contains('panel_painted_copy')));
+      expect(facts(coordinator), allOf(contains('spec=-'), contains('verdict=none'), contains('drawn=1'), contains('panel=0')));
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('the right panel on the WRONG page does not count (the spec names the page)', (tester) async {
+      final other = PanelSpec.fromBase64(
+        base64.encode(utf8.encode(jsonEncode({'path': '/public/other.php', 'required': ['#panel']}))),
+      )!;
+      final coordinator = await openedCopy(tester, withSpec: other);
+      await send(tester, report(specField: other.id));
+      expect(marks(), isNot(contains('panel_painted_copy')));
+      expect(facts(coordinator), allOf(contains('path_ok=0'), contains('panel=0')));
+      coordinator.connectivity.dispose();
     });
 
     testWidgets('the drawn-frame report says what was ON the page: state, images, stylesheets, panel size', (
       tester,
     ) async {
       final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
-      await tester.pumpWidget(_host(coordinator));
+      await tester.pumpWidget(_host(coordinator, panelSpec: spec));
       await ms(tester, 10);
       platform.delegates.single.onPageFinished!('$host/public/dashboard.php');
       await ms(tester, 10);
-
-      platform.controllers.single.channels['MM_Paint']!(
-        JavaScriptMessage(
-          message: '{"nav":1,"fcp":210,"at":480,"ready":"complete","shown":"visible",'
-              '"img":"3/3","sheets":1,"w":1180,"h":2300}',
-        ),
-      );
-      await ms(tester, 1);
-
-      final line = coordinator.traces.singleWhere((t) => t.contains('PAINTED'));
+      await send(tester, report());
       expect(
-        line,
-        allOf(
-          contains('readyState=complete'),
-          contains('visibility=visible'),
-          contains('images=3/3'),
-          contains('stylesheets=1'),
-          contains('main=1180x2300px'),
-        ),
+        facts(coordinator),
+        allOf(contains('readyState=complete'), contains('visibility=visible'), contains('images=3/3'), contains('stylesheets=1'), contains('main=1180x2300px')),
       );
     });
 
@@ -1340,41 +1683,32 @@ void main() {
       tester,
     ) async {
       final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
-      await tester.pumpWidget(_host(coordinator));
+      await tester.pumpWidget(_host(coordinator, panelSpec: spec));
       await ms(tester, 10);
       platform.delegates.single.onPageFinished!('$host/public/dashboard.php');
       await ms(tester, 10);
-
-      platform.controllers.single.channels['MM_Paint']!(
-        JavaScriptMessage(
-          message: '{"nav":1,"fcp":-1,"at":1500,"ready":"interactive","shown":"visible",'
-              '"img":"0/1","sheets":0,"w":0,"h":0}',
-        ),
-      );
-      await ms(tester, 1);
-
-      final line = coordinator.traces.singleWhere((t) => t.contains('PAINTED'));
-      expect(line, allOf(contains('readyState=interactive'), contains('images=0/1'), contains('stylesheets=0'), contains('main=0x0px')));
+      await send(tester, report(ready: 'interactive', img: '0/1', sheets: 0, w: 0, h: 0, verdict: 'fail', failed: 'r0'));
+      expect(facts(coordinator), allOf(contains('readyState=interactive'), contains('images=0/1'), contains('stylesheets=0'), contains('main=0x0px'), contains('panel=0')));
     });
 
     testWidgets('only short words and small numbers from the page are ever repeated in the trace', (tester) async {
       final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
-      await tester.pumpWidget(_host(coordinator));
+      await tester.pumpWidget(_host(coordinator, panelSpec: spec));
       await ms(tester, 10);
       platform.delegates.single.onPageFinished!('$host/public/dashboard.php');
       await ms(tester, 10);
-
-      platform.controllers.single.channels['MM_Paint']!(
-        JavaScriptMessage(
-          message: '{"nav":1,"fcp":5,"at":5,"ready":"<script>alert(1)</script>","shown":"a very long word that is not one",'
-              '"img":"<b>x</b>","sheets":"many","w":{"x":1},"h":[1]}',
-        ),
+      await send(
+        tester,
+        '{"nav":1,"via":"<b>x</b>","fcp":5,"at":5,"ready":"<script>alert(1)</script>","shown":"a very long word that is not one",'
+        '"hidden":"yes","img":"<b>x</b>","sheets":"many","w":{"x":1},"h":[1],"spec":"<img onerror=1>","verdict":"<i>","failed":"<script>"}',
       );
-      await ms(tester, 1);
-
-      final line = coordinator.traces.singleWhere((t) => t.contains('PAINTED'));
-      expect(line, allOf(contains('readyState=n/a'), contains('visibility=n/a'), contains('images=n/a'), contains('stylesheets=n/a')));
-      for (final bad in ['<', '>', 'script', 'alert', 'very long']) {
+      final line = facts(coordinator);
+      expect(
+        line,
+        allOf(contains('readyState=n/a'), contains('visibility=n/a'), contains('images=n/a'), contains('stylesheets=n/a'),
+            contains('via=n/a'), contains('hidden=n/a'), contains('spec=n/a'), contains('failed=n/a'), contains('panel=0')),
+      );
+      for (final bad in ['<', '>', 'script', 'alert', 'very long', 'onerror']) {
         expect(line, isNot(contains(bad)));
       }
     });
@@ -1382,24 +1716,182 @@ void main() {
     testWidgets('a paint report for an OLD load, or one that is not ours, changes nothing', (tester) async {
       StartupTrace.reset();
       final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
-      await tester.pumpWidget(_host(coordinator));
+      await tester.pumpWidget(_host(coordinator, panelSpec: spec));
       await ms(tester, 10);
       platform.delegates.single.onPageFinished!('$host/public/dashboard.php');
       await ms(tester, 10);
-      final report = platform.controllers.single.channels['MM_Paint']!;
 
-      report(JavaScriptMessage(message: '{"nav":99,"fcp":1,"at":1}')); // another load
-      report(JavaScriptMessage(message: 'not json at all'));
-      report(JavaScriptMessage(message: '[1,2,3]'));
-      report(JavaScriptMessage(message: '{"nav":1,"fcp":"<script>","at":{}}')); // our load, hostile numbers
-      await ms(tester, 1);
+      await send(tester, report(nav: 99)); // another load
+      await send(tester, 'not json at all');
+      await send(tester, '[1,2,3]');
+      await send(tester, '{"nav":1,"fcp":"<script>","at":{}}'); // our load, hostile numbers
 
-      final painted = coordinator.traces.where((t) => t.contains('PAINTED')).toList();
+      final painted = coordinator.traces.where((t) => t.contains('PAINTED_FACTS')).toList();
       expect(painted, hasLength(1), reason: 'only the report for this load, and only its numbers');
-      expect(painted.single, allOf(contains('first-contentful-paint=n/a'), contains('page-clock=n/a')));
+      expect(painted.single, allOf(contains('first-contentful-paint=n/a'), contains('page-clock=n/a'), contains('panel=0')));
       expect(painted.single, isNot(contains('script')));
+      expect(marks(), isNot(contains('panel_painted_live')));
       expect(find.byType(spinner), findsNothing);
       expect(coordinator.planCalls, 1);
+    });
+  });
+
+  group('the wait BEFORE the first load (is there a saved copy?) is bounded, timed, and cannot start a stale load', () {
+    const none = NetworkState(hasInterface: false, transport: NetworkTransport.none);
+    Future<void> ms(WidgetTester tester, int millis) => tester.pump(Duration(milliseconds: millis));
+
+    _ScriptedCoordinator opened(Future<bool> Function() answer) {
+      final c = _ScriptedCoordinator(
+        (forceOffline) async => forceOffline ? _offlinePlan() : _onlinePlan(),
+        signal: _TestSignal()..now = none,
+      )..savedCopyAnswer = answer;
+      return c;
+    }
+
+    testWidgets('a manifest read that NEVER answers does not hold the load for 1.5 s: the load begins at the budget, and it TRIES THE SERVER', (tester) async {
+      StartupTrace.reset();
+      final never = Completer<bool>();
+      final coordinator = opened(() => never.future);
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 300);
+      expect(coordinator.planCalls, 0, reason: 'still inside the 400 ms budget');
+      await ms(tester, 200);
+
+      expect(coordinator.planCalls, 1);
+      expect(coordinator.planForced, [false], reason: 'unknown is neither "no copy" nor "no network": the server is tried');
+      expect(coordinator.planFacts, [SavedCopyFact.unknown], reason: 'and the coordinator is told it is not known, so it does not read the manifest again with a timeout of its own');
+      expect(coordinator.planSpent.single, greaterThanOrEqualTo(Duration.zero));
+      expect(coordinator.traces.any((t) => t.contains('NOT known')), isTrue);
+      expect(coordinator.traces.any((t) => t.contains('no internet') || t.contains('no network and a saved copy')), isFalse,
+          reason: 'the store\'s slowness is not turned into a statement about the network');
+      expect(coordinator.traces.any((t) => t.contains('decided in') && t.contains('before the load began')), isTrue);
+      expect(StartupTrace.marks.map((m) => m.$1), contains('start_decided'));
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('the time spent before the load is in the trace, in milliseconds', (tester) async {
+      final coordinator = opened(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+        return true;
+      });
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 300);
+      final line = coordinator.traces.singleWhere((t) => t.contains('decided in'));
+      // (Stopwatch is the real clock, which a widget test does not advance: the number is
+      // checked for being there and being a number, the bound by the tests above.)
+      expect(RegExp(r'decided in \d+ ms before the load began').hasMatch(line), isTrue, reason: line);
+      expect(line, contains('saved copy exists'));
+      expect(coordinator.planForced, [true]);
+      expect(coordinator.planFacts, [SavedCopyFact.exists]);
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('a slow but timely answer (inside the budget) is used', (tester) async {
+      final coordinator = opened(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 350));
+        return true;
+      });
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 380);
+      expect(coordinator.planForced, [true]);
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('an answer that arrives AFTER the budget does not start a second load', (tester) async {
+      final lateAnswer = Completer<bool>();
+      final coordinator = opened(() => lateAnswer.future);
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 500);
+      expect(coordinator.planCalls, 1);
+      lateAnswer.complete(true);
+      await ms(tester, 500);
+      expect(coordinator.planCalls, 1, reason: 'the late answer must not start another load');
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('a manifest read that fails is unknown: the server is tried, no hang', (tester) async {
+      final coordinator = opened(() async => throw StateError('manifest unreadable'));
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 50);
+      expect(coordinator.planForced, [false]);
+      expect(coordinator.planFacts, [SavedCopyFact.unknown]);
+      expect(coordinator.traces.any((t) => t.contains('NOT known')), isTrue);
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('REGRESSION: the system first reports no network, the copy read takes over 400 ms, the server IS reachable: the live page loads', (tester) async {
+      final never = Completer<bool>();
+      final coordinator = opened(() => never.future);
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 600); // the check gave up at 400 ms
+      expect(coordinator.planForced, [false]);
+      expect(platform.controllers.single.loaded, [_ticketUrl], reason: 'the live page was requested, not the saved copy');
+      expect(coordinator.planReasons.single, OfflineReason.noNetwork, reason: 'only the fallback reason handed down; the plan was an online one');
+      expect(find.textContaining('OFFLINE'), findsNothing);
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('and when that server attempt fails, the screen shows the copy (the plan\'s own fallback), not an error about the store', (tester) async {
+      final never = Completer<bool>();
+      final coordinator = _ScriptedCoordinator(
+        (forceOffline) async => _offlinePlan(),   // the coordinator's online attempt failed and fell back to the copy
+        signal: _TestSignal()..now = none,
+      )..savedCopyAnswer = () => never.future;
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 600);
+      expect(platform.controllers.single.loaded, [_localUrl]);
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('a definite "no copy" still tries the server (first run after sign-in)', (tester) async {
+      final coordinator = opened(() async => false);
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 50);
+      expect(coordinator.planForced, [false]);
+      expect(coordinator.planFacts, [SavedCopyFact.absent]);
+      expect(coordinator.traces.any((t) => t.contains('no saved copy yet')), isTrue);
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('REGRESSION: the user changes while the answer is awaited: the old answer starts nothing', (tester) async {
+      final answer = Completer<bool>();
+      final coordinator = opened(() => answer.future);
+      await tester.pumpWidget(_host(coordinator, userId: 'u1'));
+      await ms(tester, 100);
+      await tester.pumpWidget(_host(coordinator, userId: 'u2')); // the new user's own load starts
+      await ms(tester, 10);
+      expect(coordinator.planCalls, 1);
+      answer.complete(true); // the OLD user's answer
+      await ms(tester, 50);
+      expect(coordinator.planCalls, 1, reason: 'u1\'s answer must not start a load for u2');
+      expect(coordinator.traces.any((t) => t.contains('ignored')), isTrue);
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('REGRESSION: a newer attempt began while the answer was awaited: the old answer starts nothing', (tester) async {
+      final answer = Completer<bool>();
+      final coordinator = opened(() => answer.future);
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 100);
+      await tester.pumpWidget(_host(coordinator, forceOffline: true)); // a newer load
+      await ms(tester, 10);
+      expect(coordinator.planCalls, 1);
+      answer.complete(true);
+      await ms(tester, 50);
+      expect(coordinator.planCalls, 1);
+      coordinator.connectivity.dispose();
+    });
+
+    testWidgets('the screen is gone while the answer is awaited: nothing starts, nothing throws', (tester) async {
+      final answer = Completer<bool>();
+      final coordinator = opened(() => answer.future);
+      await tester.pumpWidget(_host(coordinator));
+      await ms(tester, 100);
+      await tester.pumpWidget(const MaterialApp(home: SizedBox()));
+      answer.complete(true);
+      await ms(tester, 600);
+      expect(coordinator.planCalls, 0);
+      coordinator.connectivity.dispose();
     });
   });
 
@@ -2137,6 +2629,36 @@ void main() {
       await tester.pump(const Duration(minutes: 3));
       expect(coordinator.probeCalls, 1, reason: 'asking again cannot fix a refusal');
       expect(platform.controllers.single.loaded, [_localUrl]);
+    });
+
+    testWidgets('an UNAMBIGUOUS refusal met by the check REPLACES the copy on screen, and nothing asks again', (
+      tester,
+    ) async {
+      final coordinator = _ScriptedCoordinator(
+        (_) async => _offlinePlan(),
+        probe: (_) async => OnlineProbeRejected(
+          PageLoadServerError(
+            statusCode: 403,
+            errorCode: 'forbidden',
+            path: '/public/dashboard.php',
+            hasSnapshot: false,
+            refusal: HandoffRefusal.module,
+          ),
+        ),
+      );
+      await tester.pumpWidget(_host(coordinator));
+      await readyOffline(tester, platform);
+      expect(find.textContaining('OFFLINE •'), findsOneWidget);
+
+      await ms(tester, 2100);
+      await ms(tester, 10);
+
+      expect(find.textContaining('Brak uprawnień do tego modułu'), findsOneWidget);
+      expect(find.textContaining('OFFLINE •'), findsNothing, reason: 'the copy is no longer presented as the page');
+      expect(find.text('OTWÓRZ ZAPISANĄ KOPIĘ'), findsNothing);
+
+      await tester.pump(const Duration(minutes: 3));
+      expect(coordinator.probeCalls, 1);
     });
 
     testWidgets('an answer to a check for a page the user already left is ignored, and the next one returns to the CURRENT page', (

@@ -22,3 +22,6 @@
 
 # Python bytecode from the CI helper scripts
 __pycache__/
+
+# Node packages installed for the probe test in CI
+node_modules/

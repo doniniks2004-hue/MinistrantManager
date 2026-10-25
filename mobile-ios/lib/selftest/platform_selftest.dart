@@ -130,9 +130,24 @@ class PlatformSelfTest {
     }, informational: !onDevice, log: log);
 
     await check(report, 'crypto.openssl_vector_dart_opens', () async {
-      final opened = encryptor.decryptBytes(snapshotVectorBytes(snapshotVectorSealedHex));
+      // The OpenSSL answer was sealed with the VECTOR's own key. This harness's
+      // [encryptor] has a different key (the one the saved page uses), and with it
+      // the tag rightly fails to verify: opening the vector with [encryptor] was
+      // the harness's own mistake, and an InvalidCipherTextException was the
+      // integrity check doing its job.
+      final vectorEncryptor = SnapshotEncryptor(hexKey: snapshotVectorKeyHex);
+      final opened = vectorEncryptor.decryptBytes(snapshotVectorBytes(snapshotVectorSealedHex));
       if (!same(opened, snapshotVectorBytes(snapshotVectorPlainHex))) throw StateError('Dart did not open the OpenSSL bytes');
-      return 'Dart opens what OpenSSL sealed';
+      return 'Dart opens what OpenSSL sealed (with the vector key)';
+    }, log: log);
+
+    await check(report, 'crypto.openssl_vector_refused_under_another_key', () async {
+      try {
+        encryptor.decryptBytes(snapshotVectorBytes(snapshotVectorSealedHex));
+      } catch (_) {
+        return 'the same bytes under a different key are refused (the tag does not verify)';
+      }
+      throw StateError('the OpenSSL bytes were accepted under a key they were not sealed with');
     }, log: log);
 
     await check(report, 'crypto.interop_dart_and_platform', () async {

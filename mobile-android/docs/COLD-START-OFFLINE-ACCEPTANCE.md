@@ -55,7 +55,8 @@ What each line is evidence of:
 | `start: the system reports no network; skipping the online attempt` | the server was not tried first | that the copy opened |
 | `offline-serve: <file> ... verified/decrypted ... (cipher so far: platform=N dart=M)` | which implementation read each file, how long | that the page was drawn |
 | `finished <copy>` / `READY mode=copy` | the engine says loading finished | that the user sees the panel |
-| `PAINTED ... readyState= images=a/b stylesheets= main=WxHpx` | two animation frames after finish, and what was on the page: a page with `images=0/1`, `stylesheets=0` or `main=0x0px` is NOT a complete panel whatever else is logged | a guarantee: it is the page's own report |
+| `start: decided in N ms before the load began (offline\|online: ...)` and the start-up mark `start_decided` | the time the first load waited BEFORE it began (system network state, then whether a saved copy exists, bounded at 400 ms; an unread manifest is "unknown", which is neither "no copy" nor "no network": the server is then tried within the SAME start budget, the copy stays the fallback). It is part of the user's wait: the acceptance tool measures from `am start`, so it is inside the numbers; this line says how much of them it was | a measurement |
+| `PAINTED_FACTS pid= via= drawn= visibility= readyState= images=a/b stylesheets= main=WxHpx spec= verdict= failed= panel=` | what was on the page after two animation frames (`via=raf`; `via=timer` is the fallback and is not a drawn frame), whether it is visible, and whether it is the real panel by the owner's spec (`ANDROID-OFFLINE-ACCEPTANCE.md`) | a guarantee: it is the page's own report; the acceptance tool decides what to accept |
 | `loop-lag: ... busy for N ms` | the interface isolate was held for N ms, ending at +T ms | WHAT held it |
 
 The explanation that the 240 ms reads were caused by the interface isolate being busy
@@ -91,7 +92,7 @@ From a state with a valid saved copy and no network:
 3. Keep the logs of all five runs, passing or not.
 
 Pass: every run's `end - t0 <= 2.0 s` AND the page in the last frame is complete
-(`PAINTED` reports `readyState=complete`, all images, a stylesheet, a non-empty `main`).
+(`PAINTED_FACTS` with `via=raf`, visible, `readyState=complete`, all images, a stylesheet, a non-empty `main`, and `verdict=ok` for the owner's spec).
 
 ## 5. What would make this not enough
 

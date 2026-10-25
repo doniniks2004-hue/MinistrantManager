@@ -25,7 +25,7 @@ iPhone on a GitHub `macos-14` runner.
 | 12 | The WebView **recovers after the listener is lost** (no restart of the app) | listener closed, replaced, page loaded again | `webview.recovers_after_listener_loss` |
 | 13 | **Five cold opens**: a fresh process opens the saved page from disk with nothing warm; time until a frame was drawn | the app is launched five times from a fresh process | `cold_1..5.json`, `walltimes.json` |
 | 14 | Project and **built bundle**: bundle id `eu.ministrant.manager`, version = `pubspec.yaml`, minimum iOS, camera permission text, **App Transport Security** (cleartext only for loopback), privacy manifest inside the bundle, `Runner.entitlements` applied in all three configurations, `applinks:app.ministrant.eu` declared, the association file is valid | files and the built `.app` are read | `static.json` |
-| 15 | The harness itself | `flutter test` runs the widget-free part of the self-test (real sockets and file system), and 22 Python tests cover the report and the project checks | CI logs |
+| 15 | The harness itself | `flutter test` runs the widget-free part of the self-test (real sockets and file system), and the Python tests cover the report and the project checks | CI logs |
 
 Everything above ends in ONE verdict (`report.md` in the job summary and the artifact
 `ios-simulator-report`). A check that failed, a run that did not finish, or an app that
@@ -48,6 +48,40 @@ Keychain needs; the result says what happened) and every timing.
 | **A signed IPA, TestFlight** | Need the paid Apple Developer Program | Section 3 |
 | **Background and memory behaviour** (iOS reclaiming the loopback socket, memory warnings) | The simulator rarely reproduces them | `ensureHealthy` is tested by closing the listener on purpose; the real thing needs an iPhone left in the background |
 | **UIScene migration** | Needs a device test | not done |
+
+## 2b. The full journey on iOS: activation, sign-in, the real panel, offline, return
+
+What section 1 proves is the CHAIN (crypto, store, loopback server, WebView) and that the app reaches its
+activation screen. It does **not** run the journey a user takes, and nothing in CI does it yet. This is the
+list, with the result of each environment kept **separate**. Both are, today, **not executed**.
+
+| Step | Simulator (CI, `macos-14`) | iPhone (a Mac, an iPhone and a signed build) |
+|---|---|---|
+| 1. Clean install reaches the activation screen | executed by CI (section 1, row 1); the result is only as good as the signing note below | **not executed** |
+| 2. Activate a parish (code or QR) | **not executed**: needs a test parish and a test activation code as repository secrets, and an `integration_test` job that types them in; QR needs a camera, so only the code path can run on a simulator | **not executed** |
+| 3. Sign in as a real user, open the real panel (the PHP dashboard) | **not executed**: needs a test user (secrets), the same job | **not executed** |
+| 4. The real panel is saved as a complete copy (all resources) | **not executed** | **not executed** |
+| 5. Cold starts offline, five of them, panel visible within 2 s of the user's start | **not executed**; the five cold opens in section 1 open a STAND-IN page from a fresh process, which is not this | **not executed**; screen recording, `docs/COLD-START-OFFLINE-ACCEPTANCE.md` |
+| 6. Online -> offline -> online in one process | **not executed**; a simulator cannot cut its network from the job | **not executed**; Airplane mode, then Wi-Fi without internet |
+| 7. Sign out, sign in as another user: nothing of the first | **not executed** | **not executed** |
+
+A simulator result is never reported as an iPhone result, and an iPhone result is never inferred from a
+simulator one. The report of the simulator job says "simulator" in its title for that reason.
+
+To make steps 2 to 7 run on the simulator one needs, from the owner: a **test parish** (a server that may be
+used for automated sign-in), a **test activation code** and a **test user** (login and password), as repository
+secrets (never in the repository). Then an `integration_test` that drives the app is written against them. Until
+those exist this stays open.
+
+### Signing of the simulator build is an attempt
+
+The workflow builds the simulator app ad hoc signed instead of `--no-codesign`, on the hypothesis that an
+unsigned build has no entitlements and the Keychain refuses it (`-34018`, seen once in the helper test). That is a
+hypothesis, not an established cause. The report (section 1b) calls the signing **confirmed** only when the run
+shows all of: the build was not the unsigned fallback, the production app reached the activation screen (it reads
+the Keychain before it draws anything), and the self-test's Keychain check did not report `-34018`. Otherwise it
+says "not confirmed" and the signing stays an attempt. A confirmation on the simulator says nothing about a signed
+build on an iPhone.
 
 ## 3. What is left for TestFlight
 
