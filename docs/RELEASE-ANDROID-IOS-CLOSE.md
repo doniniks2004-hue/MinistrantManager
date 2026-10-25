@@ -7,7 +7,11 @@ Sama nazwa drugiej łaty nie oznacza, że nakłada się ona na czysty PR #49.
 
 ## MacBook: przygotowanie i uruchomienie
 
-Wymagane: Xcode wraz z runtime symulatora iPhone, Flutter 3.47.3, CocoaPods.
+Wymagane: Xcode 26 lub nowszy z SDK iOS 26+ i runtime symulatora iPhone,
+Flutter 3.47.3, CocoaPods. CI korzysta z `macos-26` i sprawdza wersję SDK.
+Wymóg SDK: https://developer.apple.com/news/?id=ueeok6yw
+Build release ARM64 bez podpisu sprawdza kompilację na iPhone, ale nie tworzy
+instalowalnego IPA ani nie zastępuje testu urządzenia.
 Najpierw uruchom Xcode i zakończ instalację wymaganych komponentów.
 
 ```bash

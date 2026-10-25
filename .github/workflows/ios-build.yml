@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-26
     env:
       HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' }}
       HAS_APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD != '' }}
@@ -36,6 +36,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify App Store SDK toolchain
+        run: |
+          xcodebuild -version
+          sdk_version="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iPhoneOS SDK: $sdk_version"
+          if [ "${sdk_version%%.*}" -lt 26 ]; then
+            echo "::error::iOS 26 SDK or later is required for App Store Connect submissions."
+            exit 1
+          fi
 
       - uses: subosito/flutter-action@v2
         with:
