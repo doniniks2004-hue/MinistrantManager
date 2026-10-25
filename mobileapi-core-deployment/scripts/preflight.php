@@ -21,7 +21,7 @@
  *      złym kształcie.
  */
 
-require __DIR__ . '/public_html/config/database.php';
+require_once __DIR__ . '/public_html/config/database.php';
 // ⚠ Ten skrypt zakłada, że leży BEZPOŚREDNIO w tym samym katalogu co
 // mobileapi-core/ i public_html/ — tak samo jak pozostałe skrypty w tym
 // katalogu.
@@ -126,8 +126,10 @@ if (!empty($errors)) {
     foreach ($errors as $e) {
         echo "  ✗ $e\n";
     }
+    if (defined('MM_BROWSER_INSTALL') && MM_BROWSER_INSTALL) throw new RuntimeException('Preflight failed.');
     exit(1);
 }
 
 echo "PREFLIGHT OK — bezpiecznie można przejść do migracji.\n";
+if (defined('MM_BROWSER_INSTALL') && MM_BROWSER_INSTALL) return;
 exit(0);

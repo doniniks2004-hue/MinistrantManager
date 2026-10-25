@@ -4,6 +4,7 @@ import 'package:ministrant_manager/core/database/app_database.dart';
 import 'package:ministrant_manager/core/offline/snapshot_encryptor.dart';
 import 'package:ministrant_manager/core/offline/snapshot_store.dart';
 import 'package:ministrant_manager/core/secure/secure_storage_service.dart';
+import 'package:ministrant_manager/core/util/startup_trace.dart';
 import 'package:ministrant_manager/features/device_settings/device_settings_screen.dart';
 import 'package:ministrant_manager/features/revocation/revocation_handler.dart';
 
@@ -57,6 +58,27 @@ void main() {
 
   tearDownAll(() async {
     await sharedDb.close();
+  });
+
+  testWidgets('shows which build this is and where the cold start spent its time', (tester) async {
+    StartupTrace.reset();
+    StartupTrace.mark('services_built');
+    StartupTrace.mark('page_ready_online');
+    addTearDown(StartupTrace.reset);
+
+    await tester.pumpWidget(MaterialApp(
+      home: DeviceSettingsScreen(
+        revocationHandler: _FakeRevocationHandler(sharedDb),
+        parishSlug: 'witosa',
+        onParishReset: () {},
+      ),
+    ));
+
+    expect(find.text('Wersja aplikacji'), findsOneWidget);
+    // Tests are not built by CI, so no commit is compiled in.
+    expect(find.textContaining('commit '), findsOneWidget);
+    expect(find.textContaining('services_built: '), findsOneWidget);
+    expect(find.textContaining('page_ready_online: '), findsOneWidget);
   });
 
   testWidgets('tapping "Zmień parafię" shows the exact required confirmation text', (tester) async {

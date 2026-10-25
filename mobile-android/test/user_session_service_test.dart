@@ -289,7 +289,7 @@ void main() {
     await db.close();
   });
 
-  test('device-control-plane: a 503 with no device_state body defaults to central_unavailable, never crashes on a malformed response', () async {
+  test('device-control-plane: an unstructured hosting 503 is a network error, not a device refusal', () async {
     final secureStorage = SecureStorageService();
     final api = ApiClient(secureStorage);
     final db = AppDatabase.forTesting();
@@ -307,19 +307,62 @@ void main() {
     final service = _TestUserSessionService(api: api, secureStorage: secureStorage, db: db, snapshotStore: _throwawaySnapshotStore(), fakeLoginDio: dio);
     final result = await service.login(username: 'adam', password: 'correct-password');
 
-    expect(result, isA<UserLoginDeviceNotAuthorized>());
-    expect((result as UserLoginDeviceNotAuthorized).deviceState, 'central_unavailable');
+    expect(result, isA<UserLoginNetworkError>());
 
     await db.close();
   });
+  for (final changePassword in [false, true]) {
+    for (final body in <Object?>[
+      '<html>hosting error</html>', null, {},
+      {'token': '', 'user': {'id': 1}},
+      {'token': 'new-token', 'user': {'id': '1'}},
+      {'token': 'new-token', 'user': {'id': 1, 'role_id': []}},
+    ]) {
+      test('malformed success is rejected before storage (change=$changePassword, body=$body)', () async {
+        final service = buildServiceReturningUser(1);
+        addTearDown(service.db.close);
+        service.fakeLoginDio.interceptors.clear();
+        service.fakeLoginDio.interceptors.add(InterceptorsWrapper(onRequest: (options, handler) {
+          handler.resolve(Response(requestOptions: options, statusCode: 200, data: body));
+        }));
+        final result = changePassword
+            ? await service.changeRequiredPassword(username: 'a', currentPassword: 'b', newPassword: 'c')
+            : await service.login(username: 'a', password: 'b');
+        expect(result, isA<UserLoginNetworkError>());
+        expect(await service.secureStorage.hasUserSession, isFalse);
+      });
+    }
+    test('keystore read failure returns a result (change=$changePassword)', () async {
+      final service = buildServiceReturningUser(1);
+      addTearDown(service.db.close);
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+        secureStorageChannel, (_) async => throw PlatformException(code: 'unavailable'));
+      final result = changePassword
+          ? await service.changeRequiredPassword(username: 'a', currentPassword: 'b', newPassword: 'c')
+          : await service.login(username: 'a', password: 'b');
+      expect(result, isA<UserLoginLocalError>());
+    });
+    for (final status in [403, 503]) {
+      test('generic HTTP $status is not device refusal (change=$changePassword)', () async {
+        final service = buildServiceReturningUser(1);
+        addTearDown(service.db.close);
+        service.fakeLoginDio.interceptors.clear();
+        service.fakeLoginDio.interceptors.add(InterceptorsWrapper(onRequest: (options, handler) {
+          handler.reject(DioException(requestOptions: options,
+            response: Response(requestOptions: options, statusCode: status,
+              data: {'error': 'maintenance', 'device_state': 12})));
+        }));
+        final result = changePassword
+            ? await service.changeRequiredPassword(username: 'a', currentPassword: 'b', newPassword: 'c')
+            : await service.login(username: 'a', password: 'b');
+        expect(result, isA<UserLoginNetworkError>());
+      });
+    }
+  }
+
 }
 
-/// Test seam: real UserSessionService.login() builds its own Dio pointed
-/// at the real parish server URL — this subclass swaps that internal call
-/// for a fake, pre-wired Dio instead, so the test never attempts real
-/// network I/O. Mirrors the login()/logout() logic exactly; kept as a
-/// thin override rather than changing the production class's shape for
-/// testability alone.
+/// Inject only HTTP; exercise the real validation, persistence and isolation.
 class _TestUserSessionService extends UserSessionService {
   _TestUserSessionService({
     required super.api,
@@ -332,47 +375,5 @@ class _TestUserSessionService extends UserSessionService {
   final Dio fakeLoginDio;
 
   @override
-  Future<UserLoginResult> login({required String username, required String password}) async {
-    final installationId = await secureStorage.installationId;
-    if (installationId == null) return const UserLoginNetworkError();
-
-    try {
-      final resp = await fakeLoginDio.post('/mobile/session/login', data: {
-        'username': username,
-        'password': password,
-        'installation_id': installationId,
-      });
-      final data = resp.data as Map<String, dynamic>;
-      final token = data['token'] as String;
-      final user = data['user'] as Map<String, dynamic>;
-      final newUserId = user['id'] as int;
-      final fullName = user['full_name'] as String?;
-      final roleId = user['role_id'] as int?;
-
-      final previousUserId = await secureStorage.currentUserId;
-      if (previousUserId != null && previousUserId != newUserId) {
-        await db.wipeUserScopedBusinessData();
-      }
-
-      await secureStorage.setUserSession(token: token, userId: newUserId, fullName: fullName, roleId: roleId);
-      api.resetParishClient();
-
-      return UserLoginSuccess(fullName: fullName);
-    } on DioException catch (e) {
-      final statusCode = e.response?.statusCode;
-      if (statusCode == 403 || statusCode == 503) {
-        final body = e.response?.data;
-        final deviceState = (body is Map ? body['device_state'] as String? : null) ?? 'central_unavailable';
-        return UserLoginDeviceNotAuthorized(deviceState: deviceState);
-      }
-      final body = e.response?.data;
-      if (statusCode == 428 && body is Map && body['error'] == 'password_change_required') {
-        return const UserLoginPasswordChangeRequired();
-      }
-      if (statusCode == 401 || statusCode == 400) {
-        return const UserLoginInvalidCredentials();
-      }
-      return const UserLoginNetworkError();
-    }
-  }
+  Dio createLoginClient(BaseOptions options) => fakeLoginDio;
 }

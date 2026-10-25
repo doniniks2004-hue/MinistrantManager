@@ -35,10 +35,22 @@ final class LegacyMysqlAnnouncementsRepository
         );
         $stmt->bind_param('i', $limit);
         $stmt->execute();
-        $result = $stmt->get_result();
+        $id = null;
+        $title = null;
+        $content = null;
+        $createdAt = null;
+        $authorName = null;
+        $stmt->bind_result($id, $title, $content, $createdAt, $authorName);
 
         $rows = [];
-        while ($row = $result->fetch_assoc()) {
+        while ($stmt->fetch()) {
+            $row = [
+                'id' => $id,
+                'title' => $title,
+                'content' => $content,
+                'created_at' => $createdAt,
+                'author_name' => $authorName,
+            ];
             $rows[] = [
                 'id' => 'announcements:' . $row['id'],
                 'raw_id' => (int) $row['id'],

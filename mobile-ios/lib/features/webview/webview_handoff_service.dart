@@ -1,35 +1,57 @@
+import 'dart:async';
+
+import 'package:dio/dio.dart';
+
 import '../../core/network/api_client.dart';
 import '../../core/secure/secure_storage_service.dart';
 
-/// Hybrid dashboard milestone (review round, point 18). Requests a
-/// short-lived, single-use ticket from the parish backend and builds the
-/// URL a WebView navigates to — mobile_user_token itself NEVER appears
-/// in this URL, in any JS, or in the WebView at all; only the ticket
-/// does, and the ticket authorizes exactly one page load.
+/// Short-lived tickets never enter logs or offline storage.
 class WebviewHandoffService {
   WebviewHandoffService({required this.api, required this.secureStorage});
-
   final ApiClient api;
   final SecureStorageService secureStorage;
 
-  /// [path] MUST be one of the paths the server itself advertised via a
-  /// `webview` module descriptor — the backend independently re-validates
-  /// this against its own allowlist regardless, but there is no reason
-  /// to ever ask for a path this client didn't get from the server.
-  ///
-  /// Throws on any failure (network, auth, invalid path) — the caller
-  /// (LegacyModuleScreen) is expected to show its own error/retry state
-  /// rather than this service inventing one.
-  Future<Uri> requestHandoffUrl(String path) async {
-    final dio = await api.parish();
-    final resp = await dio.post('/mobile/webview/handoff', data: {'path': path});
-    final ticket = resp.data['ticket'] as String;
+  /// The limit used when opening a page: short on purpose, so a missing
+  /// network is noticed fast and the saved copy appears within 2 s.
+  static const defaultTimeout = Duration(milliseconds: 1400);
 
-    final serverUrl = await secureStorage.serverUrl;
-    if (serverUrl == null) {
-      throw StateError('No server_url — device not activated.');
+  /// [timeout] bounds the whole request. The default is the short opening
+  /// limit; the background check for the connection coming back passes a
+  /// longer one, because there nobody is waiting and a slow server must be
+  /// told apart from a missing one.
+  Future<Uri> requestHandoffUrl(
+    String path, {
+    Duration timeout = defaultTimeout,
+  }) async {
+    final cancel = CancelToken();
+    final deadline = Timer(timeout, () => cancel.cancel('handoff deadline'));
+    try {
+      final serverUrl = await secureStorage.serverUrl;
+      if (serverUrl == null) throw StateError('Device not activated.');
+      final dio = await api.parish();
+      final resp = await dio.post(
+        '/mobile/webview/handoff',
+        data: {'path': Uri.parse(path).path},
+        cancelToken: cancel,
+        options: Options(
+          sendTimeout: timeout,
+          receiveTimeout: timeout,
+        ),
+      );
+      // Whatever shape the reply has, "the server answered but not with a
+      // handoff" is ONE signal (FormatException) — the coordinator relies
+      // on it to tell that apart from a failure in this app's own code,
+      // which must never be reported as the server's fault.
+      final data = resp.data;
+      final ticket = data is Map ? data['ticket'] : null;
+      if (ticket is! String || !RegExp(r'^[a-fA-F0-9]{64}$').hasMatch(ticket)) {
+        throw const FormatException('Invalid handoff response.');
+      }
+      return Uri.parse(serverUrl)
+          .resolve('/public/mobile_handoff.php')
+          .replace(queryParameters: {'ticket': ticket});
+    } finally {
+      deadline.cancel();
     }
-
-    return Uri.parse('$serverUrl/public/mobile_handoff.php').replace(queryParameters: {'ticket': ticket});
   }
 }

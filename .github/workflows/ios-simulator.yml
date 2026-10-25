@@ -1,0 +1,327 @@
+name: iOS simulator runtime
+
+# Compiling is not running. This workflow RUNS the iOS app on a simulator iPhone
+# and checks what it can establish without a Mac of our own, an iPhone or an
+# Apple Developer account:
+#  - the production app, freshly installed, reaches the parish activation screen;
+#  - a self-test build (a separate entry point, lib/selftest/main_selftest.dart)
+#    exercises, on iOS, the native AES-GCM against an OpenSSL known answer, the
+#    encrypted saved page, the loopback server, a real WKWebView on 127.0.0.1
+#    (App Transport Security, the page's security policy), and recovery of a closed
+#    listener; then five fresh processes open the saved page from disk;
+#  - the project and the built bundle are checked (bundle id, version, camera text,
+#    App Transport Security, privacy manifest, entitlements).
+# What it cannot establish is listed in mobile-ios/docs/IOS-RUNTIME-VERIFICATION.md.
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  helper-scripts:
+    name: CI helper scripts (tests and project checks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the helper scripts
+        run: |
+          python3 .github/scripts/test_ios_scripts.py
+          python3 .github/scripts/test_android_offline_acceptance.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test the page-side panel probe (jsdom)
+        run: |
+          npm install --no-save --no-package-lock jsdom@24.1.0
+          node --test .github/scripts/panel_probe_test.mjs
+      - name: Check the iOS project files
+        run: python3 .github/scripts/ios_static_checks.py --root . --json static-source.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-static-checks-source
+          path: static-source.json
+
+  simulator:
+    name: Run on an iPhone simulator
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      BUNDLE_ID: eu.ministrant.manager
+    defaults:
+      run:
+        working-directory: mobile-ios
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify App Store SDK toolchain
+        run: |
+          xcodebuild -version
+          sdk_version="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iPhoneOS SDK: $sdk_version"
+          if [ "${sdk_version%%.*}" -lt 26 ]; then
+            echo "::error::iOS 26 SDK or later is required for App Store Connect submissions."
+            exit 1
+          fi
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.3'
+          channel: 'stable'
+
+      - run: flutter pub get --enforce-lockfile
+      - name: Generate branded splash screens
+        run: dart run flutter_native_splash:create
+      - run: dart run build_runner build --delete-conflicting-outputs
+      - name: pod install
+        run: cd ios && pod install
+
+      - name: Build the self-test app (simulator, debug)
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/results/logs"
+          # Ad hoc SIGNED (a simulator needs no account for it) rather than --no-codesign.
+          # The reason is a HYPOTHESIS, not an established fact: that an app with no signature
+          # has no entitlements and the Keychain refuses it with -34018 ("a required
+          # entitlement is not present"), and that the app, which reads the Keychain before it
+          # draws its first screen, therefore stops at its startup error screen. The signed
+          # build is an ATTEMPT to see whether that is so; the unsigned build is the fallback.
+          # Which one was used is recorded, and the report (section 1b) calls the signing
+          # confirmed only if this run shows the activation screen reached and no -34018.
+          if flutter build ios --simulator --debug -t lib/selftest/main_selftest.dart; then
+            echo "selftest: built with the default (ad hoc) signing" >> "$GITHUB_WORKSPACE/results/logs/build-signing.txt"
+          else
+            echo "::warning::the signed simulator build of the self-test failed; falling back to --no-codesign (the Keychain will not work in it)"
+            flutter build ios --simulator --debug --no-codesign -t lib/selftest/main_selftest.dart
+            echo "selftest: built with --no-codesign (FALLBACK: no entitlements)" >> "$GITHUB_WORKSPACE/results/logs/build-signing.txt"
+          fi
+          mkdir -p "$RUNNER_TEMP/apps/selftest"
+          cp -R build/ios/iphonesimulator/Runner.app "$RUNNER_TEMP/apps/selftest/Runner.app"
+          codesign -dvvv --entitlements :- "$RUNNER_TEMP/apps/selftest/Runner.app" > "$GITHUB_WORKSPACE/results/logs/codesign-selftest.txt" 2>&1 || true
+
+      - name: Build the production app (simulator, debug)
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/results/logs"
+          if flutter build ios --simulator --debug; then
+            echo "production: built with the default (ad hoc) signing" >> "$GITHUB_WORKSPACE/results/logs/build-signing.txt"
+          else
+            echo "::warning::the signed simulator build of the app failed; falling back to --no-codesign (the Keychain will not work in it)"
+            flutter build ios --simulator --debug --no-codesign
+            echo "production: built with --no-codesign (FALLBACK: no entitlements)" >> "$GITHUB_WORKSPACE/results/logs/build-signing.txt"
+          fi
+          mkdir -p "$RUNNER_TEMP/apps/prod"
+          cp -R build/ios/iphonesimulator/Runner.app "$RUNNER_TEMP/apps/prod/Runner.app"
+          codesign -dvvv --entitlements :- "$RUNNER_TEMP/apps/prod/Runner.app" > "$GITHUB_WORKSPACE/results/logs/codesign-production.txt" 2>&1 || true
+          echo "--- what the built app is signed with ---"
+          cat "$GITHUB_WORKSPACE/results/logs/codesign-production.txt" | head -40 || true
+
+      - name: Prepare the results folder
+        run: mkdir -p "$GITHUB_WORKSPACE/results" "$GITHUB_WORKSPACE/results/logs"
+
+      - name: Check the project and the BUILT app bundle
+        working-directory: .
+        run: |
+          # Not allowed to stop the job here: the verdict is given once, by the report.
+          set +e
+          python3 .github/scripts/ios_static_checks.py --root . \
+            --built "$RUNNER_TEMP/apps/prod/Runner.app" \
+            --json results/static.json 2>&1 | tee results/logs/static-checks.txt
+          echo "static checks exit code: ${PIPESTATUS[0]}"
+          exit 0
+
+      - name: Boot an iPhone simulator
+        id: sim
+        run: |
+          set -euo pipefail
+          xcrun simctl list runtimes
+          UDID="$(python3 - <<'PY'
+          import json, subprocess
+          devices = json.loads(subprocess.check_output(['xcrun', 'simctl', 'list', 'devices', 'available', '-j']))['devices']
+          candidates = []
+          for runtime, items in devices.items():
+              if 'iOS' not in runtime:
+                  continue
+              version = tuple(int(x) for x in runtime.split('iOS-')[-1].split('-') if x.isdigit())
+              for device in items:
+                  if device['name'].startswith('iPhone'):
+                      candidates.append((version, device['name'], device['udid']))
+          candidates.sort(reverse=True)
+          if not candidates:
+              raise SystemExit('no iPhone simulator is available on this runner')
+          print(candidates[0][2])
+          PY
+          )"
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          xcrun simctl list devices available | grep "$UDID" || true
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl list devices booted
+
+      - name: Self-test, full run (first launch of a fresh install)
+        working-directory: .
+        env:
+          UDID: ${{ steps.sim.outputs.udid }}
+        run: |
+          set -uo pipefail
+          now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+          data_dir() { xcrun simctl get_app_container "$UDID" "$BUNDLE_ID" data 2>/dev/null; }
+          wait_for_result() {
+            local deadline=$(( $(date +%s) + $1 )) dir file
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+              dir="$(data_dir)"
+              file="$dir/Documents/mm_selftest/result.json"
+              if [ -n "$dir" ] && [ -f "$file" ] && RESULT="$file" python3 -c "import json,os,sys; sys.exit(0 if json.load(open(os.environ['RESULT'])).get('done') else 1)" 2>/dev/null; then
+                echo "$file"; return 0
+              fi
+              sleep 0.5
+            done
+            return 1
+          }
+
+          xcrun simctl uninstall "$UDID" "$BUNDLE_ID" 2>/dev/null || true
+          xcrun simctl install "$UDID" "$RUNNER_TEMP/apps/selftest/Runner.app"
+          xcrun simctl launch --console "$UDID" "$BUNDLE_ID" > results/logs/selftest-full.log 2>&1 &
+          LAUNCH_PID=$!
+          if FILE="$(wait_for_result 300)"; then
+            cp "$FILE" results/full.json
+            echo "full run finished"
+          else
+            echo "::error::the full self-test run did not finish within 300 s (no result file)"
+          fi
+          sleep 1
+          xcrun simctl io "$UDID" screenshot results/selftest-full.png || true
+          xcrun simctl terminate "$UDID" "$BUNDLE_ID" || true
+          wait "$LAUNCH_PID" 2>/dev/null || true
+          exit 0
+
+      - name: Self-test, five cold opens of the saved page (a fresh process each)
+        working-directory: .
+        env:
+          UDID: ${{ steps.sim.outputs.udid }}
+        run: |
+          set -uo pipefail
+          now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+          data_dir() { xcrun simctl get_app_container "$UDID" "$BUNDLE_ID" data 2>/dev/null; }
+          wait_for_result() {
+            local deadline=$(( $(date +%s) + $1 )) dir file
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+              dir="$(data_dir)"
+              file="$dir/Documents/mm_selftest/result.json"
+              if [ -n "$dir" ] && [ -f "$file" ] && RESULT="$file" python3 -c "import json,os,sys; sys.exit(0 if json.load(open(os.environ['RESULT'])).get('done') else 1)" 2>/dev/null; then
+                echo "$file"; return 0
+              fi
+              sleep 0.2
+            done
+            return 1
+          }
+
+          WALLS=""
+          for n in 1 2 3 4 5; do
+            DIR="$(data_dir)"
+            rm -f "$DIR/Documents/mm_selftest/result.json"
+            START="$(now_ms)"
+            xcrun simctl launch --console "$UDID" "$BUNDLE_ID" > "results/logs/selftest-cold-$n.log" 2>&1 &
+            LAUNCH_PID=$!
+            if FILE="$(wait_for_result 120)"; then
+              END="$(now_ms)"
+              cp "$FILE" "results/cold_$n.json"
+              WALLS="$WALLS\"cold_$n\": $((END - START)),"
+              echo "cold run $n: $((END - START)) ms from the launch command to the result file"
+            else
+              echo "::error::cold run $n did not finish within 120 s"
+            fi
+            xcrun simctl terminate "$UDID" "$BUNDLE_ID" || true
+            wait "$LAUNCH_PID" 2>/dev/null || true
+            sleep 2
+          done
+          echo "{${WALLS%,}}" > results/walltimes.json
+          cat results/walltimes.json
+          exit 0
+
+      - name: The production app, fresh install, reaches the activation screen
+        working-directory: .
+        env:
+          UDID: ${{ steps.sim.outputs.udid }}
+        run: |
+          set -uo pipefail
+          data_dir() { xcrun simctl get_app_container "$UDID" "$BUNDLE_ID" data 2>/dev/null; }
+
+          xcrun simctl uninstall "$UDID" "$BUNDLE_ID" || true
+          xcrun simctl install "$UDID" "$RUNNER_TEMP/apps/prod/Runner.app"
+          xcrun simctl launch --console "$UDID" "$BUNDLE_ID" > results/logs/production-app.log 2>&1 &
+          LAUNCH_PID=$!
+
+          # Wait for a TERMINAL screen: the activation screen, or the startup error screen
+          # (which says why). "first_frame" only means the app drew something and has not
+          # finished starting; if that is all there is after the time is up, that is what
+          # the report says.
+          terminal() {
+            MARKER="$1" python3 -c "import json,os,sys; d=json.load(open(os.environ['MARKER'])); sys.exit(0 if d.get('screen') in ('activation_screen','startup_error') else 1)" 2>/dev/null
+          }
+          deadline=$(( $(date +%s) + 120 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            DIR="$(data_dir)"
+            if [ -n "$DIR" ] && [ -f "$DIR/Documents/mm_ui_marker.json" ] && terminal "$DIR/Documents/mm_ui_marker.json"; then
+              break
+            fi
+            sleep 0.5
+          done
+          DIR="$(data_dir)"
+          if [ -n "$DIR" ] && [ -f "$DIR/Documents/mm_ui_marker.json" ]; then
+            cp "$DIR/Documents/mm_ui_marker.json" results/ui_marker.json
+            echo "what the app reported:"; cat results/ui_marker.json; echo
+          else
+            echo "::error::the production app wrote no marker at all in 120 s (no frame was drawn, or the reporting failed)"
+          fi
+
+          sleep 2
+          xcrun simctl io "$UDID" screenshot results/activation-screen.png || true
+          xcrun simctl terminate "$UDID" "$BUNDLE_ID" || true
+          wait "$LAUNCH_PID" 2>/dev/null || true
+          exit 0
+
+      - name: Collect crash reports and the simulator's log of the app
+        if: always()
+        working-directory: .
+        env:
+          UDID: ${{ steps.sim.outputs.udid }}
+        run: |
+          mkdir -p results/crashes
+          cp "$HOME"/Library/Logs/DiagnosticReports/Runner* results/crashes/ 2>/dev/null || true
+          ls results/crashes || true
+          xcrun simctl spawn "$UDID" log show --last 30m --style compact \
+            --predicate 'process == "Runner"' > results/logs/simulator-os-log.txt 2>&1 || true
+          xcrun simctl list devices booted > results/logs/simulator-info.txt 2>&1 || true
+          sw_vers >> results/logs/simulator-info.txt 2>&1 || true
+          xcodebuild -version >> results/logs/simulator-info.txt 2>&1 || true
+
+      - name: Report
+        id: report
+        working-directory: .
+        run: |
+          set +e
+          python3 .github/scripts/ios_sim_report.py --results results --out results/report.md
+          echo "verdict=$?" >> "$GITHUB_OUTPUT"
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-simulator-report
+          path: results
+          if-no-files-found: warn
+
+      - name: Fail the job if the report found a problem
+        if: ${{ steps.report.outputs.verdict != '0' }}
+        run: |
+          echo "::error::the iOS simulator run found problems; see the report in the job summary and the artifact 'ios-simulator-report'"
+          exit 1

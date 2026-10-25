@@ -1,13 +1,17 @@
 <?php
 declare(strict_types=1);
 
-if (PHP_SAPI !== 'cli') {
+$browserInstall = defined('MM_BROWSER_INSTALL') && MM_BROWSER_INSTALL === true;
+if (PHP_SAPI !== 'cli' && !$browserInstall) {
     http_response_code(403);
     exit("CLI only.\n");
 }
 
 function out(string $s=''): void { echo $s . PHP_EOL; }
-function fail(string $s): never { fwrite(STDERR, "ERROR: $s\n"); exit(1); }
+function fail(string $s): never {
+    if (defined('MM_BROWSER_INSTALL') && MM_BROWSER_INSTALL) throw new RuntimeException($s);
+    fwrite(STDERR, "ERROR: $s\n"); exit(1);
+}
 function argValue(array $argv, string $name): ?string {
     foreach ($argv as $arg) {
         if (str_starts_with($arg, "--$name=")) return substr($arg, strlen($name) + 3);
@@ -34,6 +38,7 @@ function copyTree(string $src, string $dst): void {
             throw new RuntimeException("Cannot create " . dirname($dst));
         }
         if (!copy($src, $dst)) throw new RuntimeException("Cannot copy $src");
+        if (!chmod($dst, fileperms($src) & 0777)) throw new RuntimeException("Cannot preserve file mode: $dst");
         return;
     }
     if (!is_dir($src)) return;
@@ -49,15 +54,24 @@ function copyTree(string $src, string $dst): void {
             if (!is_dir($target) && !mkdir($target, 0750, true) && !is_dir($target)) throw new RuntimeException("Cannot create $target");
         } else {
             if (!copy($item->getPathname(), $target)) throw new RuntimeException("Cannot copy " . $item->getPathname());
+            if (!chmod($target, $item->getPerms() & 0777)) throw new RuntimeException("Cannot preserve file mode: $target");
         }
     }
 }
 function runPhp(string $file): void {
+    if (defined('MM_BROWSER_INSTALL') && MM_BROWSER_INSTALL) {
+        (static function (string $file): void {
+            $conn = $GLOBALS['mm_browser_connection'];
+            require $file;
+        })($file);
+        return;
+    }
     $cmd = escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($file);
     passthru($cmd, $code);
     if ($code !== 0) fail("Command failed ($code): $file");
 }
 function hiddenPrompt(string $label): string {
+    if (defined('MM_BROWSER_INSTALL') && MM_BROWSER_INSTALL) fail('Podaj sekret MobileAPI tej parafii w formularzu.');
     fwrite(STDOUT, $label);
     $stty = trim((string) shell_exec('command -v stty 2>/dev/null'));
     if ($stty !== '') shell_exec('stty -echo');
@@ -95,7 +109,15 @@ out("=== Ministrant Manager Universal Parish Installer v1 ===");
 out("Target: $targetRoot");
 out("Mode: " . ($dryRun ? 'DRY RUN' : 'INSTALL'));
 
+// Serialize installers before reading/snapshotting the target.
+$installLock = fopen($targetRoot . '/.mm-installer.lock', 'c');
+if ($installLock === false || !flock($installLock, LOCK_EX | LOCK_NB)) {
+    fail('Another installer is running for this parish.');
+}
+
+
 require $dbConfig;
+if ($browserInstall) $GLOBALS['mm_browser_connection'] = $conn ?? null;
 if (!isset($conn) || !($conn instanceof mysqli)) fail("config/database.php did not provide mysqli \$conn");
 
 $profiles = [];
@@ -135,11 +157,13 @@ out("Detected profile: {$profile['label']} [$profileKey]");
 
 if ($dryRun) {
     out('DRY RUN OK: profile recognized; no files/database were changed.');
+    if ($browserInstall) return;
     exit(0);
 }
 
+if ($browserInstall && ($profile['hardeners'] ?? []) !== []) fail('This profile requires the CLI installer.');
 $secretPath = $publicRoot . '/config/mobile_internal_api_secret.php';
-$secret = getenv('MOBILE_INTERNAL_API_SECRET') ?: '';
+$secret = $browserInstall ? ($GLOBALS['mm_browser_secret'] ?? '') : (getenv('MOBILE_INTERNAL_API_SECRET') ?: '');
 if ($secret === '' && is_file($secretPath)) {
     $existing = file_get_contents($secretPath) ?: '';
     if (preg_match("/define\(['\"]MOBILE_INTERNAL_API_SECRET['\"],\s*['\"]([^'\"]+)['\"]\)/", $existing, $m)
@@ -150,7 +174,7 @@ if ($secret === '' && is_file($secretPath)) {
 if ($secret === '') $secret = hiddenPrompt('MOBILE_INTERNAL_API_SECRET for this parish: ');
 if ($secret === '' || strlen($secret) < 24) fail('Secret is missing or too short.');
 
-$stamp = date('Ymd_His');
+$stamp = date('Ymd_His') . '_' . bin2hex(random_bytes(4));
 $backupRoot = $targetRoot . '/mm-installer-backups/' . $stamp;
 if (!mkdir($backupRoot, 0700, true) && !is_dir($backupRoot)) fail("Cannot create backup $backupRoot");
 
@@ -162,6 +186,11 @@ $protect = [
     'public_html/public/mobile_handoff.php',
     'public_html/config/mobile_internal_api_secret.php',
     'public_html/.htaccess',
+    'public_html/mm-mobile-bootstrap.php',
+    'public_html/mm-mobile-config.php',
+    'public_html/mm-mobile-session-login.php',
+    'public_html/mm-mobile-session-change-password.php',
+    'public_html/mm-mobile-webview-handoff.php',
 ];
 foreach ($profile['legacy_backup_files'] ?? [] as $legacyRel) {
     $protect[] = 'public_html/' . ltrim($legacyRel, '/');
@@ -179,9 +208,9 @@ foreach ($protect as $rel) {
 out("Backup: $backupRoot");
 
 $GLOBALS['mm_install_complete'] = false;
-register_shutdown_function(static function () use ($targetRoot, $backupRoot, $backupItems, $createdItems): void {
+$restoreSnapshot = static function () use ($targetRoot, $backupRoot, $backupItems, $createdItems): void {
     if (($GLOBALS['mm_install_complete'] ?? false) === true) return;
-    fwrite(STDERR, "\nINSTALL FAILED — restoring file snapshot automatically...\n");
+    out("INSTALL FAILED — restoring file snapshot automatically...");
     foreach (array_reverse($createdItems) as $rel) removeTree($targetRoot . '/' . $rel);
     foreach ($backupItems as $rel) {
         $src = $backupRoot . '/files/' . $rel;
@@ -189,8 +218,11 @@ register_shutdown_function(static function () use ($targetRoot, $backupRoot, $ba
         removeTree($dst);
         copyTree($src, $dst);
     }
-    fwrite(STDERR, "FILE ROLLBACK OK. Additive DB migrations, if already applied, were intentionally left in place.\n");
-});
+    out("FILE ROLLBACK OK. Additive DB migrations, if already applied, were intentionally left in place.");
+    $GLOBALS['mm_install_complete'] = true;
+};
+$GLOBALS['mm_restore_snapshot'] = $restoreSnapshot;
+register_shutdown_function($restoreSnapshot);
 
 // Run profile hardening BEFORE MobileAPI migrations. If the parish has
 // drifted from the audited baseline, the hardener fails closed here and
@@ -208,6 +240,22 @@ $stagedCore = $targetRoot . '/mobileapi-core.__new__';
 removeTree($stagedCore);
 copyTree($packageRoot . '/mobileapi-core', $stagedCore);
 file_put_contents($stagedCore . '/active-profile.php', "<?php\nreturn " . var_export($profile['adapter_dir'], true) . ";\n");
+// Prepare schema and metadata while the previous endpoints still use the old core.
+$secretPhp = "<?php\ndefine('MOBILE_CENTRAL_BASE_URL', 'https://app.ministrant.eu');\ndefine('MOBILE_INTERNAL_API_SECRET', " . var_export($secret, true) . ");\n";
+if (file_put_contents($secretPath, $secretPhp) === false) fail('Cannot write parish secret config.');
+chmod($secretPath, 0600);
+
+copy($packageRoot . '/scripts/preflight.php', $targetRoot . '/preflight.php');
+runPhp($targetRoot . '/preflight.php');
+
+foreach (glob($packageRoot . '/migrations/*.sql') ?: [] as $migration) {
+    out('Migration: ' . basename($migration));
+    runSqlFile($conn, $migration);
+}
+
+$metaInstaller = $stagedCore . '/' . $profile['install_meta'];
+runPhp($metaInstaller);
+
 $oldCore = $targetRoot . '/mobileapi-core.__old__';
 removeTree($oldCore);
 if (is_dir($targetRoot . '/mobileapi-core') && !rename($targetRoot . '/mobileapi-core', $oldCore)) {
@@ -221,33 +269,17 @@ if (!rename($stagedCore, $targetRoot . '/mobileapi-core')) {
 copyTree($packageRoot . '/public_html-additions/api/mobile', $publicRoot . '/api/mobile');
 copyTree($packageRoot . '/public_html-additions/public/mobile_handoff.php', $publicRoot . '/public/mobile_handoff.php');
 
-$secretPhp = "<?php\ndefine('MOBILE_CENTRAL_BASE_URL', 'https://app.ministrant.eu');\ndefine('MOBILE_INTERNAL_API_SECRET', " . var_export($secret, true) . ");\n";
-if (file_put_contents($secretPath, $secretPhp) === false) fail('Cannot write parish secret config.');
-chmod($secretPath, 0600);
-
 $htaccess = $publicRoot . '/.htaccess';
 $snippet = file_get_contents($packageRoot . '/public_html-additions/htaccess-snippet.txt');
 $currentHt = is_file($htaccess) ? (file_get_contents($htaccess) ?: '') : '';
-$marker = '# BEGIN MINISTRANT MANAGER MOBILEAPI';
-if (!str_contains($currentHt, $marker)) {
-    // MobileAPI routes MUST be evaluated before any legacy catch-all/front
-    // controller rules already present in the parish .htaccess. Appending
-    // them at the end lets an earlier [L] rule swallow /api/v1/mobile/*
-    // and can surface as an unrelated 500 from the legacy router.
-    $mobileBlock = $marker . "\n" . trim((string)$snippet) . "\n# END MINISTRANT MANAGER MOBILEAPI\n\n";
-    file_put_contents($htaccess, $mobileBlock . ltrim($currentHt));
+require_once $packageRoot . '/scripts/routing_config.php';
+foreach (['bootstrap', 'config', 'session-login', 'session-change-password', 'webview-handoff'] as $endpoint) {
+    $proxy = 'mm-mobile-' . $endpoint . '.php';
+    if (!copy($packageRoot . '/public_html-additions/' . $proxy, $publicRoot . '/' . $proxy)) fail('Cannot write MobileAPI proxy.');
 }
-
-copy($packageRoot . '/scripts/preflight.php', $targetRoot . '/preflight.php');
-runPhp($targetRoot . '/preflight.php');
-
-foreach (glob($packageRoot . '/migrations/*.sql') ?: [] as $migration) {
-    out('Migration: ' . basename($migration));
-    runSqlFile($conn, $migration);
+if (file_put_contents($htaccess, canonicalMobileRouting($currentHt, (string)$snippet)) === false) {
+    fail('Cannot write MobileAPI routing.');
 }
-
-$metaInstaller = $targetRoot . '/mobileapi-core/' . $profile['install_meta'];
-runPhp($metaInstaller);
 
 $manifest = [
     'installer_version' => 1,
@@ -264,7 +296,8 @@ removeTree($oldCore);
 $GLOBALS['mm_install_complete'] = true;
 
 out();
-out('INSTALL OK');
+out('MOBILEAPI INSTALL OK');
+out('Legacy application hardening was not implied by this installation.');
 out("Profile: $profileKey");
 out("Rollback: php " . $packageRoot . "/rollback.php --backup=$backupRoot");
 out('Next: run smoke/acceptance against the parish URL.');

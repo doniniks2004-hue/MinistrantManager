@@ -38,6 +38,14 @@ import 'snapshot_manifest.dart';
 /// purpose; nothing in here infers or caches an "active" identity.
 class SnapshotStore {
   Directory? _rootOverride;
+  int _generation = 0;
+  int get generation => _generation;
+  Future<void> _pendingMutation = Future<void>.value();
+  Future<void> _serial(Future<void> Function() action) {
+    final result = _pendingMutation.then((_) => action());
+    _pendingMutation = result.catchError((_) {});
+    return result;
+  }
 
   /// Offline-architecture milestone, P8.2: review round — "snapshot może
   /// zawierać realny panel użytkownika", the same severity class as the
@@ -51,7 +59,8 @@ class SnapshotStore {
 
   /// Tests pass a temp directory here instead of the real platform
   /// application-support directory.
-  SnapshotStore({required this.encryptor, Directory? rootOverride}) : _rootOverride = rootOverride;
+  SnapshotStore({required this.encryptor, Directory? rootOverride})
+    : _rootOverride = rootOverride;
 
   Future<Directory> _cacheRoot() async {
     final override = _rootOverride;
@@ -66,12 +75,14 @@ class SnapshotStore {
     required String pagePath,
   }) async {
     final root = await _cacheRoot();
-    return Directory(p.join(
-      root.path,
-      _sanitizeSegment(parishId),
-      _sanitizeSegment(userId),
-      _sanitizeSegment(pagePath),
-    ));
+    return Directory(
+      p.join(
+        root.path,
+        _sanitizeSegment(parishId),
+        _sanitizeSegment(userId),
+        _sanitizeSegment(pagePath),
+      ),
+    );
   }
 
   /// Returns the directory to point [LocalSnapshotServer.rootDirectory]
@@ -85,10 +96,86 @@ class SnapshotStore {
     required String userId,
     required String pagePath,
   }) async {
-    final dir = await _pageDirectory(parishId: parishId, userId: userId, pagePath: pagePath);
-    final manifest = await readManifest(dir);
-    if (manifest == null) return null;
+    final dir = await _pageDirectory(
+      parishId: parishId,
+      userId: userId,
+      pagePath: pagePath,
+    );
+    final manifest = await _readManifestRecovering(dir);
+    if (manifest == null ||
+        manifest.parishId != parishId ||
+        manifest.userId != userId ||
+        manifest.path != pagePath)
+      return null;
     return dir;
+  }
+
+  /// Reads the manifest of [dir], waiting for the write queue ONLY when there
+  /// is none to read.
+  ///
+  /// The first version of the crash recovery below made every read go through
+  /// the write queue. A read then waited for any write in progress, and a write
+  /// is in progress right after every page load (the page is captured and
+  /// encrypted), which is exactly when the first switch to the saved copy
+  /// happens: the copy that was lying on disk, complete and readable, was not
+  /// read until the new one had been written. The directory of a page is
+  /// replaced by renaming, so it is only ever missing for the instant between
+  /// two renames, or after a crash; only then is waiting (or recovering)
+  /// needed.
+  Future<SnapshotManifest?> _readManifestRecovering(Directory dir) async {
+    final manifest = await readManifest(dir);
+    if (manifest != null) return manifest;
+    await _recoverInterruptedSwap(dir);
+    return readManifest(dir);
+  }
+
+  /// Crash recovery for the replacement in [_writeSnapshot].
+  ///
+  /// Replacing a snapshot first moves the old directory aside (`.trash-*`) and
+  /// then moves the new one into its place. Between those two renames the
+  /// page has NO directory, and a process killed there (the OS reclaiming the
+  /// app, a crash, a flat battery) used to leave it that way for good: the
+  /// catch that undoes a failed second rename cannot run in a dead process,
+  /// and the saved copy, complete and intact in the trash directory, was
+  /// never looked at again.
+  ///
+  /// If the page directory is missing and an old copy was set aside, put the
+  /// newest one back, so there is always one COMPLETE copy. Anything half
+  /// written (`.tmp-*`) and any other leftover of that page is deleted: it
+  /// can only be a leftover, because writes and this method share one queue
+  /// ([_serial]), so none can be in progress. Running in that queue also
+  /// means a reader waits for a write that is under way instead of looking at
+  /// the page in the middle of its replacement.
+  Future<void> _recoverInterruptedSwap(Directory realDir) {
+    return _serial(() async {
+      try {
+        if (await realDir.exists()) return;
+        final parent = realDir.parent;
+        if (!await parent.exists()) return;
+        final name = p.basename(realDir.path);
+        final trashed = <Directory>[];
+        final temps = <Directory>[];
+        await for (final entry in parent.list(followLinks: false)) {
+          if (entry is! Directory) continue;
+          final base = p.basename(entry.path);
+          if (base.startsWith('$name.trash-')) trashed.add(entry);
+          if (base.startsWith('$name.tmp-')) temps.add(entry);
+        }
+        if (trashed.isEmpty) return;
+        trashed.sort(
+          (a, b) => b.statSync().modified.compareTo(a.statSync().modified),
+        );
+        await trashed.first.rename(realDir.path);
+        for (final leftover in [...trashed.skip(1), ...temps]) {
+          try {
+            await leftover.delete(recursive: true);
+          } catch (_) {}
+        }
+      } catch (_) {
+        // Recovery is best-effort: failing leaves things exactly as they
+        // were, and the caller reads "no copy" rather than a wrong one.
+      }
+    });
   }
 
   Future<SnapshotManifest?> readManifest(Directory pageDirectory) async {
@@ -97,7 +184,8 @@ class SnapshotStore {
     try {
       final encryptedBytes = await file.readAsBytes();
       final decryptedBytes = encryptor.decryptBytes(encryptedBytes);
-      final decoded = jsonDecode(utf8.decode(decryptedBytes)) as Map<String, dynamic>;
+      final decoded =
+          jsonDecode(utf8.decode(decryptedBytes)) as Map<String, dynamic>;
       return SnapshotManifest.tryFromJson(decoded);
     } catch (_) {
       // Covers a corrupt/partial manifest (pre-existing reasoning) AND,
@@ -116,8 +204,17 @@ class SnapshotStore {
     required String userId,
     required String pagePath,
   }) async {
-    final dir = await _pageDirectory(parishId: parishId, userId: userId, pagePath: pagePath);
-    return readManifest(dir);
+    final dir = await _pageDirectory(
+      parishId: parishId,
+      userId: userId,
+      pagePath: pagePath,
+    );
+    final manifest = await _readManifestRecovering(dir);
+    if (manifest?.parishId != parishId ||
+        manifest?.userId != userId ||
+        manifest?.path != pagePath)
+      return null;
+    return manifest;
   }
 
   /// Atomically replaces whatever snapshot (if any) exists for this
@@ -154,25 +251,59 @@ class SnapshotStore {
     required String html,
     required Map<String, List<int>> assets,
     DateTime? capturedAt,
+    int? expectedGeneration,
+  }) => _serial(
+    () => _writeSnapshot(
+      parishId: parishId,
+      userId: userId,
+      pagePath: pagePath,
+      html: html,
+      assets: assets,
+      capturedAt: capturedAt,
+      expectedGeneration: expectedGeneration,
+    ),
+  );
+
+  Future<void> _writeSnapshot({
+    required String parishId,
+    required String userId,
+    required String pagePath,
+    required String html,
+    required Map<String, List<int>> assets,
+    DateTime? capturedAt,
+    int? expectedGeneration,
   }) async {
+    final writeGeneration = expectedGeneration ?? generation;
+    if (writeGeneration != generation) return;
     final root = await _cacheRoot();
-    final parentDir = Directory(p.join(root.path, _sanitizeSegment(parishId), _sanitizeSegment(userId)));
+    final parentDir = Directory(
+      p.join(root.path, _sanitizeSegment(parishId), _sanitizeSegment(userId)),
+    );
     await parentDir.create(recursive: true);
 
     final pageSegment = _sanitizeSegment(pagePath);
     final realDir = Directory(p.join(parentDir.path, pageSegment));
-    final tempDir = Directory(p.join(parentDir.path, '$pageSegment.tmp-${_randomSuffix()}'));
+    final tempDir = Directory(
+      p.join(parentDir.path, '$pageSegment.tmp-${_randomSuffix()}'),
+    );
 
     await tempDir.create(recursive: true);
     try {
       // Offline-architecture milestone, P8.2: encrypted BEFORE the bytes
       // ever touch disk — see `encryptor`'s own docblock on this class.
-      await File(p.join(tempDir.path, 'snapshot.html')).writeAsBytes(encryptor.encryptBytes(utf8.encode(html)));
+      await File(p.join(tempDir.path, 'snapshot.html'))
+          .writeAsBytes(await encryptor.encryptBytesInBackground(utf8.encode(html)));
 
       for (final entry in assets.entries) {
-        final assetFile = File(p.join(tempDir.path, 'assets', entry.key));
+        final assetRoot = p.join(tempDir.path, 'assets');
+        final assetPath = p.normalize(p.join(assetRoot, entry.key));
+        if (!p.isWithin(assetRoot, assetPath))
+          throw const FormatException('Invalid snapshot asset path.');
+        final assetFile = File(assetPath);
         await assetFile.parent.create(recursive: true);
-        await assetFile.writeAsBytes(encryptor.encryptBytes(entry.value));
+        // Fetched without credentials, so public by construction: authenticated,
+        // not encrypted (see SnapshotEncryptor.sealPublic).
+        await assetFile.writeAsBytes(encryptor.sealPublic('assets/${entry.key}', entry.value));
       }
 
       final manifest = SnapshotManifest(
@@ -190,37 +321,88 @@ class SnapshotStore {
       // manifest's own `path` field is itself real user-navigation data,
       // not something to leave as the one plaintext file here.
       final manifestBytes = utf8.encode(jsonEncode(manifest.toJson()));
-      await File(p.join(tempDir.path, 'manifest.json')).writeAsBytes(encryptor.encryptBytes(manifestBytes));
+      await File(p.join(tempDir.path, 'manifest.json'))
+          .writeAsBytes(encryptor.encryptBytes(manifestBytes));
 
-      if (await realDir.exists()) {
-        final trashDir = Directory(p.join(parentDir.path, '$pageSegment.trash-${_randomSuffix()}'));
-        await realDir.rename(trashDir.path);
-        await tempDir.rename(realDir.path);
-        try {
-          await trashDir.delete(recursive: true);
-        } catch (_) {
-          // Best-effort cleanup only — see this method's own docblock,
-          // step 4: the trashed old copy is already fully unreferenced
-          // by this point, so failing to remove it never affects
-          // correctness, only leaves an orphaned directory for a future
-          // cache-eviction pass to find.
-        }
-      } else {
-        await tempDir.rename(realDir.path);
+      if (writeGeneration != generation) {
+        if (await tempDir.exists()) await tempDir.delete(recursive: true);
+        return;
       }
+      final swappedIn = await _replaceDirectory(realDir, tempDir, parentDir, pageSegment);
+      if (swappedIn) _reportWritten(realDir, html, assets, writeGeneration);
     } catch (_) {
       // The real snapshot (if any) was never touched until the rename
-      // above, which either fully succeeded or wasn't reached — the
-      // only cleanup needed on any failure is the temp directory itself.
+      // inside _replaceDirectory, which either fully succeeded or wasn't
+      // reached — the only cleanup needed on any failure is the temp
+      // directory itself.
       try {
         await tempDir.delete(recursive: true);
       } catch (_) {
-        // Best-effort cleanup — the real snapshot was never touched
-        // (see the outer catch's own comment), so a failure to remove
-        // the abandoned temp directory here never affects correctness.
+        // Best-effort cleanup — the real snapshot was never touched.
       }
       rethrow;
     }
+  }
+
+  /// Called after a page was written and swapped in, once per file, with the
+  /// file as it now lives and the plaintext that was just written. Lets the
+  /// server remember what it would otherwise have to decrypt: a page that was
+  /// just captured costs nothing to open. Not called when a sign-out happened
+  /// while the write was running.
+  void Function(File file, List<int> plaintext)? onWritten;
+
+  void _reportWritten(
+    Directory realDir,
+    String html,
+    Map<String, List<int>> assets,
+    int writeGeneration,
+  ) {
+    final hook = onWritten;
+    if (hook == null || writeGeneration != generation) return;
+    try {
+      hook(File(p.join(realDir.path, 'snapshot.html')), utf8.encode(html));
+      for (final entry in assets.entries) {
+        hook(File(p.join(realDir.path, 'assets', entry.key)), entry.value);
+      }
+    } catch (_) {
+      // A cache hint: never a reason to fail a write that succeeded.
+    }
+  }
+
+  /// Puts [tempDir] in place of [realDir] by renaming: the old copy is moved
+  /// aside first and put back if the second rename fails, so there is always one
+  /// complete copy (see the crash recovery above for a process killed between
+  /// the two). Returns true once the new directory is in place.
+  Future<bool> _replaceDirectory(
+    Directory realDir,
+    Directory tempDir,
+    Directory parentDir,
+    String pageSegment,
+  ) async {
+    if (await realDir.exists()) {
+      final trashDir = Directory(
+        p.join(parentDir.path, '$pageSegment.trash-${_randomSuffix()}'),
+      );
+      await realDir.rename(trashDir.path);
+      try {
+        await tempDir.rename(realDir.path);
+      } catch (_) {
+        if (!await realDir.exists() && await trashDir.exists()) {
+          await trashDir.rename(realDir.path);
+        }
+        rethrow;
+      }
+      try {
+        await trashDir.delete(recursive: true);
+      } catch (_) {
+        // Best-effort cleanup only: the trashed old copy is already fully
+        // unreferenced, so failing to remove it never affects correctness, only
+        // leaves an orphaned directory for a future cache-eviction pass.
+      }
+    } else {
+      await tempDir.rename(realDir.path);
+    }
+    return true;
   }
 
   /// Logout (review round point 11/19/21): removes every snapshot for
@@ -228,9 +410,22 @@ class SnapshotStore {
   /// level data (that lives entirely outside `local-cache/`, in
   /// SecureStorageService/AppDatabase) and never touches any OTHER
   /// user's snapshots, including other users within the SAME parish.
-  Future<void> clearForUser({required String parishId, required String userId}) async {
+  Future<void> clearForUser({
+    required String parishId,
+    required String userId,
+  }) {
+    _generation++;
+    return _serial(() => _clearForUser(parishId: parishId, userId: userId));
+  }
+
+  Future<void> _clearForUser({
+    required String parishId,
+    required String userId,
+  }) async {
     final root = await _cacheRoot();
-    final userDir = Directory(p.join(root.path, _sanitizeSegment(parishId), _sanitizeSegment(userId)));
+    final userDir = Directory(
+      p.join(root.path, _sanitizeSegment(parishId), _sanitizeSegment(userId)),
+    );
     if (await userDir.exists()) {
       await userDir.delete(recursive: true);
     }
@@ -242,7 +437,12 @@ class SnapshotStore {
   /// DEVICE_REVOKED/PARISH_DISABLED, so "offline cache" can never be
   /// used to route around either (review round point 22: "Nie może
   /// pozostać możliwość obejścia blokady przez offline cache").
-  Future<void> clearForParish({required String parishId}) async {
+  Future<void> clearForParish({required String parishId}) {
+    _generation++;
+    return _serial(() => _clearForParish(parishId: parishId));
+  }
+
+  Future<void> _clearForParish({required String parishId}) async {
     final root = await _cacheRoot();
     final parishDir = Directory(p.join(root.path, _sanitizeSegment(parishId)));
     if (await parishDir.exists()) {
@@ -254,7 +454,12 @@ class SnapshotStore {
   /// Not reachable from any normal app flow today; kept for completeness
   /// (e.g. a future "clear all app data" debug/support action) rather
   /// than forcing a caller to reach into `_cacheRoot()` itself.
-  Future<void> clearAll() async {
+  Future<void> clearAll() {
+    _generation++;
+    return _serial(() => _clearAll());
+  }
+
+  Future<void> _clearAll() async {
     final root = await _cacheRoot();
     if (await root.exists()) {
       await root.delete(recursive: true);
@@ -271,7 +476,7 @@ class SnapshotStore {
   static String _sanitizeSegment(String input) {
     final stripped = input.startsWith('/') ? input.substring(1) : input;
     final safe = stripped.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
-    return safe.isEmpty ? '_' : safe;
+    return safe.isEmpty || safe == '.' || safe == '..' ? '_' : safe;
   }
 
   static final Random _random = Random();
@@ -280,6 +485,9 @@ class SnapshotStore {
     // Collision-avoidance for two near-simultaneous writes of the SAME
     // page, nothing more — never read back or relied on for anything
     // other than being a temporary, soon-discarded directory name.
-    return List.generate(8, (_) => _random.nextInt(16).toRadixString(16)).join();
+    return List.generate(
+      8,
+      (_) => _random.nextInt(16).toRadixString(16),
+    ).join();
   }
 }

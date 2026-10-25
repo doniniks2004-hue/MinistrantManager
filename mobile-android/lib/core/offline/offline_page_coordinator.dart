@@ -1,8 +1,21 @@
-import 'package:path/path.dart' as p;
+import 'dart:async';
+import 'dart:io';
+
+import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
+
+import 'page_identity.dart';
 
 import '../../features/webview/webview_handoff_service.dart';
+import '../network/network_signal.dart';
+import '../security/access_refusals.dart';
+import '../security/wipe_lock.dart';
+import '../sync/sync_engine.dart' show DeviceAuthState;
+import 'connectivity_monitor.dart';
 import 'connectivity_probe.dart';
 import 'local_snapshot_server.dart';
+import 'snapshot_encryptor.dart';
+import 'server_reachability.dart';
 import 'snapshot_capture_service.dart';
 import 'snapshot_store.dart';
 
@@ -31,6 +44,25 @@ import 'snapshot_store.dart';
 /// the base for resolving that page's own relative resource references,
 /// which would resolve to the wrong thing entirely if based on
 /// mobile_handoff.php's own location instead).
+/// What is known about whether a saved copy of a page exists.
+///
+/// Three answers, because "the read did not finish" is not "there is no copy": the first is a
+/// measurement of the store, the second a fact about the user's data. Treating them alike made a
+/// slow manifest read look like an empty store, or (the other way round) like a missing network.
+enum SavedCopyFact {
+  /// Nobody has asked yet: [OfflinePageCoordinator.plan] asks, and the time that takes is part of its budget.
+  unchecked,
+
+  /// A manifest was read: a copy exists.
+  exists,
+
+  /// The store answered and there is no manifest: no copy.
+  absent,
+
+  /// The read timed out or failed: nothing is known.
+  unknown,
+}
+
 class OfflinePageCoordinator {
   OfflinePageCoordinator({
     required this.connectivityProbe,
@@ -38,9 +70,194 @@ class OfflinePageCoordinator {
     required this.snapshotStore,
     required this.localServer,
     required this.handoffService,
-  });
+    this.onlineTimeout = const Duration(milliseconds: 1500),
+    this.firstOnlineTimeout = const Duration(seconds: 3),
+    this.offlinePlanTimeout = const Duration(milliseconds: 1500),
+    this.reachability = const ServerReachability(),
+    ConnectivityMonitor? connectivity,
+    AccessRefusals? refusals,
+    this.reverifyDevice,
+    this.reverifyTimeout = const Duration(seconds: 3),
+    WipeLock? wipeLock,
+  }) : wipeLock = wipeLock ?? WipeLock(),
+       connectivity = connectivity ?? ConnectivityMonitor(PlatformNetworkSignal()),
+       refusals = refusals ?? AccessRefusals(handoffService.secureStorage.refusalStorage) {
+    localServer.trace = trace;
+    // While a wipe is running (or unfinished) the loopback server serves nothing.
+    this.wipeLock.addListener(() {
+      if (this.wipeLock.isHeld) {
+        _wipeEpoch++;
+        localServer.rootDirectory = null;
+      }
+    });
+    if (this.wipeLock.isHeld) localServer.rootDirectory = null;
+    // Ask the platform's AES-GCM to prove it agrees with OpenSSL, now, so that the
+    // answer is known before the first page is read (see SnapshotEncryptor).
+    SnapshotEncryptor.statusLog = trace;
+    unawaited(SnapshotEncryptor.verifyPlatform());
+    // A page that has just been written is in memory the moment it is saved:
+    // the server needs no decryption for it.
+    snapshotStore.onWritten = (file, plaintext) {
+      unawaited(localServer.remember(file, plaintext));
+    };
+  }
+
+  /// [prewarmPage] for the page the app opens (the dashboard) of the signed-in
+  /// user, started as soon as the services exist: well before the screen that
+  /// shows it has been built, so that it is ready by the time the first switch
+  /// to the saved copy can happen. Never throws; does nothing before an
+  /// activation and a sign-in.
+  Future<void> prewarmEntryPage() async {
+    try {
+      final storage = handoffService.secureStorage;
+      final parishId = await storage.parishId;
+      final userId = await storage.currentUserId;
+      if (parishId == null || userId == null) return;
+      await prewarmPage(
+        parishId: parishId,
+        userId: userId.toString(),
+        pagePath: '/public/dashboard.php',
+      );
+    } catch (_) {
+      // Best effort.
+    }
+  }
+
+  /// Decrypts the saved copy of [pagePath] into the server's memory ahead of
+  /// time, in the background, so that opening it later costs nothing. For the
+  /// moments the copy is not needed yet: while the live page loads, and just
+  /// after a new copy was written. Never throws.
+  Future<void> prewarmPage({
+    required String parishId,
+    required String userId,
+    required String pagePath,
+  }) async {
+    try {
+      final dir = await snapshotStore.getPageDirectoryIfReady(
+        parishId: parishId,
+        userId: userId,
+        pagePath: pagePath,
+      );
+      if (dir != null) await localServer.prewarm(dir);
+    } catch (_) {
+      // Best effort: the copy is simply decrypted when it is opened.
+    }
+  }
+
+  /// What the operating system says about the device's connection, turned
+  /// into decisions (lost / doubtful / returned). It says nothing about the
+  /// server: "returned" only means "ask the server now".
+  final ConnectivityMonitor connectivity;
+
+  /// A line for the debug log (never in release builds): used to measure
+  /// the time from a loss of connection to the saved copy being visible.
+  void trace(String message) {
+    if (kDebugMode || _traceInAnyBuild) debugPrint(message);
+  }
+
+  /// `--dart-define=MM_TRACE=true` turns the trace on in a release or profile
+  /// build as well, so that timings can be taken from the build that is
+  /// actually shipped (a debug build runs the Dart code several times slower).
+  /// Everything in the trace is already free of tokens, tickets, cookies and
+  /// addresses' queries.
+  static const _traceInAnyBuild = bool.fromEnvironment('MM_TRACE');
 
   final ConnectivityProbe connectivityProbe;
+
+  /// What the server has refused and the app remembers (see [AccessRefusals]). Consulted before any
+  /// saved copy is handed out: a copy is never a way around a refusal that was received.
+  final AccessRefusals refusals;
+
+  /// Asks the CENTRAL server again whether this device is authorized (SyncEngine.reverifyDevice).
+  /// Used when the PARISH server refuses the device: its answer is a copy of the central one made
+  /// up to 10 minutes ago, so an old "revoked" can outlive a later ACTIVE. Null: no way to ask, and
+  /// the parish's refusal stands as it is.
+  final Future<DeviceAuthState?> Function()? reverifyDevice;
+  final Duration reverifyTimeout;
+
+  /// Held while this device's data is being erased or the erasing is unfinished (see [WipeLock]).
+  /// While it is held no saved copy is offered, opened or served, and no page is requested.
+  final WipeLock wipeLock;
+
+  /// Counts the wipes that have STARTED. An operation remembers it when it begins: if a wipe has
+  /// started since (even one that is already over), what the operation found out belongs to the data
+  /// that was erased, and is neither acted on nor allowed to bring access back or lift a block.
+  int _wipeEpoch = 0;
+  bool _wipeSince(int epoch) => wipeLock.isHeld || epoch != _wipeEpoch;
+
+  /// Budget for the CONNECT phase only: minting the handoff ticket. It
+  /// deliberately does NOT cover rendering the PHP page afterwards — the
+  /// screen owns a separate, longer budget for that, started only once a
+  /// ticket actually exists (a slow-but-working server must not be
+  /// mistaken for "no network" just because the ticket took a while).
+  final Duration onlineTimeout;
+  final Duration firstOnlineTimeout;
+
+  /// The longest PLANNING can legitimately take: the attempt to reach the
+  /// server (the longer of its two budgets), then building the local view, and
+  /// a margin for what happens around them (reading the manifest, waiting for
+  /// the write queue, starting the loopback server). The screen's guard on
+  /// planning follows THIS, not a number of its own: it was a fixed 3.5 s,
+  /// chosen when the handoff was allowed 1.5 s, and when the first handoff
+  /// after a sign-in was given 3 s the two left half a second for everything
+  /// else, so a slow but working first handoff was reported as a failure.
+  Duration get planningBudget =>
+      (onlineTimeout > firstOnlineTimeout ? onlineTimeout : firstOnlineTimeout) +
+      offlinePlanTimeout +
+      const Duration(milliseconds: 1500);
+
+  /// Budget for building the LOCAL view (manifest, directory, starting
+  /// the loopback server). Normally a few milliseconds; this exists so a
+  /// stuck filesystem/server step can never leave the screen waiting
+  /// forever on plan() itself.
+  final Duration offlinePlanTimeout;
+
+  /// Quick "can the server be reached at all" check, used on an idle live
+  /// page to notice a lost connection that no request has yet run into.
+  final ServerReachability reachability;
+
+  Future<Reachability> checkReachability(String host) async {
+    final verdict = await reachability.check(host);
+    // Debug builds only, like the handoff line: which way a lost connection
+    // was recognised (noRoute at once, dnsFailure after a repeat, ...).
+    if (kDebugMode && verdict != Reachability.reachable) {
+      debugPrint('reachability: ${verdict.name}');
+    }
+    return verdict;
+  }
+
+  /// Gets the loopback server listening BEFORE it is needed. Starting it was
+  /// part of the first fallback to a saved copy, so the very first switch
+  /// paid for the bind inside the time allowed to show the page. Safe to
+  /// call at any time and from several places: start() is idempotent and
+  /// concurrent calls share one bind.
+  Future<void> warmUp() async {
+    try {
+      await localServer.start();
+    } catch (_) {
+      // Not fatal: planning an offline view starts it again and reports a
+      // real failure where it can be handled.
+    }
+  }
+
+  /// Bumped at the start of every plan() — "a NEWER plan exists".
+  int _planGeneration = 0;
+  Future<void> _captureQueue = Future<void>.value();
+
+  final _captureTokens = <String, int>{};
+  final _captureOutcomes = StreamController<CaptureOutcome>.broadcast();
+  final _centralRevocations = StreamController<DeviceAuthState>.broadcast();
+
+  /// The central server answered DEVICE_REVOKED or PARISH_DISABLED while a parish refusal was being
+  /// checked against it. Whoever erases data on revocation (HomeScreen, through RevocationHandler)
+  /// listens here and handles it like the same answer to a status check.
+  Stream<DeviceAuthState> get centralRevocations => _centralRevocations.stream;
+
+  /// How each capture ended: written, or refused for a missing critical
+  /// resource (and which). For diagnostics and acceptance; nothing in it is
+  /// page content or user data.
+  Stream<CaptureOutcome> get captureOutcomes => _captureOutcomes.stream;
+  CaptureOutcome? lastCaptureOutcome;
   final SnapshotCaptureService captureService;
   final SnapshotStore snapshotStore;
   final LocalSnapshotServer localServer;
@@ -56,46 +273,488 @@ class OfflinePageCoordinator {
   /// itself — the caller takes the returned [PageLoadPlan] and performs
   /// the actual `loadRequest` (the one genuinely WebView-specific step
   /// left).
+  /// [targetPath] is the page being opened — its identity for the saved
+  /// copy. [handoffPath] is the page a handoff TICKET is requested for; it
+  /// defaults to [targetPath]. The screen passes the entry page here, because
+  /// the server only issues tickets for the modules in its registry, and
+  /// the panel links to real pages that are not in it (schedule, points...):
+  /// a ticket for those is refused with 400 invalid_path although the user
+  /// is perfectly allowed to view them. The session the ticket creates is
+  /// what lets the page itself open; the page enforces its own access.
   Future<PageLoadPlan> plan({
     required String parishId,
     required String userId,
     required String targetPath,
+    String? handoffPath,
+    bool forceOffline = false,
+    OfflineReason offlineReason = OfflineReason.noNetwork,
+    SavedCopyFact copyFact = SavedCopyFact.unchecked,
+    Duration alreadySpent = Duration.zero,
   }) async {
-    final path = p.normalize(targetPath);
-    final serverUrlString = await handoffService.secureStorage.serverUrl;
-
-    final reachable = serverUrlString != null && await connectivityProbe.canReach(Uri.parse(serverUrlString).resolve(path));
-    if (reachable) {
+    // A plan that is no longer wanted — superseded by a newer one, OR
+    // expired by its own deadline — must never repoint the shared
+    // loopback server at ITS page when its (still running) local steps
+    // finally finish: LocalSnapshotServer.rootDirectory is ONE mutable
+    // slot shared by every load. Future.timeout() only changes the
+    // Future the caller sees; it does not stop the async work behind it.
+    // The expiry is therefore recorded on THIS plan's own ticket, never
+    // on _planGeneration: bumping the shared counter on expiry would let
+    // an old timeout invalidate a newer, perfectly healthy plan.
+    final ticket = _PlanTicket(++_planGeneration);
+    if (wipeLock.isHeld) {
+      localServer.rootDirectory = null;
+      return _wipeBlocked(targetPath);
+    }
+    final epoch = _wipeEpoch;
+    final path = snapshotPagePath(Uri.parse(targetPath));
+    if (path == null) return const PageLoadOfflineNoSnapshot();
+    // The path a ticket is requested for; falls back to the page itself.
+    final entryPath =
+        (handoffPath == null ? null : snapshotPagePath(Uri.parse(handoffPath))) ??
+        path;
+    String? diagnosticMessage;
+    // Why a saved copy would be shown. For a forced fallback the CALLER
+    // knows (its own page took too long; the server sent an error page);
+    // for a failed handoff it is worked out below from what came back.
+    var reason = offlineReason;
+    if (!forceOffline) {
+      // The fast timeout protects an EXISTING saved copy. On a fresh login
+      // there is no copy to fall back to, so give a reachable server time
+      // to issue the first handoff rather than showing a false offline page.
+      //
+      // The caller may already know whether there is a copy ([copyFact]), and how much of the start
+      // budget finding out has taken ([alreadySpent]). It is then NOT read again here: a second
+      // full read of a slow manifest would be a second timeout on top of the first. When it is not
+      // known, what is spent finding out comes off the handoff's time.
+      var fact = copyFact;
+      var spent = alreadySpent;
+      if (fact == SavedCopyFact.unchecked) {
+        final watch = Stopwatch()..start();
+        fact = await savedCopyFact(parishId: parishId, userId: userId, pagePath: path);
+        spent += watch.elapsed;
+      }
+      final handoffBudget = handoffBudgetFor(fact, spent: spent);
       try {
-        final handoffUrl = await handoffService.requestHandoffUrl(path);
+        final handoffUrl = await handoffService
+            .requestHandoffUrl(entryPath, timeout: handoffBudget)
+            .timeout(handoffBudget);
+        // A wipe that started while the request was out wins: the ticket is not used, nothing is lifted.
+        if (_wipeSince(epoch)) return _wipeBlocked(entryPath);
+        // The server minted a ticket for this module: the user's role passes its check, which is
+        // the only thing that lifts a remembered refusal of the module.
+        unawaited(_liftModule(parishId, userId, entryPath, epoch));
         return PageLoadOnline(url: handoffUrl, targetPath: path);
-      } catch (_) {
-        // The ticket-mint call itself failed despite the server being
-        // reachable a moment ago (flaky connection, auth hiccup, ...) —
-        // fall through to the offline branch below rather than
-        // propagating this to the caller.
+      } catch (e) {
+        if (_wipeSince(epoch)) return _wipeBlocked(entryPath);
+        final failure = HandoffFailure.of(e);
+        // No URLs, response bodies, tickets, or exception messages.
+        if (kDebugMode) {
+          diagnosticMessage = e is DioException
+              ? 'handoff: ${e.type.name}; HTTP ${e.response?.statusCode ?? "none"}'
+              : 'handoff: ${e.runtimeType}';
+          debugPrint(diagnosticMessage);
+        }
+        if (failure.kind == HandoffFailureKind.rejected) {
+          // The server ANSWERED and said no. That is not "no network":
+          // falling back to a snapshot under an OFFLINE banner would tell
+          // the user their connection is broken when it is working, and
+          // would hide a problem (a rejected path, an expired session)
+          // that retrying the snapshot can never fix.
+          return _serverRefusal(failure, parishId: parishId, userId: userId, entryPath: entryPath, path: path, epoch: epoch);
+        }
+        // Always set from what actually came back: a stale reason handed in
+        // by the caller must not survive a fresh failure of another kind.
+        reason = failure.kind == HandoffFailureKind.serverUnavailable
+            ? OfflineReason.serverUnavailable
+            : OfflineReason.noNetwork;
       }
     }
 
-    final manifest = await snapshotStore.readManifestFor(parishId: parishId, userId: userId, pagePath: path);
-    if (manifest == null) {
-      return const PageLoadOfflineNoSnapshot();
+    return _planOffline(
+      reason: reason,
+      ticket: ticket,
+      parishId: parishId,
+      userId: userId,
+      path: path,
+      entryPath: entryPath,
+      diagnosticMessage: diagnosticMessage,
+    ).timeout(
+      offlinePlanTimeout,
+      onTimeout: () {
+        ticket.expired = true;
+        return PageLoadOfflineNoSnapshot(
+          diagnosticMessage: kDebugMode ? 'offline plan timed out' : null,
+          timedOut: true,
+          reason: offlineReason,
+        );
+      },
+    );
+  }
+
+  /// The server ANSWERED the handoff and refused. What is remembered, and what the user is offered,
+  /// depends on what the reply unambiguously says (see [classifyHandoffRefusal]):
+  ///  - the device is not authorized (revoked, parish disabled, not found, parish mismatch): the
+  ///    device refusal is remembered, no saved copy is offered. Nothing is erased here: erasing is
+  ///    the central server's own answer (RevocationHandler), and this one comes through the parish.
+  ///  - the user's role has no access to the module: the module is blocked for this user and parish,
+  ///    no saved copy is offered. Other modules are untouched.
+  ///  - anything else (a path the server does not know, an unknown device_state, a used ticket...):
+  ///    nothing is remembered; the reply is shown and a copy, if there is one, is offered as before,
+  ///    EXCEPT after `device_not_authorized` whatever its state: a copy is not offered after the
+  ///    server says the device is not authorized, even when this app cannot tell why.
+  Future<PageLoadServerError> _serverRefusal(
+    HandoffFailure failure, {
+    required String parishId,
+    required String userId,
+    required String entryPath,
+    required String path,
+    required int epoch,
+  }) async {
+    final kind = classifyHandoffRefusal(
+      status: failure.statusCode,
+      errorCode: failure.errorCode,
+      deviceState: failure.deviceState,
+    );
+    var kindActedOn = kind;
+    var contradicted = false;
+    if (kind == HandoffRefusal.device) {
+      // The parish said no. Its answer may be an old copy of the central one, so the central server
+      // is asked again before this becomes a block: an ACTIVE obtained NOW (after that answer) wins
+      // over it, anything else (revoked, 401, no answer, cannot tell) leaves the refusal standing.
+      final verdict = await _centralVerdict();
+      // A wipe started while the central server was being asked: nothing is recorded or passed on.
+      if (_wipeSince(epoch)) return _wipeBlocked(entryPath);
+      if (verdict == DeviceAuthState.active) {
+        contradicted = true;
+        kindActedOn = HandoffRefusal.none;
+        trace('refusal: parish refused the device, central says ACTIVE; not blocked');
+      } else {
+        final stored = await _blockDeviceNow('parish_${failure.deviceState}');
+        if (!stored) trace('refusal: device block could not be stored; it stands for this run');
+        // The CENTRAL server's own explicit cancellation is not a parish refusal: it is what erases.
+        // It is passed on to whoever owns the erasing (HomeScreen -> RevocationHandler), exactly as
+        // when a status check receives it. A refusal that comes from the parish alone is not.
+        if (verdict == DeviceAuthState.revoked || verdict == DeviceAuthState.parishDisabled) {
+          trace('refusal: central confirms ${verdict!.name}; handing it to the revocation handling');
+          if (!_centralRevocations.isClosed) _centralRevocations.add(verdict);
+        }
+      }
+    } else if (kind == HandoffRefusal.module) {
+      if (_wipeSince(epoch)) return _wipeBlocked(entryPath);
+      final stored = await refusals.blockModule(parishId: parishId, userId: userId, path: entryPath);
+      if (!stored) trace('refusal: module block could not be stored; it stands for this run');
+    }
+    final deviceNotAuthorized = failure.statusCode == 403 && failure.errorCode == 'device_not_authorized';
+    return PageLoadServerError(
+      statusCode: failure.statusCode,
+      errorCode: failure.errorCode,
+      // What was actually asked of the server, so the message names
+      // the path the server refused rather than the page the user
+      // was heading to.
+      path: Uri.parse(entryPath).path,
+      hasSnapshot: kindActedOn != HandoffRefusal.none || deviceNotAuthorized ? false : await _hasSnapshot(parishId, userId, path),
+      deviceState: failure.deviceState,
+      refusal: kindActedOn == HandoffRefusal.none ? null : kindActedOn,
+      staleParishAnswer: contradicted,
+    );
+  }
+
+  /// What the central server says when asked now: its full answer, or null when it could not be
+  /// asked or did not answer in time. A refusal is set aside only on ACTIVE; DEVICE_REVOKED and
+  /// PARISH_DISABLED are carried on (see [centralRevocations]).
+  Future<DeviceAuthState?> _centralVerdict() async {
+    final verify = reverifyDevice;
+    if (verify == null) return null;
+    try {
+      return await verify().timeout(reverifyTimeout);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Records a device refusal. With no readable token it cannot be bound to one: it then stands for
+  /// this process, whatever token is read later.
+  Future<bool> _blockDeviceNow(String source) async {
+    final (token, _) = await _readDeviceToken();
+    if (token == null) {
+      await refusals.blockDeviceWithoutToken(source: source);
+      return false;
+    }
+    return refusals.blockDevice(deviceToken: token, source: source);
+  }
+
+  Future<void> _liftModule(String parishId, String userId, String path, int epoch) async {
+    if (_wipeSince(epoch)) return;
+    final result = await refusals.liftModule(
+      parishId: parishId,
+      userId: userId,
+      path: path,
+      stillCurrent: () async => !_wipeSince(epoch),
+    );
+    // Not silent: a block that could not be removed is still there, and the next accepted handoff
+    // for this module tries again.
+    if (result == LiftResult.failed) trace('refusal: the module block could not be lifted');
+  }
+
+  /// (token, readFailed): a token that cannot be read is told apart from "not activated".
+  Future<(String?, bool)> _readDeviceToken() async {
+    try {
+      return (await handoffService.secureStorage.deviceToken, false);
+    } catch (_) {
+      return (null, true);
+    }
+  }
+
+  /// A refusal received earlier that still stands for this page, or null. Checked before any saved
+  /// copy is handed out. [entryPath] is the module the page is opened through; the page's own path
+  /// counts too (a page that is a module of its own).
+  PageLoadServerError _wipeBlocked(String path) => PageLoadServerError(
+        statusCode: null,
+        errorCode: 'wipe_in_progress',
+        path: Uri.parse(path).path,
+        hasSnapshot: false,
+        refusal: HandoffRefusal.unknown,
+        remembered: false,
+      );
+
+  Future<PageLoadServerError?> _rememberedRefusal({
+    required String parishId,
+    required String userId,
+    required String entryPath,
+    required String path,
+  }) async {
+    if (wipeLock.isHeld) return _wipeBlocked(entryPath);
+    // The device record and the module record are read at the same time: this sits on the way to
+    // the first page of a cold start.
+    final modules = {entryPath, path};
+    final (token, tokenReadFailed) = await _readDeviceToken();
+    final results = await Future.wait<Object?>([
+      refusals.checkDevice(deviceToken: token, tokenReadFailed: tokenReadFailed),
+      for (final module in modules) refusals.checkModule(parishId: parishId, userId: userId, path: module),
+    ]);
+    final device = (results[0]! as DeviceRefusalCheck).check;
+    final moduleChecks = results.skip(1).cast<RefusalCheck>().toList();
+    PageLoadServerError refused(HandoffRefusal kind, String code) => PageLoadServerError(
+          statusCode: kind == HandoffRefusal.unknown ? null : 403,
+          errorCode: code,
+          path: Uri.parse(entryPath).path,
+          hasSnapshot: false,
+          refusal: kind,
+          remembered: kind != HandoffRefusal.unknown,
+        );
+    // A refusal that stands wins over one that cannot be told; either keeps the copy shut.
+    if (device == RefusalCheck.blocked) return refused(HandoffRefusal.device, 'device_not_authorized');
+    if (moduleChecks.contains(RefusalCheck.blocked)) return refused(HandoffRefusal.module, 'forbidden');
+    if (device == RefusalCheck.unknown || moduleChecks.contains(RefusalCheck.unknown)) {
+      return refused(HandoffRefusal.unknown, 'refusal_unreadable');
+    }
+    return null;
+  }
+
+  bool _isStale(_PlanTicket ticket) =>
+      ticket.expired || ticket.generation != _planGeneration;
+
+  final _probes = <String, Future<OnlineProbeResult>>{};
+
+  /// Asks, in the background, whether the server can be reached again and
+  /// will open [targetPath]: it requests a handoff ticket, which is both the
+  /// reachability check and the way into the page, so a success needs no
+  /// second request. Used by the screen while it is showing a saved copy.
+  ///
+  /// At most ONE request per path is ever in flight: a call made while one
+  /// is pending gets that same result instead of starting another, so the
+  /// retry loop can never pile up parallel requests however it is driven.
+  /// [timeout] is longer than the one used to open a page — nobody is
+  /// waiting here, and it is what lets a slow server be recognised as
+  /// reachable instead of being mistaken for no network.
+  Future<OnlineProbeResult> probeOnline({
+    required String parishId,
+    required String userId,
+    required String targetPath,
+    Duration timeout = const Duration(seconds: 6),
+  }) {
+    final path = snapshotPagePath(Uri.parse(targetPath));
+    if (path == null) {
+      return Future.value(const OnlineProbeUnavailable());
+    }
+    return _probes[path] ??= _probe(parishId, userId, path, timeout)
+        // Block body on purpose: whenComplete WAITS for a Future returned
+        // by its callback, and Map.remove would return this very Future.
+        .whenComplete(() {
+      _probes.remove(path);
+    });
+  }
+
+  Future<OnlineProbeResult> _probe(
+    String parishId,
+    String userId,
+    String path,
+    Duration timeout,
+  ) async {
+    // While a wipe runs (or is unfinished) nothing is requested: the answer could only be used to
+    // bring access back to data that is being erased.
+    if (wipeLock.isHeld) return const OnlineProbeUnavailable();
+    final epoch = _wipeEpoch;
+    try {
+      final url = await handoffService
+          .requestHandoffUrl(path, timeout: timeout)
+          .timeout(timeout + const Duration(milliseconds: 500));
+      if (_wipeSince(epoch)) return const OnlineProbeUnavailable();
+      unawaited(_liftModule(parishId, userId, path, epoch));
+      return OnlineProbeRecovered(PageLoadOnline(url: url, targetPath: path));
+    } catch (e) {
+      if (_wipeSince(epoch)) return const OnlineProbeUnavailable();
+      final failure = HandoffFailure.of(e);
+      if (failure.kind == HandoffFailureKind.rejected) {
+        final refusal = await _serverRefusal(failure, parishId: parishId, userId: userId, entryPath: path, path: path, epoch: epoch);
+        if (_wipeSince(epoch)) return const OnlineProbeUnavailable();
+        return OnlineProbeRejected(refusal);
+      }
+      // No answer, or a transient server problem: try again later.
+      return const OnlineProbeUnavailable();
+    }
+  }
+
+  /// How long the handoff may take, given what is known about the saved copy and how much of the
+  /// START budget has already been spent finding that out.
+  ///
+  /// - a copy exists: [onlineTimeout]; the copy is the fallback, so the server gets little time.
+  /// - no copy: [firstOnlineTimeout]; nothing to fall back on, a reachable server gets time to answer.
+  /// - not known: the START budget ([firstOnlineTimeout]) minus what the check already took, never
+  ///   less than [onlineTimeout]. The check and the attempt share ONE budget; they are not two
+  ///   timeouts one after the other.
+  Duration handoffBudgetFor(SavedCopyFact fact, {Duration spent = Duration.zero}) {
+    switch (fact) {
+      case SavedCopyFact.exists:
+        return onlineTimeout;
+      case SavedCopyFact.absent:
+        return firstOnlineTimeout;
+      case SavedCopyFact.unchecked:
+      case SavedCopyFact.unknown:
+        final left = firstOnlineTimeout - spent;
+        return left > onlineTimeout ? left : onlineTimeout;
+    }
+  }
+
+  /// Whether a saved copy exists, in three answers (see [SavedCopyFact]). Bounded by
+  /// [offlinePlanTimeout]; a timeout or a failed read is [SavedCopyFact.unknown], never "absent".
+  Future<SavedCopyFact> savedCopyFact({
+    required String parishId,
+    required String userId,
+    required String pagePath,
+  }) async {
+    try {
+      // The manifest read and the check for a remembered refusal run at the same time. A copy that
+      // a remembered refusal keeps from being opened is, for every decision made from this answer,
+      // not there.
+      final read = snapshotStore
+          .readManifestFor(parishId: parishId, userId: userId, pagePath: pagePath)
+          .timeout(offlinePlanTimeout)
+        ..ignore();
+      final refused = await _rememberedRefusal(parishId: parishId, userId: userId, entryPath: pagePath, path: pagePath);
+      if (refused != null) {
+        // A standing refusal: for every decision made from this answer there is no copy. A refusal
+        // that could not be read: not known whether there is one to open, and the server decides.
+        return refused.refusal == HandoffRefusal.unknown ? SavedCopyFact.unknown : SavedCopyFact.absent;
+      }
+      final manifest = await read;
+      return manifest != null ? SavedCopyFact.exists : SavedCopyFact.absent;
+    } catch (_) {
+      return SavedCopyFact.unknown;
+    }
+  }
+
+  /// Whether a saved copy of [pagePath] exists for this user. Lets the screen
+  /// offer it when a page itself (not only the handoff) was refused.
+  Future<bool> hasSavedCopy({
+    required String parishId,
+    required String userId,
+    required String pagePath,
+  }) => _hasSnapshot(parishId, userId, pagePath);
+
+  Future<bool> _hasSnapshot(String parishId, String userId, String path) async {
+    try {
+      final read = snapshotStore
+          .readManifestFor(parishId: parishId, userId: userId, pagePath: path)
+          .timeout(offlinePlanTimeout)
+        ..ignore();
+      if (await _rememberedRefusal(parishId: parishId, userId: userId, entryPath: path, path: path) != null) {
+        return false;
+      }
+      final manifest = await read;
+      return manifest != null;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<PageLoadPlan> _planOffline({
+    required OfflineReason reason,
+    required _PlanTicket ticket,
+    required String parishId,
+    required String userId,
+    required String path,
+    required String entryPath,
+    required String? diagnosticMessage,
+  }) async {
+    final planWatch = Stopwatch()..start();
+    // BEFORE anything is served: a refusal that was received and still stands is not bypassed by
+    // the copy being there.
+    // The manifest is read at the same time (this is the cold-start path), and used only if nothing
+    // stands in the way.
+    final manifestRead = snapshotStore.readManifestFor(
+      parishId: parishId,
+      userId: userId,
+      pagePath: path,
+    )..ignore();
+    final refused = await _rememberedRefusal(parishId: parishId, userId: userId, entryPath: entryPath, path: path);
+    if (refused != null) {
+      localServer.rootDirectory = null;
+      trace('offline-plan: refused by a remembered ${refused.refusal?.name} refusal; no saved copy is opened');
+      return refused;
+    }
+    final manifest = await manifestRead;
+    trace('offline-plan: manifest read in ${planWatch.elapsedMilliseconds} ms');
+    if (manifest == null || _isStale(ticket)) {
+      return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage, reason: reason);
     }
 
-    final pageDir = await snapshotStore.getPageDirectoryIfReady(parishId: parishId, userId: userId, pagePath: path);
-    if (pageDir == null) {
+    final pageDir = await snapshotStore.getPageDirectoryIfReady(
+      parishId: parishId,
+      userId: userId,
+      pagePath: path,
+    );
+    if (pageDir == null || _isStale(ticket)) {
       // A manifest existed a moment ago but the directory is gone now
       // (e.g. a concurrent clearForUser/clearForParish mid-check) —
       // treat exactly like "no snapshot", never crash on the race.
-      return const PageLoadOfflineNoSnapshot();
+      return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage, reason: reason);
     }
 
-    final port = await localServer.start();
+    // Not start(): after the app was in the background the server object can
+    // exist while its socket is gone (iOS reclaims them).
+    await localServer.ensureHealthy();
+    trace('offline-plan: server ready after ${planWatch.elapsedMilliseconds} ms');
+    // Re-checked after the LAST await, immediately before the one
+    // assignment that has a side effect outside this plan. A wipe that started while this plan was
+    // running wins: its data is not served.
+    if (wipeLock.isHeld) {
+      localServer.rootDirectory = null;
+      return _wipeBlocked(entryPath);
+    }
+    if (_isStale(ticket)) {
+      return PageLoadOfflineNoSnapshot(diagnosticMessage: diagnosticMessage, reason: reason);
+    }
     localServer.rootDirectory = pageDir;
 
+    // Each assignment of rootDirectory above rotates LocalSnapshotServer's
+    // access token, which is part of this URL's path — so every offline
+    // plan already has its own document URL, and the previous plan's URL
+    // stops being "owned" by the server. The screen relies on that.
     return PageLoadOffline(
-      url: Uri.parse('http://127.0.0.1:$port/snapshot.html'),
+      url: localServer.urlFor('/snapshot.html'),
       capturedAt: manifest.capturedAt,
+      reason: reason,
     );
   }
 
@@ -118,22 +777,50 @@ class OfflinePageCoordinator {
     required String targetPath,
     required String renderedHtml,
   }) {
-    () async {
+    final generation = snapshotStore.generation;
+    // A page is captured right after it loads and again shortly after, to
+    // catch what the page's scripts add. Both used to be queued in full. A
+    // capture still WAITING when a newer one of the same page is queued
+    // behind it is skipped: the newer one has the later content, and a page
+    // that is slow to fetch cannot pile up a queue of captures of itself.
+    final key = '$parishId|$userId|$targetPath';
+    final token = (_captureTokens[key] ?? 0) + 1;
+    _captureTokens[key] = token;
+    _captureQueue = _captureQueue.then((_) async {
       try {
+        if (_captureTokens[key] != token) return;
+        if (snapshotStore.generation != generation) return;
         final serverUrlString = await handoffService.secureStorage.serverUrl;
         if (serverUrlString == null) return;
-        await captureService.captureAndSave(
+        final outcome = await captureService.captureAndSave(
           parishId: parishId,
           userId: userId,
           serverBaseUrl: Uri.parse(serverUrlString),
           targetPath: targetPath,
           renderedHtml: renderedHtml,
+          expectedGeneration: generation,
         );
+        lastCaptureOutcome = outcome;
+        if (kDebugMode) debugPrint(outcome.toString());
+        // The copy that was just written is the one a switch will open next:
+        // have it decrypted before it is needed.
+        if (outcome.status == CaptureStatus.saved) {
+          unawaited(prewarmPage(parishId: parishId, userId: userId, pagePath: targetPath));
+        }
+        if (!_captureOutcomes.isClosed) _captureOutcomes.add(outcome);
       } catch (_) {
-        // Best-effort — see this method's own docblock.
+        // A failed capture leaves the previous snapshot intact.
       }
-    }();
+    });
   }
+}
+
+/// Identity of ONE plan() call. [generation] is its position in the
+/// sequence of plans; [expired] is set only by this plan's own deadline.
+class _PlanTicket {
+  _PlanTicket(this.generation);
+  final int generation;
+  bool expired = false;
 }
 
 /// What [OfflinePageCoordinator.plan] decided — a sealed hierarchy
@@ -159,25 +846,216 @@ class PageLoadOnline extends PageLoadPlan {
 /// right (parish, user, page) snapshot directory; [capturedAt] is for
 /// the "OFFLINE • ostatnia synchronizacja: HH:MM" banner.
 class PageLoadOffline extends PageLoadPlan {
-  const PageLoadOffline({required this.url, required this.capturedAt});
+  const PageLoadOffline({
+    required this.url,
+    required this.capturedAt,
+    this.reason = OfflineReason.noNetwork,
+  });
   final Uri url;
   final DateTime capturedAt;
+
+  /// Why a snapshot is shown instead of the live page — drives the banner
+  /// wording, so a server outage is not reported as "no network".
+  final OfflineReason reason;
+}
+
+enum OfflineReason {
+  /// The request never got an answer (no connection, DNS, timeout).
+  noNetwork,
+
+  /// The server answered with a transient failure (5xx, 408, 429).
+  serverUnavailable,
+
+  /// The server is reachable but the page did not finish in time. Not a
+  /// missing network, and not an error: a label of its own so the user is
+  /// not told they are offline while the server is answering.
+  slowServer,
+}
+
+/// The server answered the handoff and refused it for a reason a snapshot
+/// cannot fix (4xx other than 408/429, or a reply that is not a handoff
+/// reply at all). Carries ONLY sanitized facts, safe to show on screen in a
+/// release build: the HTTP status, the server's short machine error code
+/// if it has the expected shape, and the page path without its query.
+/// Never a response body, message, URL, ticket or token.
+class PageLoadServerError extends PageLoadPlan {
+  const PageLoadServerError({
+    required this.statusCode,
+    required this.errorCode,
+    required this.path,
+    required this.hasSnapshot,
+    this.deviceState,
+    this.refusal,
+    this.remembered = false,
+    this.staleParishAnswer = false,
+  });
+
+  /// Null when the reply was not an HTTP error at all but was unusable.
+  final int? statusCode;
+  final String? errorCode;
+  final String path;
+
+  /// The server's `device_state` when it refused the device (a short machine code), else null.
+  final String? deviceState;
+
+  /// Set when the reply is an unambiguous refusal this app acts on (see [classifyHandoffRefusal]).
+  /// The saved copy is not offered then, whatever [hasSnapshot] would have said.
+  final HandoffRefusal? refusal;
+
+  /// True when this is not a fresh answer but a refusal received EARLIER and still standing.
+  final bool remembered;
+
+  /// The parish server refused the device, and the central server, asked straight after, says it is
+  /// ACTIVE: the parish answer is probably an old copy. Nothing is blocked; trying again later
+  /// reaches the parish once its copy has been refreshed.
+  final bool staleParishAnswer;
+
+  /// A saved copy of this exact page exists, so the screen can offer it
+  /// explicitly instead of silently pretending to be offline.
+  final bool hasSnapshot;
+}
+
+/// Outcome of [OfflinePageCoordinator.probeOnline].
+sealed class OnlineProbeResult {
+  const OnlineProbeResult();
+}
+
+/// The server answered and issued a ticket: [plan] opens the page online.
+class OnlineProbeRecovered extends OnlineProbeResult {
+  const OnlineProbeRecovered(this.plan);
+  final PageLoadOnline plan;
+}
+
+/// No usable answer (no network, timeout, transient server problem). The
+/// caller should try again later; nothing here says the user did anything
+/// wrong.
+class OnlineProbeUnavailable extends OnlineProbeResult {
+  const OnlineProbeUnavailable();
+}
+
+/// The server answered and refused. Retrying will not change that, so the
+/// caller should stop and say so, not keep asking.
+class OnlineProbeRejected extends OnlineProbeResult {
+  const OnlineProbeRejected(this.error);
+  final PageLoadServerError error;
+}
+
+enum HandoffFailureKind {
+  /// No answer from the server: connection, DNS, TLS, timeout, or a local
+  /// precondition (e.g. not activated). Falling back to a snapshot is right.
+  transport,
+
+  /// The server answered with a transient failure (5xx, 408, 429).
+  serverUnavailable,
+
+  /// The server answered and refused, or answered something unusable.
+  rejected,
+}
+
+class HandoffFailure {
+  const HandoffFailure._(this.kind, this.statusCode, this.errorCode, [this.deviceState]);
+
+  final HandoffFailureKind kind;
+  final int? statusCode;
+  final String? errorCode;
+
+  /// The reply's `device_state` (the parish server's reason for refusing the device), kept only
+  /// when it has the shape of a short machine code.
+  final String? deviceState;
+
+  static final _codeShape = RegExp(r'^[a-z][a-z0-9_]{0,47}$');
+
+  /// Sorts any error thrown by the handoff request into what it means for
+  /// the user. [error] is whatever requestHandoffUrl threw.
+  static HandoffFailure of(Object error) {
+    if (error is DioException) {
+      final response = error.response;
+      if (response == null) {
+        return const HandoffFailure._(HandoffFailureKind.transport, null, null);
+      }
+      final status = response.statusCode;
+      final data = response.data;
+      final raw = data is Map ? data['error'] : null;
+      // Only a short machine code is kept; anything else the server sent
+      // (a message, markup, a longer string) is dropped.
+      final code = raw is String && _codeShape.hasMatch(raw) ? raw : null;
+      final rawState = data is Map ? data['device_state'] : null;
+      final deviceState = rawState is String && _codeShape.hasMatch(rawState) ? rawState : null;
+      final transient =
+          status == null || status >= 500 || status == 408 || status == 429;
+      return HandoffFailure._(
+        transient
+            ? HandoffFailureKind.serverUnavailable
+            : HandoffFailureKind.rejected,
+        status,
+        code,
+        deviceState,
+      );
+    }
+    // The request returned, but not a handoff reply (e.g. an HTML page
+    // where JSON was expected): the server answered, so this is not the
+    // network, and a saved copy will not make it go away. ONLY the
+    // FormatException the handoff service raises for exactly this case
+    // counts; a TypeError or NoSuchMethodError is a defect in this app and
+    // must not be presented to the user as the server's refusal.
+    if (error is FormatException) {
+      return const HandoffFailure._(
+        HandoffFailureKind.rejected,
+        null,
+        'invalid_response',
+      );
+    }
+    if (error is SocketException || error is TimeoutException) {
+      return const HandoffFailure._(HandoffFailureKind.transport, null, null);
+    }
+    return const HandoffFailure._(HandoffFailureKind.serverUnavailable, null, null);
+  }
 }
 
 /// Offline AND no snapshot exists yet for this exact page — the caller
 /// should show an explanatory empty state rather than attempting to
 /// load anything.
 class PageLoadOfflineNoSnapshot extends PageLoadPlan {
-  const PageLoadOfflineNoSnapshot();
+  const PageLoadOfflineNoSnapshot({
+    this.diagnosticMessage,
+    this.timedOut = false,
+    this.reason = OfflineReason.noNetwork,
+  });
+
+  /// WHY the live page could not be had, so that the screen does not say "no
+  /// internet" about a server that is down or slow (see OfflineReason). With no
+  /// saved copy this wording is all the user has.
+  final OfflineReason reason;
+
+  /// Preparing the saved view ran out of its time. That says NOTHING about
+  /// whether a copy exists: it is not "no saved copy", and the screen must not
+  /// present it as that. It used to be indistinguishable.
+  final bool timedOut;
+
+  /// K12 diagnostic round 3: why the online attempt (if one was even
+  /// made) failed — null when this page was never actually attempted
+  /// online at all (shouldn't normally happen given plan() always tries
+  /// the handoff first, but kept nullable rather than assuming). Shown
+  /// directly on screen by the caller, specifically so this doesn't
+  /// depend on logcat being readable on the real device at all.
+  final String? diagnosticMessage;
 }
 
 /// "OFFLINE • ostatnia synchronizacja: HH:MM" — review round P7: "Jedyny
 /// dodatkowy element aplikacji" beyond the real PHP page itself. Local
 /// time, zero-padded, nothing more elaborate — this is explicitly NOT a
 /// redesign of anything, just the one allowed banner line.
-String formatOfflineBannerText(DateTime capturedAt) {
+String formatOfflineBannerText(
+  DateTime capturedAt, {
+  OfflineReason reason = OfflineReason.noNetwork,
+}) {
   final local = capturedAt.toLocal();
   final hh = local.hour.toString().padLeft(2, '0');
   final mm = local.minute.toString().padLeft(2, '0');
-  return 'OFFLINE • ostatnia synchronizacja: $hh:$mm';
+  final label = switch (reason) {
+    OfflineReason.noNetwork => 'OFFLINE',
+    OfflineReason.serverUnavailable => 'SERWER NIEDOSTĘPNY',
+    OfflineReason.slowServer => 'SERWER ODPOWIADA ZBYT WOLNO',
+  };
+  return '$label • ostatnia synchronizacja: $hh:$mm';
 }

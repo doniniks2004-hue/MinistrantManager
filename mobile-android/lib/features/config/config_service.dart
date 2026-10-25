@@ -64,13 +64,34 @@ class ConfigService {
   Future<Map<String, dynamic>?> loadClientConfig() async {
     try {
       final resp = await api.central.get('/client-config');
-      final data = resp.data as Map<String, dynamic>;
+      final raw = resp.data;
+
+      // The central endpoint must never be allowed to brick startup because
+      // a proxy/error page/legacy response returned a string instead of the
+      // expected JSON object. Treat any unexpected shape exactly like an
+      // unavailable config and fall back to the cached copy.
+      if (raw is! Map) {
+        return await _cachedClientConfig();
+      }
+
+      final data = Map<String, dynamic>.from(raw);
       await db.saveClientConfig(jsonEncode(data));
       return data;
-    } on DioException {
-      final cached = await db.getClientConfig();
-      if (cached == null) return null;
-      return jsonDecode(cached.configJson) as Map<String, dynamic>;
+    } catch (_) {
+      return _cachedClientConfig();
+    }
+  }
+
+  Future<Map<String, dynamic>?> _cachedClientConfig() async {
+    final cached = await db.getClientConfig();
+    if (cached == null) return null;
+
+    try {
+      final decoded = jsonDecode(cached.configJson);
+      if (decoded is! Map) return null;
+      return Map<String, dynamic>.from(decoded);
+    } catch (_) {
+      return null;
     }
   }
 }

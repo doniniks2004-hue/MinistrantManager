@@ -1,7 +1,7 @@
 name: ministrant_manager
 description: Ministrant Manager — natywna aplikacja mobilna z obsługą offline.
 publish_to: 'none'
-version: 1.0.0+1
+version: 1.0.0+2
 
 environment:
   sdk: '>=3.6.0 <4.0.0' # required by Drift >=2.32's sqlite3 3.x support and its build-hook config below
@@ -117,6 +117,10 @@ dev_dependencies:
   drift_dev: ^2.32.0
   build_runner: ^2.4.9
   flutter_lints: ^4.0.0
+  # Used directly by test/offline_aware_page_screen_test.dart (a fake
+  # WebViewPlatform). Already resolved transitively via webview_flutter;
+  # declared so the import is not an undeclared-dependency lint.
+  webview_flutter_platform_interface: ^2.10.0
   # Release-readiness milestone: INERT until assets/branding/splash_logo.png
   # actually exists (see that folder's own README.txt) — `dart run
   # flutter_native_splash:create` errors out cleanly on a missing file
@@ -129,10 +133,10 @@ dev_dependencies:
 
 flutter_native_splash:
   color: "#F5F5F5"
-  image: assets/branding/splash_logo.png
+  image: assets/branding/app_icon.png
   android_12:
     color: "#F5F5F5"
-    image: assets/branding/splash_logo.png
+    image: assets/branding/app_icon.png
 
 flutter:
   uses-material-design: true

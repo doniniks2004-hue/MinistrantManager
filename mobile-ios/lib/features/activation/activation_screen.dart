@@ -1,6 +1,8 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'activation_service.dart';
+import '../../core/util/ui_marker.dart';
 
 /// Spec §18–§19: first-run screen, QR scan or manual code entry, then a
 /// confirmation step before actually burning the activation code.
@@ -32,6 +34,13 @@ class _ActivationScreenState extends State<ActivationScreen> {
   @override
   void initState() {
     super.initState();
+    // For a CI job that launches the app on a simulator and has to know this
+    // screen was reached (debug builds only; see UiMarker). Reported after the
+    // frame that draws it, not from initState: initState runs before anything is
+    // on the screen.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(UiMarker.record('activation_screen'));
+    });
     if (widget.initialToken != null) {
       // Deferred to right after the first frame so context/Navigator are
       // fully ready — matches how _handleScanned is invoked from a real

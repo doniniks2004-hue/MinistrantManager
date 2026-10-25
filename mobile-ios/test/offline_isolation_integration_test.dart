@@ -377,7 +377,7 @@ void main() {
 
 /// Minimal test double for the one test above that needs to exercise
 /// login()'s real user-switch/snapshot-clear logic without a real
-/// network call. Mirrors UserSessionService.login()'s CURRENT success
+/// network call. Exercises UserSessionService.login()'s CURRENT success
 /// contract exactly (token + user{id, full_name, role_id}) — this
 /// double deliberately does NOT replicate the full error-mapping switch
 /// (403/503/428/401/400) since this test only exercises the success
@@ -395,41 +395,5 @@ class _InjectedDioUserSessionService extends UserSessionService {
   final Dio fakeLoginDio;
 
   @override
-  Future<UserLoginResult> login({required String username, required String password}) async {
-    final installationId = await secureStorage.installationId;
-    final serverUrl = await secureStorage.serverUrl;
-    if (installationId == null || serverUrl == null) {
-      return const UserLoginNetworkError();
-    }
-
-    try {
-      final resp = await fakeLoginDio.post('/mobile/session/login', data: {
-        'username': username,
-        'password': password,
-        'installation_id': installationId,
-      });
-      final data = resp.data as Map<String, dynamic>;
-      final token = data['token'] as String;
-      final user = data['user'] as Map<String, dynamic>;
-      final newUserId = user['id'] as int;
-      final fullName = user['full_name'] as String?;
-      final roleId = user['role_id'] as int?;
-
-      final previousUserId = await secureStorage.currentUserId;
-      if (previousUserId != null && previousUserId != newUserId) {
-        await db.wipeUserScopedBusinessData();
-        final parishId = await secureStorage.parishId;
-        if (parishId != null) {
-          await snapshotStore.clearForUser(parishId: parishId, userId: previousUserId.toString());
-        }
-      }
-
-      await secureStorage.setUserSession(token: token, userId: newUserId, fullName: fullName, roleId: roleId);
-      api.resetParishClient();
-
-      return UserLoginSuccess(fullName: fullName);
-    } on DioException {
-      return const UserLoginNetworkError();
-    }
-  }
+  Dio createLoginClient(BaseOptions options) => fakeLoginDio;
 }

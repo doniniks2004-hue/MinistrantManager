@@ -1,9 +1,12 @@
 import 'package:device_info_plus/device_info_plus.dart';
+import 'package:dio/dio.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:uuid/uuid.dart';
+
 import 'dart:io' show Platform;
 
 import '../../core/network/api_client.dart';
+import '../../core/network/parish_server_url.dart';
 import '../../core/secure/secure_storage_service.dart';
 
 class ActivationResult {
@@ -57,7 +60,8 @@ class ActivationService {
     final trimmed = scannedValue.trim();
     final uri = Uri.tryParse(trimmed);
 
-    final looksLikeUrl = uri != null && (uri.scheme == 'http' || uri.scheme == 'https');
+    final looksLikeUrl =
+        uri != null && (uri.scheme == 'http' || uri.scheme == 'https');
     if (!looksLikeUrl) {
       // No recognizable URL shape at all — treat as a bare code/token,
       // same as always.
@@ -116,48 +120,78 @@ class ActivationService {
   /// Step 1 (spec §12): resolve token/display_code -> parish, WITHOUT
   /// consuming the code or registering a device yet. Used to show the
   /// "✓ Znaleziono parafię ... [AKTYWUJ]" confirmation screen.
-  Future<ActivationResult> checkCode({String? token, String? displayCode}) async {
+  Future<ActivationResult> checkCode({
+    String? token,
+    String? displayCode,
+  }) async {
     try {
-      final resp = await api.central.post('/activation/check', data: {
-        if (token != null) 'token': token,
-        if (displayCode != null) 'display_code': displayCode,
-      });
+      final resp = await api.central.post(
+        '/activation/check',
+        data: {
+          if (token != null) 'token': token,
+          if (displayCode != null) 'display_code': displayCode,
+        },
+        options: Options(contentType: Headers.formUrlEncodedContentType),
+      );
       final parish = resp.data['parish'] as Map<String, dynamic>;
-      return ActivationResult(parishName: parish['name'] as String, serverUrl: parish['server_url'] as String);
+      final serverUrl = normalizeParishServerUrl(
+        parish['server_url'] as String,
+      );
+      return ActivationResult(
+        parishName: parish['name'] as String,
+        serverUrl: serverUrl,
+      );
     } catch (_) {
-      throw ActivationError('Kod aktywacyjny jest nieprawidłowy, wygasł lub został unieważniony.');
+      throw ActivationError(
+        'Kod aktywacyjny jest nieprawidłowy, wygasł lub został unieważniony.',
+      );
     }
   }
 
   /// Step 2 (spec §20–§21): actually register this installation and
   /// obtain a device_token. Persists everything needed for SyncEngine to
   /// start talking to the parish server immediately after this returns.
-  Future<ActivationResult> confirmActivation({String? token, String? displayCode}) async {
+  Future<ActivationResult> confirmActivation({
+    String? token,
+    String? displayCode,
+  }) async {
     final installationId = await _installationId();
     final meta = await _deviceMeta();
 
     try {
-      final resp = await api.central.post('/activation/confirm', data: {
-        if (token != null) 'token': token,
-        if (displayCode != null) 'display_code': displayCode,
-        'installation_id': installationId,
-        ...meta,
-      });
+      final resp = await api.central.post(
+        '/activation/confirm',
+        data: {
+          if (token != null) 'token': token,
+          if (displayCode != null) 'display_code': displayCode,
+          'installation_id': installationId,
+          ...meta,
+        },
+        options: Options(contentType: Headers.formUrlEncodedContentType),
+      );
 
       final parish = resp.data['parish'] as Map<String, dynamic>;
+      final serverUrl = normalizeParishServerUrl(
+        parish['server_url'] as String,
+      );
       final device = resp.data['device'] as Map<String, dynamic>;
 
       await secureStorage.savedActivation(
         parishId: parish['id'].toString(),
         parishSlug: parish['slug'] as String,
-        serverUrl: parish['server_url'] as String,
+        serverUrl: serverUrl,
         deviceToken: device['device_token'] as String,
       );
       api.resetParishClient();
 
-      return ActivationResult(parishName: parish['name'] as String, serverUrl: parish['server_url'] as String);
+      return ActivationResult(
+        parishName: parish['name'] as String,
+        serverUrl: serverUrl,
+      );
     } catch (_) {
-      throw ActivationError('Aktywacja nie powiodła się. Kod mógł zostać już wykorzystany lub unieważniony.');
+      throw ActivationError(
+        'Aktywacja nie powiodła się. Kod mógł zostać już wykorzystany lub unieważniony.',
+      );
     }
   }
 }

@@ -24,7 +24,11 @@ Pierwszym profilem jest:
 
 Kolejne warianty dodaje się jako nowy profil/adaptor do TEJ SAMEJ paczki.
 
-## Instalacja
+## Instalacja przez przeglądarkę
+
+Przy samym menedżerze plików użyj [instrukcji WWW](browser/README-PL.md). Cała paczka pozostaje poza public_html; publiczny jest tylko zabezpieczony punkt wejścia mm-setup.php.
+
+## Instalacja przez CLI
 
 1. Rozpakuj ZIP do katalogu obok `public_html`, np.
    `/home/user/mm-installer/`.
@@ -46,7 +50,7 @@ Instalator:
 - instaluje wspólny MobileAPI,
 - zapisuje aktywny adapter,
 - wykonuje preflight,
-- wykonuje migracje 001–005,
+- wykonuje migracje 001–006,
 - instaluje metadane adaptera,
 - uruchamia hardening przypisany do profilu,
 - zapisuje manifest rollbacku.
@@ -64,7 +68,7 @@ kasowane automatycznie.
 
 ## Bezpieczeństwo
 
-- instalator działa wyłącznie przez CLI,
+- install.php działa przez CLI lub uwierzytelniony kontroler WWW; bezpośrednie żądania HTTP są odrzucane,
 - nieznany profil = STOP,
 - brak/niepoprawny sekret = STOP,
 - profile nie obchodzą kontroli SHA-256 wewnątrz hardenerów,

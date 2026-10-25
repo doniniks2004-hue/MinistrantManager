@@ -35,6 +35,10 @@ class UserLoginPasswordChangeRequired extends UserLoginResult {
 /// A transport-level failure (no connectivity, timeout, 5xx) — distinct
 /// from invalid credentials so the UI can say "spróbuj ponownie" instead
 /// of "sprawdź hasło".
+class UserLoginLocalError extends UserLoginResult {
+  const UserLoginLocalError();
+}
+
 class UserLoginNetworkError extends UserLoginResult {
   const UserLoginNetworkError();
 }
@@ -77,144 +81,92 @@ class UserSessionService {
   /// comment already describes, just stored as files instead of rows.
   final SnapshotStore snapshotStore;
 
-  Future<UserLoginResult> login({required String username, required String password}) async {
-    final installationId = await secureStorage.installationId;
-    final serverUrl = await secureStorage.serverUrl;
-    if (installationId == null || serverUrl == null) {
-      // Shouldn't normally be reachable — LoginScreen only ever shows once
-      // the device is already activated — but fail closed rather than
-      // send a request with a missing field.
-      return const UserLoginNetworkError();
-    }
+  /// Override only the transport in tests; all session logic stays production code.
+  Dio createLoginClient(BaseOptions options) => Dio(options);
 
-    final loginDio = Dio(BaseOptions(
-      baseUrl: '$serverUrl/api/v1',
-      connectTimeout: const Duration(seconds: 10),
-      receiveTimeout: const Duration(seconds: 15),
-    ));
+  Future<UserLoginResult> login({required String username, required String password}) =>
+      _requestSession('/mobile/session/login', {'username': username, 'password': password});
 
-    try {
-      final resp = await loginDio.post('/mobile/session/login', data: {
-        'username': username,
-        'password': password,
-        'installation_id': installationId,
-      });
-      final data = resp.data as Map<String, dynamic>;
-      final token = data['token'] as String;
-      final user = data['user'] as Map<String, dynamic>;
-      final newUserId = user['id'] as int;
-      final fullName = user['full_name'] as String?;
-      final roleId = user['role_id'] as int?;
-
-      // Review round, point 3 — the whole reason this method exists as
-      // more than a one-line HTTP call: if a DIFFERENT human is signing
-      // in than whoever was signed in on this device before, the
-      // previous user's cached schedule/attendance/points/etc. must be
-      // gone BEFORE this method returns — i.e. before the caller shows
-      // ANY app content — never "for a moment" while a fresh bootstrap
-      // catches up in the background.
-      final previousUserId = await secureStorage.currentUserId;
-      if (previousUserId != null && previousUserId != newUserId) {
-        await db.wipeUserScopedBusinessData();
-        await _clearWebviewCookies();
-        await _clearSnapshotsForUser(previousUserId);
-      }
-
-      await secureStorage.setUserSession(token: token, userId: newUserId, fullName: fullName, roleId: roleId);
-      // A stale Authorization header (no token, or the previous user's)
-      // must never be reused for the very next parish API call.
-      api.resetParishClient();
-
-      return UserLoginSuccess(fullName: fullName);
-    } on DioException catch (e) {
-      final statusCode = e.response?.statusCode;
-
-      // Device-control-plane milestone: 403/503 with error code
-      // "device_not_authorized" is NEVER "zły login/hasło" — the
-      // password was correct; app.ministrant.eu just won't authorize
-      // this installation right now. Checked BEFORE the 401/400 case
-      // below since these status codes never overlap with it in this
-      // backend's design (device_not_authorized is only ever 403/503).
-      if (statusCode == 403 || statusCode == 503) {
-        final body = e.response?.data;
-        final deviceState = (body is Map ? body['device_state'] as String? : null) ?? 'central_unavailable';
-        return UserLoginDeviceNotAuthorized(deviceState: deviceState);
-      }
-
-      final body = e.response?.data;
-      if (statusCode == 428 && body is Map && body['error'] == 'password_change_required') {
-        return const UserLoginPasswordChangeRequired();
-      }
-
-      if (statusCode == 401 || statusCode == 400) {
-        return const UserLoginInvalidCredentials();
-      }
-      return const UserLoginNetworkError();
-    }
-  }
-
-  /// Completes the server-enforced first-login password change. The
-  /// current password is re-verified by the parish and the device is
-  /// re-validated centrally before a fresh token is minted.
   Future<UserLoginResult> changeRequiredPassword({
     required String username,
     required String currentPassword,
     required String newPassword,
-  }) async {
-    final installationId = await secureStorage.installationId;
-    final serverUrl = await secureStorage.serverUrl;
-    if (installationId == null || serverUrl == null) {
-      return const UserLoginNetworkError();
-    }
+  }) => _requestSession('/mobile/session/change-password', {
+    'username': username,
+    'current_password': currentPassword,
+    'new_password': newPassword,
+  });
 
-    final loginDio = Dio(BaseOptions(
-      baseUrl: '$serverUrl/api/v1',
-      connectTimeout: const Duration(seconds: 10),
-      receiveTimeout: const Duration(seconds: 15),
-    ));
-
+  Future<UserLoginResult> _requestSession(String path, Map<String, dynamic> payload) async {
+    Dio? client;
     try {
-      final resp = await loginDio.post('/mobile/session/change-password', data: {
-        'username': username,
-        'current_password': currentPassword,
-        'new_password': newPassword,
-        'installation_id': installationId,
+      final installationId = await secureStorage.installationId;
+      final serverUrl = await secureStorage.serverUrl;
+      if (installationId == null || serverUrl == null) {
+        return const UserLoginLocalError();
+      }
+      client = createLoginClient(BaseOptions(
+        baseUrl: '$serverUrl/api/v1',
+        connectTimeout: const Duration(seconds: 10),
+        receiveTimeout: const Duration(seconds: 15),
+      ));
+      final response = await client.post(path, data: {
+        ...payload, 'installation_id': installationId,
       });
-
-      final data = resp.data as Map<String, dynamic>;
-      final token = data['token'] as String;
-      final user = data['user'] as Map<String, dynamic>;
-      final newUserId = user['id'] as int;
-      final fullName = user['full_name'] as String?;
-      final roleId = user['role_id'] as int?;
-
+      final data = response.data;
+      if (data is! Map) return const UserLoginNetworkError();
+      final token = data['token'];
+      final user = data['user'];
+      if (token is! String || token.trim().isEmpty || user is! Map) {
+        return const UserLoginNetworkError();
+      }
+      final userId = user['id'];
+      final fullName = user['full_name'];
+      final roleId = user['role_id'];
+      if (userId is! int || userId <= 0 ||
+          (fullName != null && fullName is! String) ||
+          (roleId != null && roleId is! int)) {
+        return const UserLoginNetworkError();
+      }
       final previousUserId = await secureStorage.currentUserId;
-      if (previousUserId != null && previousUserId != newUserId) {
+      if (previousUserId != null && previousUserId != userId) {
         await db.wipeUserScopedBusinessData();
         await _clearWebviewCookies();
         await _clearSnapshotsForUser(previousUserId);
       }
-
       await secureStorage.setUserSession(
-        token: token,
-        userId: newUserId,
-        fullName: fullName,
-        roleId: roleId,
+        token: token, userId: userId,
+        fullName: fullName as String?, roleId: roleId as int?,
       );
       api.resetParishClient();
-
       return UserLoginSuccess(fullName: fullName);
     } on DioException catch (e) {
-      final statusCode = e.response?.statusCode;
-      if (statusCode == 403 || statusCode == 503) {
-        final body = e.response?.data;
-        final deviceState = (body is Map ? body['device_state'] as String? : null) ?? 'central_unavailable';
-        return UserLoginDeviceNotAuthorized(deviceState: deviceState);
+      final status = e.response?.statusCode;
+      final body = e.response?.data;
+      if ((status == 403 || status == 503) &&
+          body is Map && body['error'] == 'device_not_authorized') {
+        final state = body['device_state'];
+        const states = {'revoked', 'parish_disabled', 'not_found',
+          'parish_mismatch', 'central_unavailable'};
+        return UserLoginDeviceNotAuthorized(
+          deviceState: state is String && states.contains(state)
+              ? state : 'central_unavailable',
+        );
       }
-      if (statusCode == 401 || statusCode == 400 || statusCode == 409) {
+      if (status == 428 && body is Map && body['error'] == 'password_change_required') {
+        return const UserLoginPasswordChangeRequired();
+      }
+      if (status == 401 || status == 400 ||
+          (status == 409 && path.endsWith('/change-password'))) {
         return const UserLoginInvalidCredentials();
       }
       return const UserLoginNetworkError();
+    } catch (_) {
+      // Keystore/SQLite failures must never leave the UI awaiting a result.
+      // Do not expose exceptions: they can contain credentials or response data.
+      return const UserLoginLocalError();
+    } finally {
+      client?.close();
     }
   }
 

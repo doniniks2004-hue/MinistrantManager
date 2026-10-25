@@ -1,0 +1,9 @@
+{
+  "path": "REPLACE_ME: the logical path of the panel page, e.g. /public/dashboard.php",
+  "required": ["REPLACE_ME: a selector that exists only on the real panel, e.g. #dashboard-root"],
+  "forbidden": ["input[type=password]", "REPLACE_ME: a selector of the app's error banner, if it has one"],
+  "styles": [
+    {"selector": "body", "property": "background-color", "not": "rgba(0, 0, 0, 0)"}
+  ],
+  "titleContains": "REPLACE_ME: a word that is in the real panel's title"
+}

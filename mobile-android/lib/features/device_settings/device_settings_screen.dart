@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 
+import '../../core/util/build_info.dart';
+import '../../core/util/startup_trace.dart';
 import '../revocation/revocation_handler.dart';
+import '../revocation/wipe_marker.dart' show WipeIncompleteException;
 
 /// Offline-architecture milestone, P9. Review round decision: "Reset/
 /// zmiana parafii traktujemy jak utratę uprawnień do poprzedniej
@@ -21,6 +24,7 @@ class DeviceSettingsScreen extends StatefulWidget {
     required this.revocationHandler,
     required this.parishSlug,
     required this.onParishReset,
+    this.onWipeIncomplete,
   });
 
   final RevocationHandler revocationHandler;
@@ -33,6 +37,10 @@ class DeviceSettingsScreen extends StatefulWidget {
   /// screen's own job ends at confirming the user's intent and invoking
   /// the handler.
   final VoidCallback onParishReset;
+
+  /// Called when the wipe did not complete. The owner (HomeScreen) is blocked by the shared
+  /// [WipeLock] and brings the user back to its blocking screen with the retry.
+  final VoidCallback? onWipeIncomplete;
 
   @override
   State<DeviceSettingsScreen> createState() => _DeviceSettingsScreenState();
@@ -71,6 +79,18 @@ class _DeviceSettingsScreenState extends State<DeviceSettingsScreen> {
       // onParishReset rebuilding app state down to the activation
       // screen — no further setState on this widget after this point.
       widget.onParishReset();
+    } on WipeIncompleteException {
+      // The data of this device is NOT all gone, and the screen does not go on to the activation as
+      // though it were: it stays here, and the same button tries again.
+      if (mounted) {
+        setState(() => _resetting = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Nie udało się dokończyć usuwania danych. Dane są zablokowane. Spróbuj ponownie.'),
+          ),
+        );
+        widget.onWipeIncomplete?.call();
+      }
     } catch (_) {
       if (mounted) {
         setState(() => _resetting = false);
@@ -83,7 +103,11 @@ class _DeviceSettingsScreenState extends State<DeviceSettingsScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    // Back is not offered while the wipe runs; and once it has failed, the shared lock (not this
+    // screen) is what keeps the data shut, so Back cannot lead to it.
+    return PopScope(
+      canPop: !_resetting && !widget.revocationHandler.wipeLock.isHeld,
+      child: Scaffold(
       appBar: AppBar(title: const Text('Urządzenie / Parafia')),
       body: ListView(
         padding: const EdgeInsets.all(16),
@@ -101,7 +125,22 @@ class _DeviceSettingsScreenState extends State<DeviceSettingsScreen> {
             trailing: _resetting ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2)) : null,
             onTap: _resetting ? null : _confirmAndReset,
           ),
+          const Divider(height: 32),
+          ListTile(
+            leading: const Icon(Icons.info_outline),
+            title: const Text('Wersja aplikacji'),
+            subtitle: SelectableText('commit ${buildCommitLabel()}'),
+          ),
+          ListTile(
+            leading: const Icon(Icons.timer_outlined),
+            title: const Text('Diagnostyka startu'),
+            // Where the cold start spent its time, measured on this very
+            // device (from the first Dart code; Android's own process start
+            // is not included).
+            subtitle: SelectableText(StartupTrace.format()),
+          ),
         ],
+      ),
       ),
     );
   }

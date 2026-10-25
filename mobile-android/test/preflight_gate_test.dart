@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -12,29 +13,49 @@ import 'package:url_launcher/url_launcher.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
-  const secureStorageChannel = MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
+  const secureStorageChannel =
+      MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
 
   setUp(() {
-    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
       secureStorageChannel,
       (call) async => call.method == 'readAll' ? <String, String>{} : null,
     );
   });
 
   tearDown(() {
-    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(secureStorageChannel, null);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(secureStorageChannel, null);
   });
 
-  Future<ConfigService> configServiceWithCached(Map<String, dynamic> cachedConfig) async {
+  ConfigService offlineConfigService(AppDatabase db) {
+    final api = ApiClient(SecureStorageService());
+    api.central.interceptors
+        .add(InterceptorsWrapper(onRequest: (request, handler) {
+      handler.reject(DioException(
+        requestOptions: request,
+        type: DioExceptionType.connectionError,
+        error: 'Simulated offline network',
+      ));
+    }));
+    return ConfigService(db: db, api: api);
+  }
+
+  Future<ConfigService> configServiceWithCached(
+      Map<String, dynamic> cachedConfig) async {
     final db = AppDatabase.forTesting();
+    addTearDown(db.close);
     await db.saveClientConfig(jsonEncode(cachedConfig));
-    return ConfigService(db: db, api: ApiClient(SecureStorageService()));
+    return offlineConfigService(db);
   }
 
   // Review round 2, point 5: PreflightGate must sit in front of BOTH
   // ActivationScreen and HomeScreen — these tests exercise it directly
   // with a child marker widget, independent of which screen it wraps.
-  testWidgets('maintenance_mode blocks the child entirely, even before activation', (tester) async {
+  testWidgets(
+      'maintenance_mode blocks the child entirely, even before activation',
+      (tester) async {
     final configService = await configServiceWithCached({
       'maintenance_mode': true,
       'maintenance_message': 'Przerwa techniczna',
@@ -53,7 +74,9 @@ void main() {
     expect(find.text('SHOULD_NOT_APPEAR'), findsNothing);
   });
 
-  testWidgets('a global forced update blocks the child when the app version is below the platform minimum', (tester) async {
+  testWidgets(
+      'a global forced update blocks the child when the app version is below the platform minimum',
+      (tester) async {
     final configService = await configServiceWithCached({
       'maintenance_mode': false,
       'minimum_supported_android_version': '2.0.0',
@@ -71,11 +94,14 @@ void main() {
     ));
     await tester.pumpAndSettle();
 
-    expect(find.text('Dostępna jest wymagana aktualizacja Ministrant Manager.'), findsOneWidget);
+    expect(find.text('Dostępna jest wymagana aktualizacja Ministrant Manager.'),
+        findsOneWidget);
     expect(find.text('SHOULD_NOT_APPEAR'), findsNothing);
   });
 
-  testWidgets('a satisfied version + no maintenance mode lets the child through', (tester) async {
+  testWidgets(
+      'a satisfied version + no maintenance mode lets the child through',
+      (tester) async {
     final configService = await configServiceWithCached({
       'maintenance_mode': false,
       'minimum_supported_android_version': '1.0.0',
@@ -94,12 +120,14 @@ void main() {
     expect(find.text('ACTIVATION_OR_HOME'), findsOneWidget);
   });
 
-  testWidgets('no cache and no network (first launch, offline) does NOT block — the explicit instruction', (tester) async {
-    // No saveClientConfig() call at all — genuinely nothing cached, and
-    // the real network call to app.ministrant.eu will fail in this test
-    // environment, so ConfigService.loadClientConfig() returns null.
+  testWidgets(
+      'no cache and no network (first launch, offline) does NOT block — the explicit instruction',
+      (tester) async {
+    // No cached config, and a deterministic transport failure before
+    // any real network request is sent.
     final db = AppDatabase.forTesting();
-    final configService = ConfigService(db: db, api: ApiClient(SecureStorageService()));
+    addTearDown(db.close);
+    final configService = offlineConfigService(db);
 
     await tester.pumpWidget(MaterialApp(
       home: PreflightGate(
@@ -108,21 +136,20 @@ void main() {
         child: const Text('FIRST_ACTIVATION_ALLOWED'),
       ),
     ));
-    await tester.pumpAndSettle(const Duration(seconds: 15)); // real (failing) network call needs time to time out
+    await tester.pumpAndSettle();
 
     expect(find.text('FIRST_ACTIVATION_ALLOWED'), findsOneWidget);
-  // Skipped (review round 3.x point 6): requires a real network round-trip
-  // to time out, or a mocked Dio adapter — not run in this sandbox. `skip:`
-  // takes bool? in this flutter_test version; a String reason isn't a
-  // valid argument type, so the reason lives in this comment instead.
-  }, skip: true);
+  });
 
-  testWidgets('tapping AKTUALIZUJ on the forced-update screen launches the correct store URL', (tester) async {
+  testWidgets(
+      'tapping AKTUALIZUJ on the forced-update screen launches the correct store URL',
+      (tester) async {
     // Review round point 6: this button used to be a hollow placeholder
     // (`onPressed: () {/* url_launcher ... */}`) — this test fails against
     // that old code (nothing captured) and passes against the real fix.
     Uri? capturedUri;
-    StoreLinkLauncher.launchUrlOverride = (uri, {mode = LaunchMode.platformDefault}) async {
+    StoreLinkLauncher.launchUrlOverride =
+        (uri, {mode = LaunchMode.platformDefault}) async {
       capturedUri = uri;
       return true;
     };
@@ -132,14 +159,16 @@ void main() {
       'maintenance_mode': false,
       'minimum_supported_android_version': '2.0.0',
       'minimum_supported_ios_version': '2.0.0',
-      'android_store_url': 'https://play.google.com/store/apps/details?id=eu.ministrant.manager',
+      'android_store_url':
+          'https://play.google.com/store/apps/details?id=eu.ministrant.manager',
       'ios_store_url': 'https://apps.apple.com/app/id0000000000',
     });
 
     await tester.pumpWidget(MaterialApp(
       home: PreflightGate(
         configService: configService,
-        appVersion: '1.0.0', // below the 2.0.0 minimum — forces the update screen
+        appVersion:
+            '1.0.0', // below the 2.0.0 minimum — forces the update screen
         child: const Text('SHOULD_NOT_APPEAR'),
       ),
     ));

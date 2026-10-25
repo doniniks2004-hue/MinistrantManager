@@ -63,14 +63,18 @@ extensions.configure<ApplicationExtension> {
 
     buildTypes {
         release {
-            // Falls back to debug signing when no key.properties exists
-            // (e.g. `flutter build apk --debug` / CI's non-release runs),
-            // so the app still builds out of the box for testing.
-            signingConfig = if (rootProject.file("key.properties").exists()) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
+            // A release task cannot silently fall back to the debug key.
+            if (gradle.startParameter.taskNames.any { it.contains("release", ignoreCase = true) }) {
+                check(rootProject.file("key.properties").exists()) {
+                    "Release signing requires android/key.properties and a valid keystore."
+                }
+                val config = signingConfigs.getByName("release")
+                check(config.storeFile?.isFile == true && !config.storePassword.isNullOrEmpty() &&
+                    !config.keyAlias.isNullOrEmpty() && !config.keyPassword.isNullOrEmpty()) {
+                    "Release signing configuration is incomplete."
+                }
             }
+            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
@@ -86,4 +90,21 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+// mobile_scanner 5.2.3 requests CameraX 1.3.3 and ML Kit 17.2.0,
+// whose bundled 64-bit libraries are only 4 KB aligned. Keep the Dart/iOS
+// API unchanged while selecting their compatible 16 KB-capable Android releases.
+// The packaged APK/AAB are checked by android_native_alignment.py in CI.
+dependencies {
+    constraints {
+        implementation("com.google.mlkit:barcode-scanning:17.3.0") {
+            because("The bundled barcode engine must support 16 KB memory pages")
+        }
+        listOf("camera-core", "camera-camera2", "camera-lifecycle").forEach { module ->
+            implementation("androidx.camera:$module:1.4.2") {
+                because("The native image processor must support 16 KB memory pages")
+            }
+        }
+    }
 }

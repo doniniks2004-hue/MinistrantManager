@@ -1,28 +1,8 @@
-# Dodaj do public_html/.htaccess (obok innych reguł routingu API) —
-# wystawia czyste URL-e /api/v1/mobile/* wspierane przez pliki-zaślepki
-# w api/mobile/*.php (każdy z nich woła prawdziwą logikę z
-# mobileapi-core/ParishAdapters/Witosa/, wdrożonej POZA public_html).
-#
-# Snapshot-first, read-only (bez session/exchange — celowo poza
-# zakresem; bez /mobile/sync — stary incremental model, nieużywany).
-#
-# `mobile_handoff.php` NIE potrzebuje reguły — leży bezpośrednio w
-# public/ i jest wołany wprost (public/mobile_handoff.php?ticket=...).
-# PRODUKCJA: stare narzędzia serwisowe nie mogą być osiągalne przez HTTP.
-# - reset.php: nieautoryzowany destructive reset przez query string
-# - upd.php / fix.php: jednorazowe maintenance tools z hardcoded secret
-# - receiver.php: stary uploader PHP z jednym wspólnym fleet-wide tokenem
-# - install.php: instalator nie powinien być publiczny po wdrożeniu
-#
-# apply_legacy_security_hardening.php dodatkowo fail-closed podmienia
-# obecne pliki reset/upd/fix/receiver. Ta reguła jest defense-in-depth:
-# nawet jeśli ktoś później omyłkowo wgra starą wersję pliku, HTTP nadal
-# dostanie 403. Stary centralny deploy przez receiver.php jest przez to
-# CELOWO wyłączony dla tej parafii; używamy wersjonowanej paczki + SSH/SFTP.
-RewriteRule ^(?:install|reset|upd|fix|receiver)\.php$ - [F,L]
-
-RewriteRule ^api/v1/mobile/bootstrap$ api/mobile/bootstrap.php [L,QSA]
-RewriteRule ^api/v1/mobile/session/login$ api/mobile/session_login.php [L,QSA]
-RewriteRule ^api/v1/mobile/session/change-password$ api/mobile/session_change_password.php [L,QSA]
-RewriteRule ^api/v1/mobile/config$ api/mobile/config.php [L,QSA]
-RewriteRule ^api/v1/mobile/webview/handoff$ api/mobile/webview_handoff.php [L,QSA]
+RewriteEngine On
+# Apache 2.4 END prevents the legacy API router from rewriting these again.
+RewriteRule ^api/v1/mobile/bootstrap/?$ mm-mobile-bootstrap.php [END,QSA]
+RewriteRule ^api/v1/mobile/session/login/?$ mm-mobile-session-login.php [END,QSA]
+RewriteRule ^api/v1/mobile/session/change-password/?$ mm-mobile-session-change-password.php [END,QSA]
+RewriteRule ^api/v1/mobile/config/?$ mm-mobile-config.php [END,QSA]
+RewriteRule ^api/v1/mobile/webview/handoff/?$ mm-mobile-webview-handoff.php [END,QSA]
+RewriteRule ^(?:install|reset|upd|fix|receiver)\.php$ - [F,END]

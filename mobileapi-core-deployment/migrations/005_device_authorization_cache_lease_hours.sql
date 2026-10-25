@@ -8,9 +8,15 @@
 --   now() - checked_at > offline_lease_hours  =>  treat as
 --   central_unavailable, no matter how the 10-minute lease looks.
 --
--- Safe to run multiple times / on a table that may already have rows:
--- ADD COLUMN IF NOT EXISTS with a sane default (72h, matching
--- Parish::effectiveOfflineLeaseHours()'s own fallback default).
-
-ALTER TABLE device_authorization_cache
-    ADD COLUMN IF NOT EXISTS offline_lease_hours INT NOT NULL DEFAULT 72 AFTER state;
+-- MySQL and MariaDB compatible, safe to repeat on an existing column.
+SET @mm_add_lease_column = IF(
+    EXISTS(SELECT 1 FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'device_authorization_cache'
+             AND COLUMN_NAME = 'offline_lease_hours'),
+    'SELECT 1',
+    'ALTER TABLE device_authorization_cache ADD COLUMN offline_lease_hours INT NOT NULL DEFAULT 72 AFTER state'
+);
+PREPARE mm_lease_migration FROM @mm_add_lease_column;
+EXECUTE mm_lease_migration;
+DEALLOCATE PREPARE mm_lease_migration;

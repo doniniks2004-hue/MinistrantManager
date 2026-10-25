@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The app does not track users and contacts no tracking domains. -->
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+	<!-- Required-reason APIs used by the APP'S OWN code (plugins and the Flutter
+	     engine ship their own manifests). The app reads file timestamps inside
+	     its own container: crash recovery of a saved page picks the newest
+	     directory by modification time (snapshot_store.dart). Reason C617.1:
+	     files inside the app container. Nothing else the app itself calls is a
+	     required-reason API; re-check this list when native code is added. -->
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>C617.1</string>
+			</array>
+		</dict>
+	</array>
+	<!-- Data collection is declared in App Store Connect's privacy questionnaire,
+	     which is the owner's decision; this manifest does not declare any. -->
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array/>
+</dict>
+</plist>

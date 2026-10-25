@@ -1,12 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
+
 import 'package:dio/dio.dart';
 import 'package:drift/drift.dart';
 import 'package:meta/meta.dart';
 import 'package:uuid/uuid.dart';
+
 import '../database/app_database.dart';
 import '../network/api_client.dart';
 import '../secure/secure_storage_service.dart';
+import '../security/access_refusals.dart';
 import 'offline_lease.dart';
 
 enum DeviceAuthState {
@@ -22,6 +25,17 @@ enum DeviceAuthState {
   // access is blocked, cached data is not shown, without necessarily
   // being as destructive as a confirmed revoked/parishDisabled signal.
   authError,
+  // The central server answered, unambiguously, that it does not accept this device's token
+  // (HTTP 401 on /device/status), or the parish server refused the device with a state that says
+  // so (device_not_authorized + revoked / parish_disabled / not_found / parish_mismatch). Unlike
+  // [authError] it is REMEMBERED (AccessRefusals): a later start with no connection does not get
+  // the offline lease back, and no saved copy is opened. Unlike [revoked] it erases nothing; it is
+  // lifted by a verified ACTIVE from the central server, or by a new activation.
+  tokenRejected,
+  // The app cannot find out whether a refusal stands (the local record cannot be read or is damaged,
+  // or a refusal could not be lifted after a verified ACTIVE). NOT "no refusal": saved data is not
+  // opened, nothing is erased, and the user can try again.
+  refusalUnknown,
   offlineWithinLease,
   offlineLeaseExpired,
 }
@@ -49,7 +63,8 @@ class DeviceStatusResult {
 /// installation_id/device_token, never re-trigger QR activation.
 class ParishSessionExpiredException implements Exception {
   @override
-  String toString() => 'ParishSessionExpiredException: the parish API rejected the current mobile_user_token (401).';
+  String toString() =>
+      'ParishSessionExpiredException: the parish API rejected the current mobile_user_token (401).';
 }
 
 /// Review round fix (real bug — a missing X-Installation-Id header
@@ -81,23 +96,94 @@ class SyncEngine {
     required this.api,
     required this.secureStorage,
     this.offlineLease = const OfflineLease(),
-  });
+    AccessRefusals? refusals,
+  }) : refusals = refusals ?? AccessRefusals(secureStorage.refusalStorage);
 
   final AppDatabase db;
   final ApiClient api;
   final SecureStorageService secureStorage;
   final OfflineLease offlineLease;
+
+  /// What the server has refused, remembered across restarts.
+  final AccessRefusals refusals;
   final _uuid = const Uuid();
 
   bool _isSyncing = false;
 
+  /// A refusal that was received earlier and has not been lifted, read from LOCAL storage only
+  /// (no network): what a start must know BEFORE it shows anything. Three answers:
+  ///  - null: the device is not activated, or no refusal stands;
+  ///  - [DeviceAuthState.tokenRejected]: a refusal stands;
+  ///  - [DeviceAuthState.refusalUnknown]: it could not be found out (the token or the record cannot
+  ///    be read, or the record is damaged). That is NOT "no refusal".
+  Future<DeviceStatusResult?> persistedRefusal() async {
+    String? token;
+    var tokenReadFailed = false;
+    try {
+      token = await secureStorage.deviceToken;
+    } catch (_) {
+      tokenReadFailed = true;
+    }
+    if (token == null && !tokenReadFailed) return null;
+    final check = await refusals.checkDevice(deviceToken: token, tokenReadFailed: tokenReadFailed);
+    return switch (check.check) {
+      RefusalCheck.clear => null,
+      RefusalCheck.blocked => DeviceStatusResult(DeviceAuthState.tokenRejected),
+      RefusalCheck.unknown => DeviceStatusResult(DeviceAuthState.refusalUnknown),
+    };
+  }
+
+  String? _lastAppVersion;
+  String? _lastOsVersion;
+
+  /// Asks the central server again, with the versions of the last check: used by a caller that
+  /// has just been told "no" by the PARISH server, whose answer can be a stale copy (it caches the
+  /// central one for 10 minutes). Null when there has been no check to take the versions from, or
+  /// the device is not activated. The same rules as [checkDeviceStatus]: an ACTIVE lifts a
+  /// remembered refusal, a 401 adds one.
+  Future<DeviceAuthState?> reverifyDevice() async {
+    final app = _lastAppVersion;
+    final os = _lastOsVersion;
+    if (app == null || os == null) return null;
+    return (await checkDeviceStatus(appVersion: app, osVersion: os))?.state;
+  }
+
   /// Returns null if the app isn't activated yet — caller should route to
-  /// the activation screen.
-  Future<DeviceStatusResult?> checkDeviceStatus({required String appVersion, required String osVersion}) async {
+  /// the activation screen — and also when the activation CHANGED while the request was on its way
+  /// (the answer was for another token: it is dropped, nothing of it is applied).
+  ///
+  /// What each answer of the CENTRAL server means (`POST /device/status`, DeviceController):
+  ///  - 200 ACTIVE: confirmed. Lifts a remembered refusal for this token, renews the lease.
+  ///  - 200 DEVICE_REVOKED / PARISH_DISABLED: revoked (the caller erases, RevocationHandler).
+  ///  - 200 UPDATE_REQUIRED: unchanged. It does NOT lift a remembered refusal: only ACTIVE does.
+  ///  - 401: the central server does not accept this token. REMEMBERED ([DeviceAuthState.tokenRejected]).
+  ///  - 200 with an unknown status, a body that is not an object, 403 (this endpoint does not
+  ///    produce it: a firewall or proxy does), 4xx and 3xx others: an answer this app cannot
+  ///    interpret. NOT ACTIVE, the lease is NOT renewed, nothing is erased, nothing new is
+  ///    remembered, and a refusal remembered earlier STAYS (it is not removed by noise).
+  ///  - 5xx, no answer: the offline lease, as before; with a remembered refusal, the refusal.
+  Future<DeviceStatusResult?> checkDeviceStatus({
+    required String appVersion,
+    required String osVersion,
+  }) async {
     final token = await secureStorage.deviceToken;
     if (token == null) return null;
+    _lastAppVersion = appVersion;
+    _lastOsVersion = osVersion;
 
     final meta = await db.ensureSyncMetadata();
+    final remembered = (await refusals.checkDevice(deviceToken: token)).check;
+
+    // Whether this answer still belongs to the CURRENT activation. The device can be re-activated
+    // (another token) while a request is on its way; an answer for the old token must neither
+    // lift, add, renew nor wipe anything of the new one.
+    Future<bool> stillCurrent() async {
+      try {
+        return (await secureStorage.deviceToken) == token;
+      } catch (_) {
+        return false;
+      }
+    }
 
     try {
       final dio = api.centralWithAuth(token);
@@ -105,19 +191,50 @@ class SyncEngine {
       // backend was evaluating UPDATE_REQUIRED against whatever version
       // was last recorded at activation/heartbeat time, which could be
       // stale for a device that just updated but hasn't heartbeat'd yet.
-      final resp = await dio.post('/device/status', data: {
-        'app_version': appVersion,
-        'os_version': osVersion,
-      });
+      final resp = await dio.post(
+        '/device/status',
+        data: {'app_version': appVersion, 'os_version': osVersion},
+      );
+      if (!await stillCurrent()) return null;
+      if (resp.data is! Map<String, dynamic>) {
+        return _cannotInterpret(remembered);
+      }
       final data = resp.data as Map<String, dynamic>;
-
-      await _persistServerControlledConfig(data);
-
-      return _interpretStatus(data);
+      final result = _interpretStatus(data);
+      if (result.state == DeviceAuthState.authError) return _cannotInterpret(remembered);
+      if (result.state == DeviceAuthState.active) {
+        // The refusal is lifted BEFORE the device is called active, and the app learns whether it
+        // really was: a block that could not be removed from storage is not lifted, and "active"
+        // would then be a statement the next start contradicts.
+        final lift = await refusals.liftDevice(deviceToken: token, stillCurrent: stillCurrent);
+        if (lift == LiftResult.superseded) return null; // the activation changed: nothing here applies
+        if (lift == LiftResult.failed) return DeviceStatusResult(DeviceAuthState.refusalUnknown);
+        if (!await stillCurrent()) return null;
+        await _persistServerControlledConfig(data);
+      }
+      return result;
     } on DioException catch (e) {
-      return _interpretDioFailure(e, meta);
+      if (!await stillCurrent()) return null;
+      return _interpretDioFailure(e, meta, token: token, remembered: remembered);
     }
   }
+
+  /// An answer that cannot be read as ACTIVE or as a refusal. Fails closed (authError) and leaves
+  /// everything else as it was; a refusal remembered earlier keeps being reported, and a record that
+  /// cannot be read keeps the app at "cannot tell".
+  DeviceStatusResult _cannotInterpret(RefusalCheck remembered) => DeviceStatusResult(switch (remembered) {
+        RefusalCheck.blocked => DeviceAuthState.tokenRejected,
+        RefusalCheck.unknown => DeviceAuthState.refusalUnknown,
+        RefusalCheck.clear => DeviceAuthState.authError,
+      });
+
+  /// What a transient failure (no answer, 5xx) comes to: the offline lease, unless a refusal stands
+  /// (it is not undone by the connection being gone) or could not be ruled out.
+  DeviceStatusResult _transient(RefusalCheck remembered, SyncMetadataData meta) => switch (remembered) {
+        RefusalCheck.blocked => DeviceStatusResult(DeviceAuthState.tokenRejected),
+        RefusalCheck.unknown => DeviceStatusResult(DeviceAuthState.refusalUnknown),
+        RefusalCheck.clear => _offlineLeaseResult(meta),
+      };
 
   /// Review round fix: the previous code treated EVERY DioException as
   /// "no internet" and fell back to the offline lease — but a DioException
@@ -126,36 +243,43 @@ class SyncEngine {
   /// opinion; silently reading that as "offline, use cached lease" would
   /// let a device with an invalidated token keep using local data for up
   /// to the whole lease window.
-  DeviceStatusResult _interpretDioFailure(DioException e, SyncMetadataData meta) {
+  ///
+  /// Now also: that 401 is remembered, and 403/other statuses are told apart from it (see
+  /// [checkDeviceStatus]).
+  Future<DeviceStatusResult> _interpretDioFailure(
+    DioException e,
+    SyncMetadataData meta, {
+    required String token,
+    required RefusalCheck remembered,
+  }) async {
     final statusCode = e.response?.statusCode;
 
     if (statusCode != null) {
       // The server responded — this is never a connectivity problem.
       if (statusCode == 401) {
-        // Invalid/unknown device token — fail closed, do not serve cached data.
-        return DeviceStatusResult(DeviceAuthState.authError);
-      }
-      if (statusCode == 403) {
-        // Explicit security rejection — same treatment as 401.
-        return DeviceStatusResult(DeviceAuthState.authError);
+        // The central server does not accept this device token: remembered, so that the next start
+        // (which may have no connection) does not take the lease back and open a saved copy.
+        await refusals.blockDevice(deviceToken: token, source: 'central_401');
+        return DeviceStatusResult(DeviceAuthState.tokenRejected);
       }
       if (statusCode >= 500) {
         // Server-side failure, not a device-auth decision by the server —
         // treated as a temporary outage, same as a genuine transport
         // failure below (an explicit, deliberate choice per review, not
         // an oversight: a device shouldn't be locked out by a backend
-        // deploy blip).
-        return _offlineLeaseResult(meta);
+        // deploy blip). A refusal received EARLIER is still in force.
+        return _transient(remembered, meta);
       }
-      // Any other unexpected HTTP status from a server that DID respond:
-      // fail closed rather than silently trusting cached data.
-      return DeviceStatusResult(DeviceAuthState.authError);
+      // 403 and every other status: an answer this endpoint does not give for a refused token, so
+      // it is not read as one (and not as ACTIVE either).
+      return _cannotInterpret(remembered);
     }
 
     // No response at all — genuine transport failure (timeout, DNS,
     // connection refused, no network reachability). This is the ONLY
-    // case the offline lease is meant to cover.
-    return _offlineLeaseResult(meta);
+    // case the offline lease is meant to cover, and a refusal that was
+    // already received is not undone by the connection being gone.
+    return _transient(remembered, meta);
   }
 
   DeviceStatusResult _offlineLeaseResult(SyncMetadataData meta) {
@@ -164,7 +288,9 @@ class SyncEngine {
       leaseHours: meta.offlineLeaseHours,
     );
     return DeviceStatusResult(
-      withinLease ? DeviceAuthState.offlineWithinLease : DeviceAuthState.offlineLeaseExpired,
+      withinLease
+          ? DeviceAuthState.offlineWithinLease
+          : DeviceAuthState.offlineLeaseExpired,
     );
   }
 
@@ -176,13 +302,16 @@ class SyncEngine {
     await (db.update(db.syncMetadata)..where((t) => t.id.equals(1))).write(
       SyncMetadataCompanion(
         lastAuthorizationCheck: Value(DateTime.now().toUtc()),
-        offlineLeaseHours: leaseHours != null ? Value(leaseHours) : const Value.absent(),
+        offlineLeaseHours: leaseHours != null
+            ? Value(leaseHours)
+            : const Value.absent(),
       ),
     );
   }
 
   @visibleForTesting
-  DeviceStatusResult interpretStatusForTesting(Map<String, dynamic> data) => _interpretStatus(data);
+  DeviceStatusResult interpretStatusForTesting(Map<String, dynamic> data) =>
+      _interpretStatus(data);
 
   DeviceStatusResult _interpretStatus(Map<String, dynamic> data) {
     switch (data['status'] as String?) {
@@ -193,7 +322,8 @@ class SyncEngine {
       case 'UPDATE_REQUIRED':
         return DeviceStatusResult(
           DeviceAuthState.updateRequired,
-          minimumSupportedAppVersion: data['minimum_supported_app_version'] as String?,
+          minimumSupportedAppVersion:
+              data['minimum_supported_app_version'] as String?,
         );
       case 'ACTIVE':
         return DeviceStatusResult(DeviceAuthState.active);
@@ -271,10 +401,14 @@ class SyncEngine {
   /// method itself does not swallow anything, so a test or a stricter
   /// caller can still observe failures.
   Future<void> fetchAndApplySnapshot() async {
+    final generation = secureStorage.sessionGeneration;
     final dio = await api.parish();
     try {
       final resp = await dio.get('/mobile/bootstrap');
-      await _applySnapshot(resp.data as Map<String, dynamic>);
+      await _applySnapshot(
+        resp.data as Map<String, dynamic>,
+        sessionGeneration: generation,
+      );
     } on DioException catch (e) {
       final statusCode = e.response?.statusCode;
 
@@ -303,7 +437,10 @@ class SyncEngine {
         if (body is Map) {
           message = body['message'] as String? ?? body['error'] as String?;
         }
-        throw ParishContractErrorException(statusCode: statusCode!, message: message);
+        throw ParishContractErrorException(
+          statusCode: statusCode!,
+          message: message,
+        );
       }
 
       // Anything else (no response at all — timeout/DNS/connection
@@ -319,12 +456,27 @@ class SyncEngine {
   /// snapshot-replace logic directly with a synthetic payload, without
   /// needing a real/fake HTTP layer for `/mobile/bootstrap` itself.
   @visibleForTesting
-  Future<void> applySnapshotForTesting(Map<String, dynamic> data) => _applySnapshot(data);
+  Future<void> applySnapshotForTesting(Map<String, dynamic> data) =>
+      _applySnapshot(data);
 
-  Future<void> _applySnapshot(Map<String, dynamic> data) async {
-    final generatedAt = DateTime.tryParse(data['generated_at'] as String? ?? '') ?? DateTime.now().toUtc();
+  Future<void> _applySnapshot(
+    Map<String, dynamic> data, {
+    int? sessionGeneration,
+  }) async {
+    void checkSession() {
+      if (sessionGeneration != null &&
+          secureStorage.sessionGeneration != sessionGeneration) {
+        throw StateError('Discarded response from a previous user session.');
+      }
+    }
+
+    checkSession();
+    final generatedAt =
+        DateTime.tryParse(data['generated_at'] as String? ?? '') ??
+        DateTime.now().toUtc();
 
     await db.transaction(() async {
+      checkSession();
       await db.delete(db.events).go();
       for (final row in _rows(data['events'])) {
         await db.into(db.events).insertOnConflictUpdate(_mapLegacyEvent(row));
@@ -332,7 +484,9 @@ class SyncEngine {
 
       await db.delete(db.scheduleAssignments).go();
       for (final row in _rows(data['schedule'])) {
-        await db.into(db.scheduleAssignments).insertOnConflictUpdate(_mapLegacySchedule(row));
+        await db
+            .into(db.scheduleAssignments)
+            .insertOnConflictUpdate(_mapLegacySchedule(row));
       }
 
       // Hybrid dashboard milestone, P1: parish-wide, replaced wholesale
@@ -341,7 +495,9 @@ class SyncEngine {
       // either, so a full replace is the only way to reflect a deletion).
       await db.delete(db.announcements).go();
       for (final row in _rows(data['announcements'])) {
-        await db.into(db.announcements).insertOnConflictUpdate(_mapLegacyAnnouncement(row));
+        await db
+            .into(db.announcements)
+            .insertOnConflictUpdate(_mapLegacyAnnouncement(row));
       }
 
       // Points: history is per-user already (bootstrap.php scopes the
@@ -362,7 +518,9 @@ class SyncEngine {
       final rankingData = data['ranking'];
       if (rankingData is Map) {
         for (final row in _rows(rankingData['entries'])) {
-          await db.into(db.rankingEntries).insertOnConflictUpdate(_mapLegacyRankingEntry(row));
+          await db
+              .into(db.rankingEntries)
+              .insertOnConflictUpdate(_mapLegacyRankingEntry(row));
         }
       }
 
@@ -374,10 +532,18 @@ class SyncEngine {
       final substitutionsData = data['substitutions'];
       if (substitutionsData is Map) {
         for (final row in _rows(substitutionsData['mine'])) {
-          await db.into(db.substitutionRequests).insertOnConflictUpdate(_mapLegacySubstitution(row, isMine: true));
+          await db
+              .into(db.substitutionRequests)
+              .insertOnConflictUpdate(
+                _mapLegacySubstitution(row, isMine: true),
+              );
         }
         for (final row in _rows(substitutionsData['available'])) {
-          await db.into(db.substitutionRequests).insertOnConflictUpdate(_mapLegacySubstitution(row, isMine: false));
+          await db
+              .into(db.substitutionRequests)
+              .insertOnConflictUpdate(
+                _mapLegacySubstitution(row, isMine: false),
+              );
         }
       }
 
@@ -386,7 +552,9 @@ class SyncEngine {
       // docblock for why this is a genuinely separate source).
       await db.delete(db.gatheringAttendanceRecords).go();
       for (final row in _rows(data['gathering_attendance'])) {
-        await db.into(db.gatheringAttendanceRecords).insertOnConflictUpdate(_mapLegacyGatheringAttendance(row));
+        await db
+            .into(db.gatheringAttendanceRecords)
+            .insertOnConflictUpdate(_mapLegacyGatheringAttendance(row));
       }
 
       // Review round fix (real bug, found via a direct-call test that
@@ -400,13 +568,20 @@ class SyncEngine {
       // is unconditionally correct: creates the row with lastSyncAt set
       // if none existed, or updates ONLY lastSyncAt (leaving cursor/
       // lastAuthorizationCheck/offlineLeaseHours untouched) if one did.
-      await db.into(db.syncMetadata).insertOnConflictUpdate(
-            SyncMetadataCompanion.insert(id: const Value(1), lastSyncAt: Value(generatedAt)),
+      await db
+          .into(db.syncMetadata)
+          .insertOnConflictUpdate(
+            SyncMetadataCompanion.insert(
+              id: const Value(1),
+              lastSyncAt: Value(generatedAt),
+            ),
           );
+      checkSession();
     });
   }
 
-  EventsCompanion _mapLegacyEvent(Map<String, dynamic> row) => EventsCompanion.insert(
+  EventsCompanion _mapLegacyEvent(Map<String, dynamic> row) =>
+      EventsCompanion.insert(
         id: row['id'] as String, // canonical "{source}:{raw_id}" — see the backend contract
         rawId: row['raw_id'] as int,
         source: row['source'] as String,
@@ -416,7 +591,8 @@ class SyncEngine {
         isCancelled: Value(row['is_cancelled'] as bool? ?? false),
       );
 
-  ScheduleAssignmentsCompanion _mapLegacySchedule(Map<String, dynamic> row) => ScheduleAssignmentsCompanion.insert(
+  ScheduleAssignmentsCompanion _mapLegacySchedule(Map<String, dynamic> row) =>
+      ScheduleAssignmentsCompanion.insert(
         id: row['id'] as String,
         rawId: row['raw_id'] as int,
         eventId: row['event_id'] as String,
@@ -427,7 +603,8 @@ class SyncEngine {
         status: row['status'] as String,
       );
 
-  AnnouncementsCompanion _mapLegacyAnnouncement(Map<String, dynamic> row) => AnnouncementsCompanion.insert(
+  AnnouncementsCompanion _mapLegacyAnnouncement(Map<String, dynamic> row) =>
+      AnnouncementsCompanion.insert(
         id: row['id'] as String,
         rawId: row['raw_id'] as int,
         title: row['title'] as String,
@@ -436,7 +613,8 @@ class SyncEngine {
         createdAt: DateTime.parse(row['created_at'] as String),
       );
 
-  PointsCompanion _mapLegacyPoint(Map<String, dynamic> row) => PointsCompanion.insert(
+  PointsCompanion _mapLegacyPoint(Map<String, dynamic> row) =>
+      PointsCompanion.insert(
         id: row['id'] as String,
         rawId: row['raw_id'] as int,
         pointsValue: row['points_value'] as int,
@@ -446,7 +624,8 @@ class SyncEngine {
         createdAt: DateTime.parse(row['created_at'] as String),
       );
 
-  RankingEntriesCompanion _mapLegacyRankingEntry(Map<String, dynamic> row) => RankingEntriesCompanion.insert(
+  RankingEntriesCompanion _mapLegacyRankingEntry(Map<String, dynamic> row) =>
+      RankingEntriesCompanion.insert(
         id: 'ranking:${row['user_id']}',
         userId: row['user_id'] as int,
         fullName: row['full_name'] as String,
@@ -455,37 +634,43 @@ class SyncEngine {
         isCurrentUser: Value(row['is_current_user'] as bool? ?? false),
       );
 
-  SubstitutionRequestsCompanion _mapLegacySubstitution(Map<String, dynamic> row, {required bool isMine}) =>
-      SubstitutionRequestsCompanion.insert(
-        id: row['id'] as String,
-        rawId: row['raw_id'] as int,
-        status: row['status'] as String,
-        requestingUserName: row['requesting_user_name'] as String,
-        acceptedByName: Value(row['accepted_by_name'] as String?),
-        eventId: row['event_id'] as String,
-        eventSource: row['event_source'] as String,
-        eventDate: Value(row['event_date'] != null ? DateTime.parse(row['event_date'] as String) : null),
-        eventDescription: Value(row['event_description'] as String?),
-        isMine: isMine,
-        createdAt: DateTime.parse(row['created_at'] as String),
-      );
+  SubstitutionRequestsCompanion _mapLegacySubstitution(
+    Map<String, dynamic> row, {
+    required bool isMine,
+  }) => SubstitutionRequestsCompanion.insert(
+    id: row['id'] as String,
+    rawId: row['raw_id'] as int,
+    status: row['status'] as String,
+    requestingUserName: row['requesting_user_name'] as String,
+    acceptedByName: Value(row['accepted_by_name'] as String?),
+    eventId: row['event_id'] as String,
+    eventSource: row['event_source'] as String,
+    eventDate: Value(
+      row['event_date'] != null
+          ? DateTime.parse(row['event_date'] as String)
+          : null,
+    ),
+    eventDescription: Value(row['event_description'] as String?),
+    isMine: isMine,
+    createdAt: DateTime.parse(row['created_at'] as String),
+  );
 
-  GatheringAttendanceRecordsCompanion _mapLegacyGatheringAttendance(Map<String, dynamic> row) =>
-      GatheringAttendanceRecordsCompanion.insert(
-        id: row['id'] as String,
-        rawId: row['raw_id'] as int,
-        gatheringTitle: row['gathering_title'] as String,
-        gatheringDate: DateTime.parse(row['gathering_date'] as String),
-        wasPresent: row['was_present'] as bool,
-        isExcused: row['is_excused'] as bool,
-        pointsAwarded: row['points_awarded'] as int,
-        notes: Value(row['notes'] as String?),
-      );
+  GatheringAttendanceRecordsCompanion _mapLegacyGatheringAttendance(
+    Map<String, dynamic> row,
+  ) => GatheringAttendanceRecordsCompanion.insert(
+    id: row['id'] as String,
+    rawId: row['raw_id'] as int,
+    gatheringTitle: row['gathering_title'] as String,
+    gatheringDate: DateTime.parse(row['gathering_date'] as String),
+    wasPresent: row['was_present'] as bool,
+    isExcused: row['is_excused'] as bool,
+    pointsAwarded: row['points_awarded'] as int,
+    notes: Value(row['notes'] as String?),
+  );
 
-
-
-  List<Map<String, dynamic>> _rows(dynamic raw) =>
-      raw is List ? raw.cast<Map<String, dynamic>>() : const <Map<String, dynamic>>[];
+  List<Map<String, dynamic>> _rows(dynamic raw) => raw is List
+      ? raw.cast<Map<String, dynamic>>()
+      : const <Map<String, dynamic>>[];
 
   /// Tells app.ministrant.eu that this device successfully completed a
   /// business-data sync with its parish — this is what makes the panel's
@@ -510,33 +695,47 @@ class SyncEngine {
   /// removing each on success. A 409 conflict is surfaced to the caller
   /// via [onConflict] rather than silently resolved — per spec §1, the
   /// app must never auto-overwrite someone else's later change.
-  Future<void> pushPendingActions({void Function(PendingAction action, Map<String, dynamic> conflict)? onConflict}) async {
+  Future<void> pushPendingActions({
+    void Function(PendingAction action, Map<String, dynamic> conflict)?
+    onConflict,
+  }) async {
     final pending = await db.select(db.pendingActions).get();
     if (pending.isEmpty) return;
 
     final dio = await api.parish();
 
-    final resp = await dio.post('/mobile/actions', data: {
-      'actions': pending
-          .map((a) => {
+    final resp = await dio.post(
+      '/mobile/actions',
+      data: {
+        'actions': pending
+            .map(
+              (a) => {
                 'client_action_id': a.clientActionId,
                 'type': a.type,
-                'payload': jsonDecode(a.payloadJson), // was: raw String — backend expects a JSON object
+                'payload': jsonDecode(
+                  a.payloadJson,
+                ), // was: raw String — backend expects a JSON object
                 if (a.baseVersion != null) 'base_version': a.baseVersion,
                 'created_at': a.createdAt.toIso8601String(),
-              })
-          .toList(),
-    });
+              },
+            )
+            .toList(),
+      },
+    );
 
     final results = (resp.data['results'] as List).cast<Map<String, dynamic>>();
 
     for (final result in results) {
-      final action = pending.firstWhere((a) => a.clientActionId == result['client_action_id']);
+      final action = pending.firstWhere(
+        (a) => a.clientActionId == result['client_action_id'],
+      );
 
       switch (result['status']) {
         case 'applied':
         case 'already_applied':
-          await (db.delete(db.pendingActions)..where((t) => t.id.equals(action.id))).go();
+          await (db.delete(
+            db.pendingActions,
+          )..where((t) => t.id.equals(action.id))).go();
           break;
         case 'conflict':
           // Leave the action queued for now — the caller (UI layer) decides
@@ -545,7 +744,9 @@ class SyncEngine {
           onConflict?.call(action, result);
           break;
         default:
-          await (db.update(db.pendingActions)..where((t) => t.id.equals(action.id))).write(
+          await (db.update(
+            db.pendingActions,
+          )..where((t) => t.id.equals(action.id))).write(
             PendingActionsCompanion(
               attemptCount: Value(action.attemptCount + 1),
               lastError: Value(result['reason']?.toString() ?? 'unknown_error'),
@@ -558,8 +759,14 @@ class SyncEngine {
   /// Enqueue a user action performed right now (online or offline — the
   /// caller doesn't need to know or care). Call `runFullSync()` afterwards
   /// if you want to try pushing immediately.
-  Future<void> enqueueAction({required String type, required Map<String, dynamic> payload, int? baseVersion}) async {
-    await db.into(db.pendingActions).insert(
+  Future<void> enqueueAction({
+    required String type,
+    required Map<String, dynamic> payload,
+    int? baseVersion,
+  }) async {
+    await db
+        .into(db.pendingActions)
+        .insert(
           PendingActionsCompanion.insert(
             clientActionId: _uuid.v4(),
             type: type,
@@ -570,12 +777,18 @@ class SyncEngine {
         );
   }
 
-  Future<void> heartbeat({required String appVersion, required String osVersion}) async {
+  Future<void> heartbeat({
+    required String appVersion,
+    required String osVersion,
+  }) async {
     final token = await secureStorage.deviceToken;
     if (token == null) return;
     try {
       final dio = api.centralWithAuth(token);
-      final resp = await dio.post('/device/heartbeat', data: {'app_version': appVersion, 'os_version': osVersion});
+      final resp = await dio.post(
+        '/device/heartbeat',
+        data: {'app_version': appVersion, 'os_version': osVersion},
+      );
       await _persistServerControlledConfig(resp.data as Map<String, dynamic>);
     } on DioException {
       // Best-effort — heartbeat failing silently is fine, see spec §34.

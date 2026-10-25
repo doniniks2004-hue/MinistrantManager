@@ -88,7 +88,9 @@ final class LegacyPasswordAuthenticator
         $hash = $user['password'] ?? $dummyHash;
         $isValid = password_verify($password, $hash);
 
-        $this->recordAttempt($ip, $username, $isValid && $user !== null);
+        if (!$this->recordAttempt($ip, $username, $isValid && $user !== null)) {
+            return null;
+        }
 
         if ($user === null || !$isValid || (int) $user['is_active'] !== 1) {
             return null;
@@ -105,8 +107,9 @@ final class LegacyPasswordAuthenticator
 
     private function isRateLimited(string $ip, string $username): bool
     {
+        // A missing/broken limiter must never permit unlimited password guesses.
         if (!$this->loginAttemptsTableExists()) {
-            return false;
+            return true;
         }
 
         $timeLimit = date('Y-m-d H:i:s', strtotime('-' . self::DECAY_MINUTES . ' minutes'));
@@ -128,27 +131,30 @@ final class LegacyPasswordAuthenticator
         }
 
         if (!$stmt) {
-            return false;
+            return true;
         }
 
         $stmt->bind_param('sss', $ip, $username, $timeLimit);
         if (!$stmt->execute()) {
             $stmt->close();
+            return true;
+        }
+
+        $attempts = 0;
+        $stmt->bind_result($attempts);
+        $hasRow = $stmt->fetch();
+        $stmt->close();
+
+        return !$hasRow || (int) $attempts >= self::MAX_FAILED_ATTEMPTS;
+    }
+
+    private function recordAttempt(string $ip, string $username, bool $wasSuccessful): bool
+    {
+        if (!$this->loginAttemptsTableExists()) {
             return false;
         }
 
-        $row = $stmt->get_result()->fetch_assoc();
-        $stmt->close();
-
-        return (int) ($row['attempts'] ?? 0) >= self::MAX_FAILED_ATTEMPTS;
-    }
-
-    private function recordAttempt(string $ip, string $username, bool $wasSuccessful): void
-    {
-        if (!$this->loginAttemptsTableExists()) {
-            return;
-        }
-
+        $recorded = false;
         if ($this->loginAttemptsHasColumn('was_successful')) {
             $successFlag = $wasSuccessful ? 1 : 0;
             $stmt = @$this->conn->prepare(
@@ -156,7 +162,7 @@ final class LegacyPasswordAuthenticator
             );
             if ($stmt) {
                 $stmt->bind_param('ssi', $ip, $username, $successFlag);
-                @$stmt->execute();
+                $recorded = $stmt->execute();
                 $stmt->close();
             }
         } else {
@@ -168,10 +174,12 @@ final class LegacyPasswordAuthenticator
             );
             if ($stmt) {
                 $stmt->bind_param('ss', $ip, $username);
-                @$stmt->execute();
+                $recorded = $stmt->execute();
                 $stmt->close();
             }
         }
+
+        if (!$recorded) return false;
 
         if ($wasSuccessful) {
             // Review round addition: a successful login resets this
@@ -179,13 +187,20 @@ final class LegacyPasswordAuthenticator
             // mistyped password before they got it right, say) no longer
             // count toward the limit at all, matching "po prawidłowym
             // logowaniu wyczyść wcześniejsze błędne próby tego użytkownika".
-            $stmt = $this->conn->prepare('DELETE FROM login_attempts WHERE username = ? AND was_successful = 0');
-            $stmt->bind_param('s', $username);
-            @$stmt->execute();
-            $stmt->close();
+            if ($this->loginAttemptsHasColumn('was_successful')) {
+                $stmt = @$this->conn->prepare('DELETE FROM login_attempts WHERE username = ? AND was_successful = 0');
+            } else {
+                $stmt = @$this->conn->prepare('DELETE FROM login_attempts WHERE username = ?');
+            }
+            if ($stmt) {
+                $stmt->bind_param('s', $username);
+                @$stmt->execute();
+                $stmt->close();
+            }
 
             @$this->conn->query("DELETE FROM login_attempts WHERE attempt_time < DATE_SUB(NOW(), INTERVAL 1 DAY)");
         }
+        return true;
     }
 
     private function loginAttemptsHasColumn(string $column): bool

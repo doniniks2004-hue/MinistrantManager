@@ -1,16 +1,31 @@
 import 'dart:math';
+
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+
+import '../network/parish_server_url.dart';
+import '../../features/revocation/wipe_marker.dart' show WipeMarkerStore;
+import '../security/access_refusals.dart' show RefusalSlot, RefusalStorage, SharedRefusalStorage;
 
 /// Wraps flutter_secure_storage (Android Keystore / iOS Keychain).
 /// This is the ONLY place device_token, installation_id, and the resolved
 /// parish server_url are persisted. Never write these to SharedPreferences,
 /// plain files, or logs (spec §21, §4).
 class SecureStorageService {
+  int _sessionGeneration = 0;
+  int get sessionGeneration => _sessionGeneration;
+  Future<void> _credentialMutation = Future<void>.value();
+
+  Future<void> _mutateCredentials(Future<void> Function() action) {
+    final operation = _credentialMutation.then((_) => action());
+    _credentialMutation = operation.catchError((_) {});
+    return operation;
+  }
+
   SecureStorageService()
-      : _storage = const FlutterSecureStorage(
-          aOptions: AndroidOptions(encryptedSharedPreferences: true),
-          iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
-        );
+    : _storage = const FlutterSecureStorage(
+        aOptions: AndroidOptions(encryptedSharedPreferences: true),
+        iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
+      );
 
   final FlutterSecureStorage _storage;
 
@@ -30,16 +45,33 @@ class SecureStorageService {
   static const _kCurrentUserId = 'current_user_id';
   static const _kCurrentUserFullName = 'current_user_full_name';
   static const _kCurrentUserRoleId = 'current_user_role_id';
+  // Refusals the server has given (see AccessRefusals): records of a token's short fingerprint, a
+  // label and a time. Never a token. Cleared with the activation they belong to.
+  static const _kRefusalDevice = 'refusal_device';
+  static const _kRefusalModules = 'refusal_modules';
+  // "A wipe was started and is not confirmed complete". Deliberately NOT removed by clearActivation()
+  // or clearAfterDeletedInstall(): it is removed by the wipe itself, once every required step is done.
+  static const _kWipeInProgress = 'wipe_in_progress';
 
   Future<String?> get installationId => _storage.read(key: _kInstallationId);
-  Future<void> setInstallationId(String value) => _storage.write(key: _kInstallationId, value: value);
+  Future<void> setInstallationId(String value) =>
+      _storage.write(key: _kInstallationId, value: value);
 
   Future<String?> get deviceToken => _storage.read(key: _kDeviceToken);
-  Future<void> setDeviceToken(String value) => _storage.write(key: _kDeviceToken, value: value);
+  Future<void> setDeviceToken(String value) =>
+      _storage.write(key: _kDeviceToken, value: value);
 
   Future<String?> get parishId => _storage.read(key: _kParishId);
   Future<String?> get parishSlug => _storage.read(key: _kParishSlug);
-  Future<String?> get serverUrl => _storage.read(key: _kServerUrl);
+  Future<String?> get serverUrl async {
+    final raw = await _storage.read(key: _kServerUrl);
+    if (raw != null && raw.toLowerCase().startsWith('https://https://')) {
+      final normalized = normalizeParishServerUrl(raw);
+      await _storage.write(key: _kServerUrl, value: normalized);
+      return normalized;
+    }
+    return raw;
+  }
 
   Future<String?> get mobileUserToken => _storage.read(key: _kMobileUserToken);
 
@@ -48,7 +80,8 @@ class SecureStorageService {
     return raw != null ? int.tryParse(raw) : null;
   }
 
-  Future<String?> get currentUserFullName => _storage.read(key: _kCurrentUserFullName);
+  Future<String?> get currentUserFullName =>
+      _storage.read(key: _kCurrentUserFullName);
 
   /// Hybrid dashboard milestone, review round point 22: the role_id the
   /// dashboard uses for its DISPLAY-only module filter
@@ -64,9 +97,10 @@ class SecureStorageService {
     // ordered so this can't happen going forward, but a value already on
     // disk from before this fix could still be in that state) must never
     // read as "there is a session" with a null user id.
-    final token = await mobileUserToken;
-    final userId = await currentUserId;
-    return token != null && userId != null;
+    // Both reads go through the platform keystore; there is no reason for
+    // the second to wait for the first.
+    final values = await Future.wait<Object?>([mobileUserToken, currentUserId]);
+    return values[0] != null && values[1] != null;
   }
 
   /// Called right after a successful `/session/login`. Review round fix:
@@ -76,19 +110,32 @@ class SecureStorageService {
   /// session" (fails closed). The old order (token first) could leave
   /// "token present, no user_id" after an interruption, which is exactly
   /// the half-written state `hasUserSession` must never treat as valid.
-  Future<void> setUserSession({required String token, required int userId, String? fullName, int? roleId}) async {
-    await _storage.write(key: _kCurrentUserId, value: userId.toString());
-    if (fullName != null) {
-      await _storage.write(key: _kCurrentUserFullName, value: fullName);
-    } else {
-      await _storage.delete(key: _kCurrentUserFullName);
-    }
-    if (roleId != null) {
-      await _storage.write(key: _kCurrentUserRoleId, value: roleId.toString());
-    } else {
-      await _storage.delete(key: _kCurrentUserRoleId);
-    }
-    await _storage.write(key: _kMobileUserToken, value: token);
+  Future<void> setUserSession({
+    required String token,
+    required int userId,
+    String? fullName,
+    int? roleId,
+  }) {
+    _sessionGeneration++;
+    return _mutateCredentials(() async {
+      await _storage.delete(key: _kMobileUserToken);
+      await _storage.delete(key: _kLegacyRememberToken);
+      await _storage.write(key: _kCurrentUserId, value: userId.toString());
+      if (fullName != null) {
+        await _storage.write(key: _kCurrentUserFullName, value: fullName);
+      } else {
+        await _storage.delete(key: _kCurrentUserFullName);
+      }
+      if (roleId != null) {
+        await _storage.write(
+          key: _kCurrentUserRoleId,
+          value: roleId.toString(),
+        );
+      } else {
+        await _storage.delete(key: _kCurrentUserRoleId);
+      }
+      await _storage.write(key: _kMobileUserToken, value: token);
+    });
   }
 
   /// Explicit logout OR the parish API rejecting the current
@@ -96,16 +143,19 @@ class SecureStorageService {
   /// problem, never a device problem). Deliberately leaves installation_id,
   /// device_token, parish_id/slug/server_url completely untouched — logout
   /// (or a session 401) never requires re-scanning the activation QR.
-  Future<void> clearUserSession() async {
-    await _storage.delete(key: _kMobileUserToken);
-    await _storage.delete(key: _kCurrentUserId);
-    await _storage.delete(key: _kCurrentUserFullName);
-    await _storage.delete(key: _kCurrentUserRoleId);
-    // P10: the legacy PHP "remember me" continuity token (see its own
-    // field docblock) is issued per-user, at login — a stale one must
-    // never survive this specific user's session ending, same as every
-    // other credential cleared above.
-    await _storage.delete(key: _kLegacyRememberToken);
+  Future<void> clearUserSession() {
+    _sessionGeneration++;
+    return _mutateCredentials(() async {
+      await _storage.delete(key: _kMobileUserToken);
+      await _storage.delete(key: _kCurrentUserId);
+      await _storage.delete(key: _kCurrentUserFullName);
+      await _storage.delete(key: _kCurrentUserRoleId);
+      // P10: the legacy PHP "remember me" continuity token (see its own
+      // field docblock) is issued per-user, at login — a stale one must
+      // never survive this specific user's session ending, same as every
+      // other credential cleared above.
+      await _storage.delete(key: _kLegacyRememberToken);
+    });
   }
 
   Future<void> savedActivation({
@@ -127,14 +177,40 @@ class SecureStorageService {
   /// Also clears the user session — a revoked/disabled device can't have
   /// a meaningfully valid signed-in user either.
   Future<void> clearActivation() async {
+    await clearUserSession();
+    // The refusals belong to this activation (device) and its users (modules); a later activation
+    // starts without them. (A user's LOGOUT does not clear them: see clearUserSession.)
+    await _storage.delete(key: _kRefusalDevice);
+    await _storage.delete(key: _kRefusalModules);
     await _storage.delete(key: _kParishId);
     await _storage.delete(key: _kParishSlug);
     await _storage.delete(key: _kServerUrl);
     await _storage.delete(key: _kDeviceToken);
-    await clearUserSession();
   }
 
+  /// The two slots AccessRefusals keeps: nothing else can be read or written through it.
+  RefusalStorage get refusalStorage => _SecureRefusalStorage(_storage);
+
+  /// The single slot of the "wipe in progress" marker.
+  WipeMarkerStore get wipeMarkerStore => _SecureWipeMarkerStore(_storage);
+
   Future<bool> get isActivated async => (await deviceToken) != null;
+
+  /// Credentials of an activation or a signed-in user are stored.
+  Future<bool> get hasCredentials async =>
+      (await deviceToken) != null || (await mobileUserToken) != null;
+
+  /// What a DELETED install leaves behind: on iOS the Keychain survives an
+  /// uninstall while the app's own files do not. Clears the activation, the
+  /// user session and both encryption keys (the files they protected are
+  /// gone, so the keys are only a liability). Like [clearActivation] it keeps
+  /// installation_id: the identity of this device may be reused when the
+  /// parish is activated again.
+  Future<void> clearAfterDeletedInstall() async {
+    await clearActivation();
+    await deleteDbEncryptionKey();
+    await deleteSnapshotEncryptionKey();
+  }
 
   /// Encryption key for the local SQLCipher database (spec §4 / RODO —
   /// the DB holds altar-server names, attendance, points; a bare
@@ -163,7 +239,8 @@ class SecureStorageService {
   /// file from a backup or crash dump is permanently unreadable. The next
   /// `getOrCreateDbEncryptionKey()` call (on next activation) generates a
   /// genuinely NEW key, never reuses this one.
-  Future<void> deleteDbEncryptionKey() => _storage.delete(key: _kDbEncryptionKey);
+  Future<void> deleteDbEncryptionKey() =>
+      _storage.delete(key: _kDbEncryptionKey);
 
   static const _kSnapshotEncryptionKey = 'snapshot_encryption_key';
 
@@ -206,7 +283,8 @@ class SecureStorageService {
   /// (whenever this device is next activated, for whatever parish)
   /// generates a genuinely NEW key, never reuses this one — matching
   /// `deleteDbEncryptionKey()`'s own exact reasoning.
-  Future<void> deleteSnapshotEncryptionKey() => _storage.delete(key: _kSnapshotEncryptionKey);
+  Future<void> deleteSnapshotEncryptionKey() =>
+      _storage.delete(key: _kSnapshotEncryptionKey);
 
   static const _kLegacyRememberToken = 'legacy_remember_token';
 
@@ -228,9 +306,56 @@ class SecureStorageService {
   /// outside this round's scope — the server-side consumption mechanism
   /// is pre-existing, separately-built PHP logic this mobile project
   /// doesn't own and doesn't yet have a client-side use for.
-  Future<void> setLegacyRememberToken(String token) => _storage.write(key: _kLegacyRememberToken, value: token);
+  Future<void> setLegacyRememberToken(String token) {
+    final generation = _sessionGeneration;
+    return _mutateCredentials(() async {
+      if (generation != _sessionGeneration) return;
+      await _storage.write(key: _kLegacyRememberToken, value: token);
+    });
+  }
 
-  Future<String?> get legacyRememberToken => _storage.read(key: _kLegacyRememberToken);
+  Future<String?> get legacyRememberToken =>
+      _storage.read(key: _kLegacyRememberToken);
 
-  Future<void> deleteLegacyRememberToken() => _storage.delete(key: _kLegacyRememberToken);
+  Future<void> deleteLegacyRememberToken() =>
+      _mutateCredentials(() => _storage.delete(key: _kLegacyRememberToken));
+}
+
+class _SecureRefusalStorage implements RefusalStorage, SharedRefusalStorage {
+  _SecureRefusalStorage(this._storage);
+  final FlutterSecureStorage _storage;
+
+  /// The platform keystore is ONE place: every instance, whatever service built it, queues behind
+  /// the same operations (see SharedRefusalStorage).
+  @override
+  Object get gateKey => 'platform-keystore:refusals';
+
+  static String _key(RefusalSlot slot) => switch (slot) {
+        RefusalSlot.device => SecureStorageService._kRefusalDevice,
+        RefusalSlot.modules => SecureStorageService._kRefusalModules,
+      };
+
+  @override
+  Future<String?> read(RefusalSlot slot) => _storage.read(key: _key(slot));
+
+  @override
+  Future<void> write(RefusalSlot slot, String value) => _storage.write(key: _key(slot), value: value);
+
+  @override
+  Future<void> delete(RefusalSlot slot) => _storage.delete(key: _key(slot));
+}
+
+class _SecureWipeMarkerStore implements WipeMarkerStore {
+  _SecureWipeMarkerStore(this._storage);
+  final FlutterSecureStorage _storage;
+
+  @override
+  Future<String?> read() => _storage.read(key: SecureStorageService._kWipeInProgress);
+
+  @override
+  Future<void> write(String value) =>
+      _storage.write(key: SecureStorageService._kWipeInProgress, value: value);
+
+  @override
+  Future<void> delete() => _storage.delete(key: SecureStorageService._kWipeInProgress);
 }

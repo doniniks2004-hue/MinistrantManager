@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Nothing of this app is backed up or transferred to another device.
+
+  The local database, the saved pages and the sign-in state are protected by
+  keys that live in the Android Keystore and never leave the device. A backup
+  would restore the files without those keys: a database that exists and can
+  never be opened, and sign-in data that cannot be decrypted. Re-activating the
+  parish on the new device is the intended way to move.
+
+  android:allowBackup="false" covers Android 11 and older; this file covers
+  Android 12+, where device-to-device transfer is governed separately.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
+    </device-transfer>
+</data-extraction-rules>
