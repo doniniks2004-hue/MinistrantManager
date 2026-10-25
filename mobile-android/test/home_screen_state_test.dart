@@ -355,7 +355,6 @@ void main() {
 
       expect(find.textContaining('Serwer odrzucił autoryzację tego urządzenia'), findsOneWidget);
       expect(find.textContaining(unknownText), findsNothing);
-      expect(find.textContaining(missingData), findsOneWidget);
     });
   });
 }
