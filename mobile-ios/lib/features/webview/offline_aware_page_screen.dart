@@ -1081,6 +1081,11 @@ $_captureChannel.postMessage(JSON.stringify({
   /// page back.
   void _onConnectivity(ConnectivityEvent event) {
     if (!mounted || _loggingOut) return;
+    // The monitor also emits the initial offline baseline after its 250 ms grace.
+    // Until the first plan starts, _firstLoad owns the bounded saved-copy decision.
+    // A baseline event must not replace its 400 ms read with an unconditional
+    // offline load and discard the eventual unknown/absent result.
+    if (_loadGeneration == 0) return;
     switch (event.kind) {
       case ConnectivityEventKind.lost:
         if (!_online) return; // already on the copy, or about to be

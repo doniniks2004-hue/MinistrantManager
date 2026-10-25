@@ -152,7 +152,7 @@ void main() {
   Future<ResponseBody> noConnection(RequestOptions o) =>
       Future.error(DioException(requestOptions: o, type: DioExceptionType.connectionError));
 
-  setUp(() {
+  setUp(() async {
     revokedCalls = 0;
     dbFilesRemain = true;
     keystore = {
@@ -181,6 +181,9 @@ void main() {
       }
     });
     db = AppDatabase.forTesting();
+    // Open SQLite outside the widget fake-async zone; teardown must not wait on
+    // an unfinished lazy-open operation after a failed widget assertion.
+    await db.ensureSyncMetadata();
     storage = _FlakyStorage();
     final api = _FakeApi(storage, _Adapter((o) => central.removeAt(0).call(o)));
     final snapshotStore = _NoIoStore();
@@ -225,6 +228,7 @@ void main() {
 
   Future<void> settle(WidgetTester tester) async {
     for (var i = 0; i < 20; i++) {
+      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 1)));
       await tester.pump(const Duration(milliseconds: 50));
     }
   }

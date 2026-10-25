@@ -132,7 +132,7 @@ void main() {
   var revokedCalls = 0;
   var dbFilesRemain = true;
 
-  setUp(() {
+  setUp(() async {
     revokedCalls = 0;
     dbFilesRemain = true;
     keystore = {'device_token': 'device-token-A', 'mobile_user_token': 'token', 'current_user_id': '7'};
@@ -155,6 +155,9 @@ void main() {
       }
     });
     db = AppDatabase.forTesting();
+    // Open SQLite outside the widget fake-async zone; teardown must not wait on
+    // an unfinished lazy-open operation after a failed widget assertion.
+    await db.ensureSyncMetadata();
     storage = _FlakyStorage();
     final api = _FakeApi(
       storage,
@@ -205,6 +208,7 @@ void main() {
 
   Future<void> settle(WidgetTester tester) async {
     for (var i = 0; i < 20; i++) {
+      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 1)));
       await tester.pump(const Duration(milliseconds: 50));
     }
   }
