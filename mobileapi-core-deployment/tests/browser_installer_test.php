@@ -46,6 +46,17 @@ try {
     [$status,$body] = request('/mm-setup.php', ['action'=>'check','csrf'=>$token]); check($status===200 && str_contains($body,'DRY RUN OK'), 'Check failed: '.$body);
     check($db->query("SHOW TABLES LIKE 'mobile_meta'")->num_rows===0, 'Check mutated schema');
     [$status] = request('/mm-setup.php', ['action'=>'install','csrf'=>$token]); check($status===409, 'Backup confirmation bypass');
+    file_put_contents($root.'/public_html/mm-mobile-session-login.php', 'old endpoint');
+    $badMigration = $root.'/mm-installer/migrations/999_test_failure.sql';
+    file_put_contents($badMigration, 'INVALID SQL FOR TEST');
+    [$status,$body] = request('/mm-setup.php', ['action'=>'install','csrf'=>$token,'backup_confirmed'=>'yes','parish_secret'=>$secret]);
+    check($status===500 && !str_contains($body,'MOBILEAPI INSTALL OK'), 'Failed migration reported success');
+    check(file_get_contents($root.'/public_html/mm-mobile-session-login.php')==='old endpoint', 'Failure did not restore old endpoint');
+    check(!is_file($root.'/public_html/config/mobile_internal_api_secret.php'), 'Failure left newly written secret');
+    check(!is_file($root.'/mm-installer/browser/completed.lock'), 'Failure locked out retry');
+    check(!str_contains($body,$secret), 'Failure exposed secret');
+    unlink($badMigration);
+    [$status,$body] = request('/mm-setup.php', ['action'=>'check','csrf'=>$token]); check($status===200, 'Recheck after failure denied');
     [$status,$body] = request('/mm-setup.php', ['action'=>'install','csrf'=>$token,'backup_confirmed'=>'yes','parish_secret'=>$secret]);
     check($status===200 && str_contains($body,'MOBILEAPI INSTALL OK'), 'Browser installation failed: '.$body);
     check(!str_contains($body,$secret) && !str_contains($body,$key), 'Secret leaked');
@@ -54,6 +65,16 @@ try {
     check(is_file($root.'/mm-installer/browser/completed.lock'), 'Completion lock missing');
     [$status] = request('/mm-setup.php'); check($status===410, 'Completed installer still accessible');
     [$status] = request('/mm-setup.php', ['action'=>'install','csrf'=>$token,'backup_confirmed'=>'yes']); check($status===410, 'Repeat install allowed');
+    unlink($root.'/mm-installer/browser/completed.lock');
+    [$status,$body] = request('/mm-setup.php'); $token=csrf($body);
+    for ($n=0; $n<5; $n++) {
+        [$status] = request('/mm-setup.php', ['action'=>'login','access_key'=>'wrong','csrf'=>$token]);
+        check($status===403, 'Unexpected rate-limit response');
+    }
+    [$status] = request('/mm-setup.php', ['action'=>'login','access_key'=>$key,'csrf'=>$token]); check($status===429, 'Rate limit bypassed');
+    [$status] = request('/mm-installer/browser/access.php'); check($status===404, 'Private config publicly accessible');
+    copy($root.'/mm-installer/install.php', $root.'/public_html/install.php');
+    [$status] = request('/install.php'); check($status===403, 'Direct web access to CLI installer allowed');
     echo "BROWSER INSTALLER AUTH, CSRF, MYSQL INSTALL AND ONE-TIME LOCK OK (shell functions disabled)\n";
 } finally {
     proc_terminate($process); proc_close($process);
