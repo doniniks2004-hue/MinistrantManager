@@ -331,6 +331,9 @@ void main() {
 
     testWidgets('when the keystore recovers, the retry asks again and the screen is left', (tester) async {
       signedInDevice();
+      // This suite tests HomeScreen states without a native WebView. Recovery
+      // should reach the missing-data state once the refusal can be read.
+      store.remove('server_url');
       failRefusalReads = true;
       await tester.pumpWidget(_home(sharedDb));
       await _settle(tester);
@@ -340,6 +343,7 @@ void main() {
       await tester.tap(find.text('SPRÓBUJ PONOWNIE'));
       await _settle(tester);
       expect(find.textContaining(unknownText), findsNothing);
+      expect(find.textContaining(missingData), findsOneWidget);
     });
 
     testWidgets('a readable refusal that stands still shows the refusal screen, not this one', (tester) async {
@@ -351,6 +355,7 @@ void main() {
 
       expect(find.textContaining('Serwer odrzucił autoryzację tego urządzenia'), findsOneWidget);
       expect(find.textContaining(unknownText), findsNothing);
+      expect(find.textContaining(missingData), findsOneWidget);
     });
   });
 }

@@ -20,6 +20,10 @@ import 'package:ministrant_manager/core/security/access_refusals.dart';
 import 'package:ministrant_manager/core/sync/sync_engine.dart' show DeviceAuthState;
 import 'package:ministrant_manager/features/webview/webview_handoff_service.dart';
 
+// Real loopback sockets for tests that verify the local HTTP response. The
+// Flutter binding otherwise substitutes an HTTP client that always returns 400.
+class _LoopbackHttpOverrides extends HttpOverrides {}
+
 /// P10 fix: a test double for WebviewHandoffService, which
 /// OfflinePageCoordinator now requires (targetPath/handoffUrl
 /// separation — see that class's own docblock for the real-Szarlej
@@ -363,7 +367,9 @@ void main() {
 
         final plan = await coordinator.plan(parishId: 'p', userId: 'u', targetPath: '/public/ranking.php', forceOffline: true);
         expect(plan, isA<PageLoadOffline>());
-        final client = HttpClient();
+        final client = HttpOverrides.runWithHttpOverrides(
+          () => HttpClient(), _LoopbackHttpOverrides(),
+        );
         addTearDown(() => client.close(force: true));
         final response = await (await client.getUrl((plan as PageLoadOffline).url)).close();
         final body = await response.transform(utf8.decoder).join();
@@ -383,7 +389,9 @@ void main() {
         final plan = await coordinator.plan(parishId: 'p', userId: 'u', targetPath: '/public/ranking.php', forceOffline: true);
         expect(plan, isA<PageLoadOffline>(), reason: 'the manifest is fine: it is the page that fails, when asked');
 
-        final client = HttpClient();
+        final client = HttpOverrides.runWithHttpOverrides(
+          () => HttpClient(), _LoopbackHttpOverrides(),
+        );
         addTearDown(() => client.close(force: true));
         final response = await (await client.getUrl((plan as PageLoadOffline).url)).close().timeout(const Duration(seconds: 5));
         await response.drain<void>();

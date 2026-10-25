@@ -109,7 +109,7 @@ void main() {
 
     expect(find.byType(spinner), findsNothing);
     expect(find.text('Nie udało się uruchomić aplikacji.'), findsOneWidget);
-    expect(find.text('PlatformException'), findsOneWidget);
+    expect(find.text('PlatformException(keystore-unavailable)'), findsOneWidget);
     expect(builds, 0);
   });
 
@@ -177,7 +177,7 @@ void main() {
       ),
     );
     await _pumpStartup(tester);
-    expect(find.text('PlatformException'), findsOneWidget);
+    expect(find.text('PlatformException(keystore-unavailable)'), findsOneWidget);
     expect(builds, 0);
 
     failStorage = false;
