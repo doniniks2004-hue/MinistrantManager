@@ -46,6 +46,10 @@ jobs:
           flutter-version: '3.47.3' # ships Dart >=3.7, required by drift ^2.32.0
           channel: 'stable'
 
+      - name: Test native package alignment checker
+        working-directory: .
+        run: python3 .github/scripts/test_android_native_alignment.py
+
       # Review round 3.x point 11: `flutter create` removed from CI
       # entirely. The full native Android project (Kotlin DSL Gradle
       # files, gradle wrapper, manifest, etc.) is now committed directly
@@ -127,6 +131,7 @@ jobs:
           KEYPROPS
 
           flutter build appbundle --release
+          python3 ../.github/scripts/android_native_alignment.py build/app/outputs/bundle/release/app-release.aab
 
           rm -f android/key.properties android/ci-release-test.keystore
           rm -f build/app/outputs/bundle/release/*.aab
@@ -139,6 +144,15 @@ jobs:
           # The workflow's own run number only ever goes up.
           flutter build apk --release --build-number=${{ github.run_number }} --dart-define=GIT_SHA=${{ github.sha }}
           flutter build appbundle --release --build-number=${{ github.run_number }} --dart-define=GIT_SHA=${{ github.sha }}
+
+      - name: Verify packaged native libraries support 16 KB pages
+        run: |
+          python3 ../.github/scripts/android_native_alignment.py build/app/outputs/flutter-apk/app-debug.apk
+          if [ -f build/app/outputs/flutter-apk/app-release.apk ]; then
+            python3 ../.github/scripts/android_native_alignment.py \
+              build/app/outputs/flutter-apk/app-release.apk \
+              build/app/outputs/bundle/release/app-release.aab
+          fi
 
       - name: Record which commit these files were built from
         # The commit is also compiled into the app (device settings -> "Wersja

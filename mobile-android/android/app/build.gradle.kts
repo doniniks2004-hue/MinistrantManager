@@ -91,3 +91,20 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+// mobile_scanner 5.2.3 requests CameraX 1.3.3 and ML Kit 17.2.0,
+// whose bundled 64-bit libraries are only 4 KB aligned. Keep the Dart/iOS
+// API unchanged while selecting their compatible 16 KB-capable Android releases.
+// The packaged APK/AAB are checked by android_native_alignment.py in CI.
+dependencies {
+    constraints {
+        implementation("com.google.mlkit:barcode-scanning:17.3.0") {
+            because("The bundled barcode engine must support 16 KB memory pages")
+        }
+        listOf("camera-core", "camera-camera2", "camera-lifecycle").forEach { module ->
+            implementation("androidx.camera:$module:1.4.2") {
+                because("The native image processor must support 16 KB memory pages")
+            }
+        }
+    }
+}
