@@ -1,13 +1,17 @@
 <?php
 declare(strict_types=1);
 
-if (PHP_SAPI !== 'cli') {
+$browserInstall = defined('MM_BROWSER_INSTALL') && MM_BROWSER_INSTALL === true;
+if (PHP_SAPI !== 'cli' && !$browserInstall) {
     http_response_code(403);
     exit("CLI only.\n");
 }
 
 function out(string $s=''): void { echo $s . PHP_EOL; }
-function fail(string $s): never { fwrite(STDERR, "ERROR: $s\n"); exit(1); }
+function fail(string $s): never {
+    if (defined('MM_BROWSER_INSTALL') && MM_BROWSER_INSTALL) throw new RuntimeException($s);
+    fwrite(STDERR, "ERROR: $s\n"); exit(1);
+}
 function argValue(array $argv, string $name): ?string {
     foreach ($argv as $arg) {
         if (str_starts_with($arg, "--$name=")) return substr($arg, strlen($name) + 3);
@@ -55,11 +59,19 @@ function copyTree(string $src, string $dst): void {
     }
 }
 function runPhp(string $file): void {
+    if (defined('MM_BROWSER_INSTALL') && MM_BROWSER_INSTALL) {
+        (static function (string $file): void {
+            $conn = $GLOBALS['mm_browser_connection'];
+            require $file;
+        })($file);
+        return;
+    }
     $cmd = escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($file);
     passthru($cmd, $code);
     if ($code !== 0) fail("Command failed ($code): $file");
 }
 function hiddenPrompt(string $label): string {
+    if (defined('MM_BROWSER_INSTALL') && MM_BROWSER_INSTALL) fail('Podaj sekret MobileAPI tej parafii w formularzu.');
     fwrite(STDOUT, $label);
     $stty = trim((string) shell_exec('command -v stty 2>/dev/null'));
     if ($stty !== '') shell_exec('stty -echo');
@@ -105,6 +117,7 @@ if ($installLock === false || !flock($installLock, LOCK_EX | LOCK_NB)) {
 
 
 require $dbConfig;
+if ($browserInstall) $GLOBALS['mm_browser_connection'] = $conn ?? null;
 if (!isset($conn) || !($conn instanceof mysqli)) fail("config/database.php did not provide mysqli \$conn");
 
 $profiles = [];
@@ -144,11 +157,13 @@ out("Detected profile: {$profile['label']} [$profileKey]");
 
 if ($dryRun) {
     out('DRY RUN OK: profile recognized; no files/database were changed.');
+    if ($browserInstall) return;
     exit(0);
 }
 
+if ($browserInstall && ($profile['hardeners'] ?? []) !== []) fail('This profile requires the CLI installer.');
 $secretPath = $publicRoot . '/config/mobile_internal_api_secret.php';
-$secret = getenv('MOBILE_INTERNAL_API_SECRET') ?: '';
+$secret = $browserInstall ? ($GLOBALS['mm_browser_secret'] ?? '') : (getenv('MOBILE_INTERNAL_API_SECRET') ?: '');
 if ($secret === '' && is_file($secretPath)) {
     $existing = file_get_contents($secretPath) ?: '';
     if (preg_match("/define\(['\"]MOBILE_INTERNAL_API_SECRET['\"],\s*['\"]([^'\"]+)['\"]\)/", $existing, $m)
@@ -193,9 +208,9 @@ foreach ($protect as $rel) {
 out("Backup: $backupRoot");
 
 $GLOBALS['mm_install_complete'] = false;
-register_shutdown_function(static function () use ($targetRoot, $backupRoot, $backupItems, $createdItems): void {
+$restoreSnapshot = static function () use ($targetRoot, $backupRoot, $backupItems, $createdItems): void {
     if (($GLOBALS['mm_install_complete'] ?? false) === true) return;
-    fwrite(STDERR, "\nINSTALL FAILED — restoring file snapshot automatically...\n");
+    out("INSTALL FAILED — restoring file snapshot automatically...");
     foreach (array_reverse($createdItems) as $rel) removeTree($targetRoot . '/' . $rel);
     foreach ($backupItems as $rel) {
         $src = $backupRoot . '/files/' . $rel;
@@ -203,8 +218,11 @@ register_shutdown_function(static function () use ($targetRoot, $backupRoot, $ba
         removeTree($dst);
         copyTree($src, $dst);
     }
-    fwrite(STDERR, "FILE ROLLBACK OK. Additive DB migrations, if already applied, were intentionally left in place.\n");
-});
+    out("FILE ROLLBACK OK. Additive DB migrations, if already applied, were intentionally left in place.");
+    $GLOBALS['mm_install_complete'] = true;
+};
+$GLOBALS['mm_restore_snapshot'] = $restoreSnapshot;
+register_shutdown_function($restoreSnapshot);
 
 // Run profile hardening BEFORE MobileAPI migrations. If the parish has
 // drifted from the audited baseline, the hardener fails closed here and

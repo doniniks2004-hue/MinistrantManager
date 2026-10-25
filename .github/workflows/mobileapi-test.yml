@@ -73,6 +73,10 @@ jobs:
         working-directory: .
         run: php mobileapi-core-deployment/tests/installer_mysql_test.php
 
+      - name: Test authenticated browser installer without shell functions
+        working-directory: .
+        run: php mobileapi-core-deployment/tests/browser_installer_test.php
+
       - name: Test handoff diagnostics (hashes stay in step with the repo; no secret can be printed)
         working-directory: .
         run: php mobileapi-core-deployment/tests/diagnose_handoff_test.php
