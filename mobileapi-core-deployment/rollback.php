@@ -4,22 +4,27 @@ declare(strict_types=1);
 if (PHP_SAPI !== 'cli') { http_response_code(403); exit("CLI only.\n"); }
 function fail(string $s): never { fwrite(STDERR, "ERROR: $s\n"); exit(1); }
 function removeTree(string $path): void {
-    if (is_file($path) || is_link($path)) { @unlink($path); return; }
+    if (is_file($path) || is_link($path)) {
+        if (!unlink($path)) throw new RuntimeException("Cannot remove $path");
+        return;
+    }
     if (!is_dir($path)) return;
     $it = new RecursiveIteratorIterator(
         new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS),
         RecursiveIteratorIterator::CHILD_FIRST
     );
     foreach ($it as $item) {
-        if ($item->isDir()) @rmdir($item->getPathname());
-        else @unlink($item->getPathname());
+        $ok = $item->isDir() && !$item->isLink()
+            ? rmdir($item->getPathname()) : unlink($item->getPathname());
+        if (!$ok) throw new RuntimeException("Cannot remove " . $item->getPathname());
     }
-    @rmdir($path);
+    if (!rmdir($path)) throw new RuntimeException("Cannot remove $path");
 }
 function copyTree(string $src, string $dst): void {
     if (is_file($src)) {
         if (!is_dir(dirname($dst))) mkdir(dirname($dst), 0750, true);
         if (!copy($src, $dst)) throw new RuntimeException("Cannot copy $src");
+        if (!chmod($dst, fileperms($src) & 0777)) throw new RuntimeException("Cannot preserve file mode: $dst");
         return;
     }
     if (!is_dir($src)) return;
@@ -29,7 +34,10 @@ function copyTree(string $src, string $dst): void {
         $rel = substr($item->getPathname(), strlen($src) + 1);
         $target = $dst . DIRECTORY_SEPARATOR . $rel;
         if ($item->isDir()) { if (!is_dir($target)) mkdir($target, 0750, true); }
-        elseif (!copy($item->getPathname(), $target)) throw new RuntimeException("Cannot copy " . $item->getPathname());
+        else {
+            if (!copy($item->getPathname(), $target)) throw new RuntimeException("Cannot copy " . $item->getPathname());
+            if (!chmod($target, $item->getPerms() & 0777)) throw new RuntimeException("Cannot preserve file mode: $target");
+        }
     }
 }
 $backup = null;

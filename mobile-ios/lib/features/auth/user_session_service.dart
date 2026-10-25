@@ -139,14 +139,14 @@ class UserSessionService {
         fullName: fullName as String?, roleId: roleId as int?,
       );
       api.resetParishClient();
-      return UserLoginSuccess(fullName: fullName as String?);
+      return UserLoginSuccess(fullName: fullName);
     } on DioException catch (e) {
       final status = e.response?.statusCode;
       final body = e.response?.data;
       if ((status == 403 || status == 503) &&
           body is Map && body['error'] == 'device_not_authorized') {
         final state = body['device_state'];
-        const states = {'active', 'revoked', 'parish_disabled', 'not_found',
+        const states = {'revoked', 'parish_disabled', 'not_found',
           'parish_mismatch', 'central_unavailable'};
         return UserLoginDeviceNotAuthorized(
           deviceState: state is String && states.contains(state)

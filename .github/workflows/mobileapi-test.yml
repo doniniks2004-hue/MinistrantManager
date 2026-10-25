@@ -18,6 +18,15 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: yes
+          MYSQL_DATABASE: ministrant_mobile_test
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=5
     defaults:
       run:
         working-directory: mobileapi
@@ -28,6 +37,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.3'
+          extensions: mysqli
 
       - name: Syntax-check every PHP file
         run: find . -name "*.php" -not -path "./vendor/*" -print0 | xargs -0 -n1 php -l
@@ -54,6 +64,10 @@ jobs:
       - name: Test login denial when rate-limit storage is unavailable
         working-directory: .
         run: php -n mobileapi-core-deployment/tests/login_limiter_test.php
+
+      - name: Test login limiter and migration against MySQL
+        working-directory: .
+        run: php mobileapi-core-deployment/tests/login_mysql_test.php
 
       - name: Test handoff diagnostics (hashes stay in step with the repo; no secret can be printed)
         working-directory: .

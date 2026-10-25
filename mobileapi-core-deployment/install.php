@@ -34,6 +34,7 @@ function copyTree(string $src, string $dst): void {
             throw new RuntimeException("Cannot create " . dirname($dst));
         }
         if (!copy($src, $dst)) throw new RuntimeException("Cannot copy $src");
+        if (!chmod($dst, fileperms($src) & 0777)) throw new RuntimeException("Cannot preserve file mode: $dst");
         return;
     }
     if (!is_dir($src)) return;
@@ -49,6 +50,7 @@ function copyTree(string $src, string $dst): void {
             if (!is_dir($target) && !mkdir($target, 0750, true) && !is_dir($target)) throw new RuntimeException("Cannot create $target");
         } else {
             if (!copy($item->getPathname(), $target)) throw new RuntimeException("Cannot copy " . $item->getPathname());
+            if (!chmod($target, $item->getPerms() & 0777)) throw new RuntimeException("Cannot preserve file mode: $target");
         }
     }
 }

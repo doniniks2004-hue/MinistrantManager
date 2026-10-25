@@ -2,7 +2,7 @@
 declare(strict_types=1);
 // Run with php -n: a failing DB double exercises the actual authenticator
 // without a database or a reimplementation of its limiter.
-if (class_exists('mysqli')) throw new RuntimeException('Run this test with php -n.');
+if (extension_loaded('mysqli')) throw new RuntimeException('Run this test with php -n.');
 class mysqli {
     public string $mode = 'missing-table';
     public function query(string $sql): object|false {

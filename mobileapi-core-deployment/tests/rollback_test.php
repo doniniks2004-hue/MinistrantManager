@@ -20,10 +20,12 @@ try {
     put($target . '/public_html/new.php', 'new endpoint');
     put($target . '/public_html/unrelated.php', 'keep');
     put($backup . '/files/mobileapi-core/old.php', 'old version');
+    chmod($backup . '/files/mobileapi-core/old.php', 0600);
     put($backup . '/manifest.json', json_encode($manifest));
     exec(escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($script) . ' ' . escapeshellarg('--backup=' . $backup) . ' 2>&1', $output, $code);
     check($code === 0, implode("\n", $output));
     check(file_get_contents($target . '/mobileapi-core/old.php') === 'old version', 'Old content not restored');
+    check((fileperms($target . '/mobileapi-core/old.php') & 0777) === 0600, 'Private file permissions lost');
     check(!file_exists($target . '/mobileapi-core/new.php'), 'New nested file survived rollback');
     check(!file_exists($target . '/public_html/new.php'), 'New endpoint survived rollback');
     check(file_get_contents($target . '/public_html/unrelated.php') === 'keep', 'Unrelated file changed');
