@@ -49,6 +49,10 @@ jobs:
         with:
           api-level: 35
           arch: x86_64
+          # The experimental 16 KB image otherwise kills even its foreground
+          # app during first-boot Google services setup (recorded LMK in CI).
+          ram-size: 4096M
+          heap-size: 512M
           target: ${{ matrix.target }}
           disable-animations: false
           script: python3 .github/scripts/android_runtime_smoke.py --selftest-apk runtime-apks/selftest.apk --production-apk runtime-apks/production.apk --expected-page-size ${{ matrix.page-size }}

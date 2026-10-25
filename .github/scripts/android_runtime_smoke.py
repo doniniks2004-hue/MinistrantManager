@@ -29,6 +29,24 @@ def validate(report, mode, run):
         raise ValueError('required native checks missing or not passing: ' + repr(statuses))
 
 
+def wait_for_emulator(adb, timeout=60):
+    """Require stable ADB and PackageManager before the app's test clock starts."""
+    deadline = time.monotonic() + timeout
+    stable = 0
+    while time.monotonic() < deadline:
+        state = adb('get-state', check=False)
+        boot = adb('shell', 'getprop', 'sys.boot_completed', check=False)
+        package = adb('shell', 'pm', 'path', 'android', check=False)
+        ready = (state.returncode == 0 and state.stdout.strip() == 'device' and
+                 boot.returncode == 0 and boot.stdout.strip() == '1' and
+                 package.returncode == 0 and package.stdout.startswith('package:'))
+        stable = stable + 1 if ready else 0
+        if stable >= 3:
+            return
+        time.sleep(1)
+    raise TimeoutError('emulator ADB/PackageManager did not become stable before installation')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--serial', default='emulator-5554')
@@ -43,8 +61,14 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     def adb(*command, check=True):
-        return subprocess.run(['adb', '-s', args.serial, *command], capture_output=True,
-                              text=True, timeout=60, check=check)
+        result = subprocess.run(['adb', '-s', args.serial, *command], capture_output=True,
+                                text=True, timeout=60, check=False)
+        if result.returncode:
+            with (out / 'adb-errors.txt').open('a') as log:
+                log.write(repr(command) + '\n' + result.stdout + result.stderr + '\n')
+            if check:
+                result.check_returncode()
+        return result
 
     def wait_json(path, final=lambda value: value.get('done') is True):
         deadline = time.monotonic() + 120
@@ -72,6 +96,8 @@ def main():
     logger = subprocess.Popen(['adb', '-s', args.serial, 'logcat', '-v', 'threadtime'],
                               stdout=log_file, stderr=subprocess.STDOUT)
     try:
+        wait_for_emulator(adb)
+        (out / 'memory-before.txt').write_text(adb('shell', 'cat', '/proc/meminfo').stdout)
         page_size = int(adb('shell', 'getconf', 'PAGE_SIZE').stdout.strip())
         (out / 'environment.json').write_text(json.dumps({'page_size': page_size}))
         if args.expected_page_size is not None and page_size != args.expected_page_size:
