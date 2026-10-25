@@ -35,6 +35,7 @@ def main():
     parser.add_argument('--selftest-apk', required=True)
     parser.add_argument('--production-apk', required=True)
     parser.add_argument('--out', default='android-runtime-results')
+    parser.add_argument('--expected-page-size', type=int, choices=(4096, 16384))
     args = parser.parse_args()
     if not args.serial.startswith('emulator-'):
         parser.error('this destructive fresh-install test only accepts an emulator serial')
@@ -62,6 +63,10 @@ def main():
         adb('shell', 'am', 'start', '-W', '-n', PACKAGE + '/.MainActivity')
 
     try:
+        page_size = int(adb('shell', 'getconf', 'PAGE_SIZE').stdout.strip())
+        (out / 'environment.json').write_text(json.dumps({'page_size': page_size}))
+        if args.expected_page_size is not None and page_size != args.expected_page_size:
+            raise ValueError(f'expected {args.expected_page_size}-byte pages, emulator has {page_size}')
         adb('uninstall', PACKAGE, check=False)
         adb('install', args.selftest_apk)
         for run in range(1, 7):
