@@ -108,7 +108,7 @@ Nie da się zdegradować ani dezaktywować ostatniego aktywnego `SUPER_ADMIN`
 
 ## TODO przed produkcją
 
-1. Uzupełnić realne wartości w `public/.well-known/assetlinks.json` i `apple-app-site-association` (patrz `docs-app-links.md`) — wymaga finalnego keystore Android i konta Apple Developer.
+1. Uzupełnić identyfikator Apple w `public/.well-known/apple-app-site-association` po uzyskaniu Team ID (patrz `docs-app-links.md`). `assetlinks.json` zawiera już odcisk certyfikatu Android release; zgodność pliku na serwerze trzeba potwierdzić przy wdrożeniu.
 2. Rozważyć dedykowany cache driver (Redis) dla `RateLimiter` przy większym ruchu — `database` wystarcza na start, ale generuje więcej zapytań pod obciążeniem.
-3. Panel z listą `audit_logs` (dane są już zapisywane przy każdej akcji — brakuje tylko widoku listującego/filtrującego).
+3. Panel `audit_logs` jest zaimplementowany: `/admin/audit-log`, `AuditLogController` i widok z filtrami. Nie jest otwartym zadaniem implementacyjnym.
 4. Rozważyć e-mail z potwierdzeniem przy tworzeniu nowego konta administratora (obecnie hasło tymczasowe trzeba przekazać ręcznie/ustnie).

@@ -1,7 +1,9 @@
 # RELEASE-READINESS.md
 
-Stan po finalnym domknięciu funkcjonalnym i brandingu, przed testem
-akceptacyjnym na realnym urządzeniu.
+Stan na 25.10.2026. Bieżące wyniki i artefakty: Draft PR #50.
+Kod przeszedł testy automatyczne i runtime emulatorów; odbiór realnego
+urządzenia i docelowego serwera pozostaje osobnym etapem.
+Nie jest to deklaracja braku wszystkich możliwych błędów.
 
 ## Gotowe w kodzie
 
@@ -10,7 +12,7 @@ akceptacyjnym na realnym urządzeniu.
 | Nazwa aplikacji „Ministrant Manager” | ✅ |
 | Android Application ID | ✅ `eu.ministrant.manager` |
 | iOS Bundle ID | ✅ `eu.ministrant.manager` |
-| Wersja startowa | ✅ `1.0.0+1` |
+| Wersja startowa | ✅ `1.0.0+2` (build release nadawany przez CI) |
 | INTERNET + CAMERA / opis kamery iOS | ✅ |
 | 7/7 modułów native/offline | ✅ |
 | Dynamiczny dashboard native/WebView | ✅ |
@@ -61,10 +63,10 @@ są zapisane osobno w prywatnej Bibliotece:
 
 Repo **nie zawiera** JKS ani haseł.
 
-### Jedyny ręczny krok GitHub
+### Podpisywanie Androida w CI
 
-Obecne narzędzia nie pozwalają bezpośrednio zapisywać GitHub Actions
-Secrets. Trzeba jednorazowo ustawić cztery sekrety repo:
+Komplet czterech sekretów jest skonfigurowany: podpisane APK/AAB build 242
+powstały w przebiegu `40180664248`. Ich nazwy:
 
 - `ANDROID_KEYSTORE_BASE64`
 - `ANDROID_KEYSTORE_PASSWORD`
@@ -133,7 +135,7 @@ Hotfix zamian jest fail-closed:
 zamknięte do finalnej rundy acceptance/hardening.
 
 **Do publikacji sklepów:** dodatkowo wymagane są:
-1. ustawienie 4 sekretów Androida,
+1. odbiór podpisanego Android APK/AAB (sekrety są już skonfigurowane),
 2. Apple Developer + signing dla iOS,
 3. finalny test realnego urządzenia/Witosy,
 4. upload do Google Play Console / App Store Connect.

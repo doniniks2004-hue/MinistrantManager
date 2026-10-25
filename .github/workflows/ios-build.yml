@@ -115,6 +115,16 @@ jobs:
       - name: Build for iOS simulator (unsigned, always runs)
         run: flutter build ios --simulator --no-codesign
 
+      # Compile the actual iPhone target even before Apple signing is available.
+      # Simulator compilation alone does not validate device-only plugin code,
+      # the ARM64 link, or release/AOT compilation. This app is NOT installable.
+      - name: Build for iPhone ARM64 (release, unsigned)
+        run: |
+          flutter build ios --release --no-codesign --dart-define=GIT_SHA=${{ github.sha }}
+          xcrun lipo -verify_arch arm64 build/ios/iphoneos/Runner.app/Runner
+          xcrun lipo -verify_arch arm64 build/ios/iphoneos/Runner.app/Frameworks/App.framework/App
+          echo "iPhone ARM64 release compilation PASS; signing and device acceptance are still required." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Import certificate and provisioning profile
         if: ${{ env.HAS_APPLE_CERT == 'true' && env.HAS_APPLE_CERT_PASSWORD == 'true' && env.HAS_APPLE_PROFILE == 'true' && env.HAS_APPLE_TEAM_ID == 'true' }}
         env:
