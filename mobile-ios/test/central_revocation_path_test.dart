@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
@@ -56,11 +55,11 @@ ResponseBody _json(int status, Object body) => ResponseBody.fromString(
     );
 
 class _FakeApi extends ApiClient {
-  _FakeApi(SecureStorageService storage, this.central) : super(storage);
-  final _Adapter central;
+  _FakeApi(SecureStorageService storage, this.centralAdapter) : super(storage);
+  final _Adapter centralAdapter;
 
   @override
-  Dio centralWithAuth(String deviceToken) => Dio(BaseOptions(baseUrl: ApiClient.centralBaseUrl))..httpClientAdapter = central;
+  Dio centralWithAuth(String deviceToken) => Dio(BaseOptions(baseUrl: ApiClient.centralBaseUrl))..httpClientAdapter = centralAdapter;
 }
 
 class _FlakyStorage extends SecureStorageService {

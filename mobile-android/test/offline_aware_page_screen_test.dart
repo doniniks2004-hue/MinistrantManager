@@ -1591,7 +1591,7 @@ void main() {
       expect(marks(), containsAll(['screen_init', 'load_request', 'plan_done', 'panel_painted_copy']));
       expect(
         facts(coordinator),
-        allOf(
+        allOf([
           contains('mode=copy'),
           contains('via=raf'),
           contains('drawn=1'),
@@ -1600,7 +1600,7 @@ void main() {
           contains('first-contentful-paint=210 ms'),
           contains('page-clock=480 ms'),
           matches(RegExp(r'pid=\d+ session=[0-9a-z]+ ')),
-        ),
+        ]),
       );
       coordinator.connectivity.dispose(); // its grace timer (no network at start) must not outlive the test
     });
@@ -1705,8 +1705,8 @@ void main() {
       final line = facts(coordinator);
       expect(
         line,
-        allOf(contains('readyState=n/a'), contains('visibility=n/a'), contains('images=n/a'), contains('stylesheets=n/a'),
-            contains('via=n/a'), contains('hidden=n/a'), contains('spec=n/a'), contains('failed=n/a'), contains('panel=0')),
+        allOf([contains('readyState=n/a'), contains('visibility=n/a'), contains('images=n/a'), contains('stylesheets=n/a'),
+            contains('via=n/a'), contains('hidden=n/a'), contains('spec=n/a'), contains('failed=n/a'), contains('panel=0')]),
       );
       for (final bad in ['<', '>', 'script', 'alert', 'very long', 'onerror']) {
         expect(line, isNot(contains(bad)));

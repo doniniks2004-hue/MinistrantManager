@@ -35,7 +35,7 @@ class _Gate {
 
   static _Gate of(RefusalStorage storage) {
     if (storage is SharedRefusalStorage) {
-      return _byKey.putIfAbsent(storage.gateKey, _Gate.new);
+      return _byKey.putIfAbsent((storage as SharedRefusalStorage).gateKey, _Gate.new);
     }
     return _byStorage[storage] ??= _Gate();
   }

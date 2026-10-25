@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 import 'package:drift/drift.dart' show Value;
@@ -42,12 +41,12 @@ ResponseBody json(int status, Object body) => ResponseBody.fromString(
     );
 
 class _FakeApi extends ApiClient {
-  _FakeApi(SecureStorageService storage, this.central, this.parishAdapter) : super(storage);
-  final _Adapter central;
+  _FakeApi(SecureStorageService storage, this.centralAdapter, this.parishAdapter) : super(storage);
+  final _Adapter centralAdapter;
   final _Adapter parishAdapter;
 
   @override
-  Dio centralWithAuth(String deviceToken) => Dio(BaseOptions(baseUrl: ApiClient.centralBaseUrl))..httpClientAdapter = central;
+  Dio centralWithAuth(String deviceToken) => Dio(BaseOptions(baseUrl: ApiClient.centralBaseUrl))..httpClientAdapter = centralAdapter;
 
   @override
   Future<Dio> parish() async => Dio(BaseOptions(baseUrl: 'https://szarlej.ministrant.eu/api'))..httpClientAdapter = parishAdapter;
