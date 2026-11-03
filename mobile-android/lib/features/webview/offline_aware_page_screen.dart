@@ -26,6 +26,7 @@ class OfflineAwarePageScreen extends StatefulWidget {
     required this.userId,
     required this.coordinator,
     this.onLogout,
+    this.onOpenDeviceSettings,
     this.forceOffline = false,
     this.panelSpec,
   });
@@ -36,6 +37,7 @@ class OfflineAwarePageScreen extends StatefulWidget {
   final String userId;
   final OfflinePageCoordinator coordinator;
   final Future<void> Function()? onLogout;
+  final Future<void> Function()? onOpenDeviceSettings;
   final bool forceOffline;
 
   /// What the real panel is (see PanelSpec). Null: the one the build was made with
@@ -88,13 +90,39 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
   static const _captureChannel = 'MMPageCapture';
   static const _bridgeChannel = 'MinistrantBridge';
   static const _paintChannel = 'MM_Paint';
-  static const _bridgeShim = '''
+  static const _bridgeShim = r'''
 (function() {
   if (!window.MinistrantBridge || window.MinistrantBridge.__mmShimmed) return;
   var raw = window.MinistrantBridge;
+  function logout() {
+    raw.postMessage(JSON.stringify({type: 'logout', url: location.href}));
+  }
+  function logoutUrl(value) {
+    try {
+      var url = new URL(value, location.href);
+      return url.origin === location.origin && /\/(logout|logout\.php)\/?$/i.test(url.pathname);
+    } catch (_) { return false; }
+  }
+  document.addEventListener('click', function(event) {
+    var el = event.target.closest && event.target.closest('a,button,input[type="submit"]');
+    if (!el) return;
+    var label = (el.textContent || el.value || '').trim().toLowerCase();
+    if (!logoutUrl(el.getAttribute('href') || el.getAttribute('formaction') || '') &&
+        label !== 'wyloguj' && label !== 'wyloguj się') return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    logout();
+  }, true);
+  document.addEventListener('submit', function(event) {
+    if (!logoutUrl(event.target.action)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    logout();
+  }, true);
   window.MinistrantBridge = {
     __mmShimmed: true,
     debugPing: function() {}, onScroll: function() {},
+    logout: logout,
     saveRememberToken: function(token) {
       raw.postMessage(JSON.stringify({type: 'remember_token', token: token}));
     }
@@ -772,6 +800,11 @@ class _OfflineAwarePageScreenState extends State<OfflineAwarePageScreen>
     if (!_online || _loggingOut || !mounted) return;
     try {
       final data = jsonDecode(message.message) as Map<String, dynamic>;
+      if (data['type'] == 'logout' && data['url'] is String) {
+        final uri = Uri.tryParse(data['url'] as String);
+        if (uri != null && _trusted(uri)) unawaited(_logout());
+        return;
+      }
       if (data['type'] == 'remember_token' && data['token'] is String) {
         unawaited(
           widget.coordinator.handoffService.secureStorage
@@ -1618,6 +1651,30 @@ $_captureChannel.postMessage(JSON.stringify({
       }
     },
     child: Scaffold(
+      floatingActionButton: widget.onOpenDeviceSettings == null
+          ? null
+          : Material(
+              elevation: 3,
+              color: Theme.of(context).colorScheme.surface,
+              shape: const CircleBorder(),
+              child: PopupMenuButton<String>(
+                tooltip: 'Ustawienia aplikacji',
+                icon: const Icon(Icons.settings_outlined),
+                enabled: !_loggingOut,
+                onSelected: (action) {
+                  if (action == 'logout') {
+                    unawaited(_logout());
+                  } else {
+                    unawaited(widget.onOpenDeviceSettings!());
+                  }
+                },
+                itemBuilder: (_) => [
+                  if (widget.onLogout != null)
+                    const PopupMenuItem(value: 'logout', child: Text('Wyloguj')),
+                  const PopupMenuItem(value: 'parish', child: Text('Zmień parafię')),
+                ],
+              ),
+            ),
       body: SafeArea(
         child: Column(
           children: [

@@ -913,6 +913,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       coordinator: widget.offlinePageCoordinator,
       forceOffline: forceOfflineFor(_authState),
       onLogout: _onLogout,
+      onOpenDeviceSettings: _openDeviceSettings,
     );
   }
 }

@@ -430,6 +430,7 @@ PageLoadOnline _onlinePlan() =>
 Widget _host(
   OfflinePageCoordinator coordinator, {
   Future<void> Function()? onLogout,
+  Future<void> Function()? onOpenDeviceSettings,
   bool forceOffline = false,
   String parishId = 'p',
   String userId = 'u',
@@ -443,6 +444,7 @@ Widget _host(
     userId: userId,
     coordinator: coordinator,
     onLogout: onLogout,
+    onOpenDeviceSettings: onOpenDeviceSettings,
     forceOffline: forceOffline,
     panelSpec: panelSpec,
   ),
@@ -488,6 +490,57 @@ void main() {
   });
 
   const spinner = CircularProgressIndicator;
+
+  testWidgets('explicit web logout clears native session once and blocks PHP renewal', (tester) async {
+    var logouts = 0;
+    final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
+    await tester.pumpWidget(_host(coordinator, onLogout: () async { logouts++; }));
+    await tester.pump(const Duration(milliseconds: 10));
+    final bridge = platform.controllers.single.channels['MinistrantBridge']!;
+    const logout = JavaScriptMessage(message: '{"type":"logout","url":"https://szarlej.ministrant.eu/public/dashboard.php"}');
+    bridge(logout);
+    bridge(logout);
+    await tester.pump(const Duration(milliseconds: 10));
+    platform.delegates.single.onPageFinished!('https://szarlej.ministrant.eu/public/login.php');
+    await tester.pump(const Duration(milliseconds: 10));
+    expect(logouts, 1);
+    expect(coordinator.planCalls, 1);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('logout bridge ignores an unrelated host', (tester) async {
+    var logouts = 0;
+    final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
+    await tester.pumpWidget(_host(coordinator, onLogout: () async { logouts++; }));
+    await tester.pump(const Duration(milliseconds: 10));
+    platform.controllers.single.channels['MinistrantBridge']!(
+      const JavaScriptMessage(message: '{"type":"logout","url":"https://example.com/"}'),
+    );
+    await tester.pump();
+    expect(logouts, 0);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('parish settings can be opened from the panel without logging out', (tester) async {
+    var settings = 0;
+    var logouts = 0;
+    final coordinator = _ScriptedCoordinator((_) async => _onlinePlan());
+    await tester.pumpWidget(_host(coordinator,
+      onLogout: () async { logouts++; },
+      onOpenDeviceSettings: () async { settings++; },
+    ));
+    await tester.pump(const Duration(milliseconds: 10));
+    await tester.tap(find.byTooltip('Ustawienia aplikacji'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pump();
+    await tester.tap(find.text('Zmień parafię'));
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(settings, 1);
+    expect(logouts, 0);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
 
   testWidgets('first navigation waits for asynchronous WebView configuration', (tester) async {
     final gate = Completer<void>();
