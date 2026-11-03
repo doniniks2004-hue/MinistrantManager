@@ -15,6 +15,8 @@ class ApiClient {
   ApiClient(this._secureStorage)
       : central = Dio(BaseOptions(
           baseUrl: centralBaseUrl,
+          headers: {'Accept': Headers.jsonContentType},
+          followRedirects: false,
           connectTimeout: const Duration(seconds: 10),
           receiveTimeout: const Duration(seconds: 15),
         ));
@@ -87,7 +89,11 @@ class ApiClient {
   Dio centralWithAuth(String deviceToken) {
     return Dio(BaseOptions(
       baseUrl: centralBaseUrl,
-      headers: {'Authorization': 'Bearer $deviceToken'},
+      headers: {
+        'Authorization': 'Bearer $deviceToken',
+        'Accept': Headers.jsonContentType,
+      },
+      followRedirects: false,
       // Review round: `central` (below) already had timeouts; this client
       // didn't — an unresponsive server could hang checkDeviceStatus()
       // indefinitely instead of failing into the offline-lease path.

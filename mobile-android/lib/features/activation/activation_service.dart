@@ -86,6 +86,30 @@ class ActivationService {
     return segments[idx + 1];
   }
 
+  // Never classify a transport failure or an HTML redirect as a bad code.
+  // Only the central API's explicit validation response supports that claim.
+  ActivationError _requestError(DioException error, {required bool confirming}) {
+    final status = error.response?.statusCode;
+    final body = error.response?.data;
+    if (status == 429) {
+      return ActivationError('Zbyt wiele prób aktywacji. Odczekaj 10 minut i spróbuj ponownie.');
+    }
+    if (status == 422 && body is Map && body['errors'] is Map) {
+      final errors = body['errors'] as Map;
+      if (errors.containsKey('code') || errors.containsKey('token') ||
+          errors.containsKey('display_code')) {
+        return ActivationError(confirming
+            ? 'Aktywacja nie powiodła się. Kod mógł zostać już wykorzystany lub unieważniony.'
+            : 'Kod aktywacyjny jest nieprawidłowy, wygasł lub został unieważniony.');
+      }
+      return ActivationError('Serwer odrzucił dane aktywacji. Spróbuj ponownie lub skontaktuj się z administratorem.');
+    }
+    if (status != null) {
+      return ActivationError('Serwer aktywacji zwrócił błąd HTTP $status. Spróbuj ponownie później.');
+    }
+    return ActivationError('Nie udało się połączyć z serwerem aktywacji. Sprawdź internet i spróbuj ponownie.');
+  }
+
   Future<String> _installationId() async {
     final existing = await secureStorage.installationId;
     if (existing != null) return existing;
@@ -141,10 +165,10 @@ class ActivationService {
         parishName: parish['name'] as String,
         serverUrl: serverUrl,
       );
+    } on DioException catch (e) {
+      throw _requestError(e, confirming: false);
     } catch (_) {
-      throw ActivationError(
-        'Kod aktywacyjny jest nieprawidłowy, wygasł lub został unieważniony.',
-      );
+      throw ActivationError('Serwer zwrócił nieprawidłową odpowiedź aktywacji. Spróbuj ponownie później.');
     }
   }
 
@@ -188,10 +212,10 @@ class ActivationService {
         parishName: parish['name'] as String,
         serverUrl: serverUrl,
       );
+    } on DioException catch (e) {
+      throw _requestError(e, confirming: true);
     } catch (_) {
-      throw ActivationError(
-        'Aktywacja nie powiodła się. Kod mógł zostać już wykorzystany lub unieważniony.',
-      );
+      throw ActivationError('Nie udało się zapisać aktywacji. Spróbuj ponownie.');
     }
   }
 }
