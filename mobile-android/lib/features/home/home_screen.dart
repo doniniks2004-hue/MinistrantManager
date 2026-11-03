@@ -113,6 +113,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// flag the screen stayed on its first-frame spinner indefinitely.
   bool _stateLoadFailed = false;
   bool _syncInProgress = false;
+  bool _checkingDeviceStatus = false;
   int _sessionGeneration = 0;
   Timer? _leaseTimer;
   StreamSubscription<DeviceAuthState>? _centralRevocationSub;
@@ -390,6 +391,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     } finally {
       _syncInProgress = false;
+      if (mounted && generation == _sessionGeneration && _checkingDeviceStatus) {
+        setState(() => _checkingDeviceStatus = false);
+      }
       if (mounted && generation != _sessionGeneration)
         unawaited(_bootstrapThenSync());
     }
@@ -437,6 +441,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       widget.offlinePageCoordinator.localServer.rootDirectory = null;
     }
     setState(() {
+      _checkingDeviceStatus = true;
       _authState = rememberedRefusal != null
           ? rememberedRefusal.state
           : localWithinLease
@@ -462,6 +467,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
 
     if (!mounted || generation != _sessionGeneration) return;
+    setState(() => _checkingDeviceStatus = false);
     if (status == null) {
       // Not activated — shouldn't normally reach HomeScreen in this state.
       return;
@@ -814,6 +820,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final isOfflineExpired = _authState == DeviceAuthState.offlineLeaseExpired;
 
     if (isOfflineExpired) {
+      // A fresh activation has no cached lease yet. Until the server answers,
+      // that means "checking", not a confirmed loss of connectivity. Keep the
+      // same access gate; never open cached data while authorization is pending.
+      if (_checkingDeviceStatus) {
+        return Scaffold(
+          appBar: _deviceSettingsBar(),
+          body: const Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(height: 16),
+                Text('Sprawdzanie połączenia…'),
+              ],
+            ),
+          ),
+        );
+      }
       return Scaffold(
         appBar: _deviceSettingsBar(),
         body: Center(

@@ -156,6 +156,20 @@ class _ActivationScreenState extends State<ActivationScreen> {
         Expanded(
           flex: 3,
           child: MobileScanner(
+            placeholderBuilder: (_, __) => const Center(
+              child: CircularProgressIndicator(),
+            ),
+            errorBuilder: (context, error, child) => Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Text(
+                  error.errorCode == MobileScannerErrorCode.permissionDenied
+                      ? 'Zezwól aplikacji na dostęp do aparatu w ustawieniach telefonu albo wpisz kod poniżej.'
+                      : 'Nie udało się uruchomić aparatu. Otwórz ponownie aplikację albo wpisz kod poniżej.',
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            ),
             onDetect: (capture) {
               final code = capture.barcodes.firstOrNull?.rawValue;
               if (code != null) _handleScanned(code);
