@@ -41,13 +41,16 @@ class _OfflineSyncEngine extends SyncEngine {
     required super.api,
     required super.secureStorage,
     super.offlineLease,
+    this.result,
   });
+
+  final Future<DeviceStatusResult?>? result;
 
   @override
   Future<DeviceStatusResult?> checkDeviceStatus({
     required String appVersion,
     required String osVersion,
-  }) async => null;
+  }) async => result == null ? null : await result;
 }
 
 class _NoConfig extends ConfigService {
@@ -60,7 +63,10 @@ class _NoConfig extends ConfigService {
 const _channel = MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
 final _encryptor = SnapshotEncryptor(hexKey: 'b' * 64);
 
-Widget _home(AppDatabase db) {
+Widget _home(AppDatabase db, {
+  OfflineLease lease = const _AlwaysWithinLease(),
+  Future<DeviceStatusResult?>? status,
+}) {
   final secure = IsolatedSecureStorage();
   final api = ApiClient(secure);
   final snapshotStore = SnapshotStore(encryptor: _encryptor);
@@ -71,7 +77,8 @@ Widget _home(AppDatabase db) {
         db: db,
         api: api,
         secureStorage: secure,
-        offlineLease: const _AlwaysWithinLease(),
+        offlineLease: lease,
+        result: status,
       ),
       configService: _NoConfig(db: db, api: api),
       revocationHandler: RevocationHandler(
@@ -165,6 +172,37 @@ void main() {
 
   const spinner = CircularProgressIndicator;
   const missingData = 'Brakuje danych potrzebnych do otwarcia strony';
+
+  for (final state in [DeviceAuthState.active, DeviceAuthState.offlineLeaseExpired]) {
+    testWidgets('fresh activation waits for authorization before reporting offline: $state', (tester) async {
+      final status = Completer<DeviceStatusResult?>();
+      await tester.pumpWidget(_home(sharedDb, lease: const OfflineLease(), status: status.future));
+      await _settle(tester);
+      expect(find.text('Sprawdzanie połączenia…'), findsOneWidget);
+      expect(find.byIcon(Icons.wifi_off), findsNothing);
+      expect(find.text('Logowanie'), findsNothing);
+
+      status.complete(DeviceStatusResult(state));
+      await _settle(tester);
+      expect(find.text('Sprawdzanie połączenia…'), findsNothing);
+      expect(find.byIcon(Icons.wifi_off), state == DeviceAuthState.offlineLeaseExpired ? findsOneWidget : findsNothing);
+      expect(find.text('Logowanie'), state == DeviceAuthState.active ? findsOneWidget : findsNothing);
+      await tester.pumpWidget(const SizedBox());
+    });
+  }
+
+  testWidgets('failed authorization request does not leave the checking screen indefinitely', (tester) async {
+    final status = Completer<DeviceStatusResult?>();
+    await tester.pumpWidget(_home(sharedDb, lease: const OfflineLease(), status: status.future));
+    await _settle(tester);
+    expect(find.text('Sprawdzanie połączenia…'), findsOneWidget);
+    status.completeError(StateError('test transport failed'));
+    await _settle(tester);
+    expect(find.text('Sprawdzanie połączenia…'), findsNothing);
+    expect(find.byIcon(Icons.wifi_off), findsOneWidget);
+    expect(find.text('SPRÓBUJ PONOWNIE'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox());
+  });
 
   group('forceOfflineFor: which device states may open the live page', () {
     // Every state must be decided explicitly: adding one to the enum fails
